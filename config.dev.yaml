@@ -1,0 +1,50 @@
+server:
+  listen: ":8080"
+  dataDir: "./data-dev"
+  maxUploadMB: 2048
+  dryRun: true             # 演练模式
+
+sshServers:
+  - id: "demo-linux"
+    name: "演示环境构建机"
+    host: "10.0.0.88"
+    port: 22
+    user: "root"
+    authType: "password"
+    password: "demo"
+
+apps:
+  - id: "order-service"
+    name: "order-service"
+    description: "演示订单服务 (Jar)"
+    serverId: "demo-linux"
+    type: "jar"
+    artifactDir: "/data/packages/order-service"
+    buildDir: "/data/docker-build/order-service"
+    k8sYamlDir: "/data/k8s-yaml/order-service"
+    image: "harbor.example.com/app/order-service"
+    buildCmd: "cd {{.BuildDir}} && docker build -t {{.Image}}:{{.Tag}} ."
+    pushCmd: "docker push {{.Image}}:{{.Tag}}"
+    deployCmd: "kubectl -n {{.Namespace}} set image deployment/{{.Deployment}} {{.Container}}={{.Image}}:{{.Tag}}"
+    namespace: "prod"
+    deployment: "order-service"
+    container: "order-service"
+    rolloutTimeout: 300
+    autoRollback: true
+
+  - id: "gateway"
+    name: "api-gateway"
+    description: "演示网关 (Go 二进制)"
+    serverId: "demo-linux"
+    type: "go"
+    artifactDir: "/data/packages/gateway"
+    buildDir: "/data/docker-build/gateway"
+    k8sYamlDir: "/data/k8s-yaml/gateway"
+    image: "harbor.example.com/app/gateway"
+    buildCmd: "cd {{.BuildDir}} && docker build -t {{.Image}}:{{.Tag}} ."
+    deployCmd: "kubectl -n {{.Namespace}} set image deployment/{{.Deployment}} {{.Container}}={{.Image}}:{{.Tag}}"
+    namespace: "prod"
+    deployment: "gateway"
+    container: "gateway"
+    rolloutTimeout: 300
+    autoRollback: true

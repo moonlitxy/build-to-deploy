@@ -1,0 +1,42 @@
+server:
+  listen: ":8080"          # 本地页面访问地址: http://localhost:8080
+  dataDir: "./data"        # 本地暂存文件与发布记录存放目录
+  maxUploadMB: 2048        # 支持上传最大产物大小(MB)
+  dryRun: false            # true 为演练模式(用于无网络环境模拟测试)
+
+# SSH 服务器长连接池配置（保活心跳常驻，避免频繁 SSH 握手触发限制）
+sshServers:
+  - id: "prod-server"
+    name: "生产 K8s Linux 构建部署机"
+    host: "192.168.1.100"   # 服务器 IP
+    port: 22
+    user: "root"
+    authType: "password"   # "password" 或 "key"
+    password: "your-password"
+    # keyPath: "C:/Users/Administrator/.ssh/id_rsa"
+
+# 应用独立目录与发布命令配置（满足目录分离与镜像版本控制）
+apps:
+  - id: "order-service"
+    name: "order-service"
+    description: "订单服务 (Java Jar)"
+    serverId: "prod-server"
+    type: "jar"             # jar 或 go
+
+    # 1. 独立目录配置（核心需求）
+    artifactDir: "/data/packages/order-service"      # 服务器放构建产物的单独目录
+    buildDir: "/data/docker-build/order-service"     # 服务器构建镜像的单独目录
+    k8sYamlDir: "/data/k8s-yaml/order-service"       # 服务器放 K8s yaml 配置文件的单独目录
+
+    # 2. 镜像与构建命令模板
+    image: "harbor.example.com/app/order-service"
+    buildCmd: "cd {{.BuildDir}} && docker build -t {{.Image}}:{{.Tag}} ."
+    pushCmd: "docker push {{.Image}}:{{.Tag}}"       # 单机不需要推送可留空
+    deployCmd: "kubectl -n {{.Namespace}} set image deployment/{{.Deployment}} {{.Container}}={{.Image}}:{{.Tag}}"
+    
+    # 3. K8s 部署信息
+    namespace: "prod"
+    deployment: "order-service"
+    container: "order-service"
+    rolloutTimeout: 300
+    autoRollback: true

@@ -1,0 +1,47 @@
+# 为发布平台创建最小权限的 ServiceAccount（每个需要发布的命名空间各创建一份 Role/RoleBinding）
+# kubectl apply -f rbac.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: build-to-deploy
+  namespace: prod
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: build-to-deploy
+  namespace: prod
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: build-to-deploy
+  namespace: prod
+subjects:
+  - kind: ServiceAccount
+    name: build-to-deploy
+    namespace: prod
+roleRef:
+  kind: Role
+  name: build-to-deploy
+  apiGroup: rbac.authorization.k8s.io
+---
+# 长期 token（K8s 1.24+ 需显式创建）
+apiVersion: v1
+kind: Secret
+metadata:
+  name: build-to-deploy-token
+  namespace: prod
+  annotations:
+    kubernetes.io/service-account.name: build-to-deploy
+type: kubernetes.io/service-account-token

@@ -1,0 +1,16 @@
+[Unit]
+Description=Build-to-Deploy 发布平台
+After=network.target docker.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/build-to-deploy
+ExecStart=/opt/build-to-deploy/build-to-deploy -config /opt/build-to-deploy/config.yaml
+Restart=on-failure
+RestartSec=5
+# 运行用户需在 docker 组中，并能读取 kubeconfig
+User=deploy
+Group=docker
+
+[Install]
+WantedBy=multi-user.target

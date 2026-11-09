@@ -1,0 +1,5 @@
+/bin/
+/data/
+/data-dev/
+config.yaml
+*.exe

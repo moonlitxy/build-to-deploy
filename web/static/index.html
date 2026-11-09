@@ -1,0 +1,488 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Build-to-Deploy 本地一键发布平台</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<!-- 顶部导航栏 -->
+<header class="topbar">
+  <div class="brand">
+    <span class="logo-icon">🚀</span>
+    <span class="brand-text">Build-to-Deploy</span>
+    <span class="sub-text">本地构建产物 → 远程服务器构建 & K8s 部署</span>
+    <span id="dryRunBadge" class="badge warn hidden">演练模式 (DryRun)</span>
+  </div>
+  <nav class="nav-tabs">
+    <button class="tab-btn active" data-tab="deploy"><span class="icon">📦</span> 产物发布</button>
+    <button class="tab-btn" data-tab="pods"><span class="icon">☸️</span> K8s Pod 监控</button>
+    <button class="tab-btn" data-tab="config"><span class="icon">⚙️</span> 服务器与目录配置</button>
+    <button class="tab-btn" data-tab="history"><span class="icon">📜</span> 发布历史</button>
+  </nav>
+</header>
+
+<main class="main-content">
+  <!-- TAB 1: 产物上传与发布 -->
+  <section id="tab-deploy" class="tab-pane active">
+    <div class="deploy-grid">
+      <!-- 左侧：发布操作面板 -->
+      <div class="card form-card">
+        <div class="card-header">
+          <h3>新建发布任务</h3>
+          <span class="tag-badge">无需登录 · 本地直连</span>
+        </div>
+
+        <div class="form-group">
+          <label>选择发布应用</label>
+          <select id="deployAppSelect"></select>
+        </div>
+
+        <!-- 目录分离详情预览 -->
+        <div id="appPathPreview" class="path-preview-box">
+          <div class="path-item"><span class="p-label">🖥️ 目标主机:</span> <span id="pvServer" class="p-val">-</span></div>
+          <div class="path-item"><span class="p-label">📁 产物目录:</span> <span id="pvArtifactDir" class="p-val">-</span></div>
+          <div class="path-item"><span class="p-label">🔨 构建目录:</span> <span id="pvBuildDir" class="p-val">-</span></div>
+          <div class="path-item"><span class="p-label">📄 K8s 目录:</span> <span id="pvYamlDir" class="p-val">-</span></div>
+          <div class="path-item"><span class="p-label">🏷️ 目标镜像:</span> <span id="pvImage" class="p-val">-</span></div>
+        </div>
+
+        <div class="form-group">
+          <label>选择本地产物文件 <span class="tip">(支持 Jar 包、Linux Go 二进制包)</span></label>
+          <div id="dropZone" class="drop-zone">
+            <input type="file" id="fileInput" hidden>
+            <div class="drop-icon">📤</div>
+            <div id="dropText" class="drop-title">点击选择 或 将文件拖拽至此处</div>
+            <div class="drop-desc">自动检测文件格式与完整性</div>
+          </div>
+        </div>
+
+        <div class="form-row">
+          <div class="form-group flex-1">
+            <label>镜像 Tag / 版本号 <span class="req">*</span></label>
+            <input type="text" id="tagInput" placeholder="如: v1.0.0 或 20261109.1" autocomplete="off">
+            <div id="tagTip" class="hint">字母、数字、. _ -，若服务器已存在同名 Tag 会触发弹窗确认</div>
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label>发布备注说明</label>
+          <input type="text" id="remarkInput" placeholder="如: 修复下单接口超时、升级依赖" maxlength="200">
+        </div>
+
+        <div class="form-actions">
+          <button id="startDeployBtn" class="btn btn-primary btn-large">
+            <span class="btn-icon">🚀</span> 开始上传并构建部署
+          </button>
+        </div>
+      </div>
+
+      <!-- 右侧：流水线进度与实时日志 -->
+      <div class="card terminal-card">
+        <div class="card-header">
+          <div class="pipe-header-left">
+            <h3>流水线执行状态</h3>
+            <span id="currentStatusBadge" class="status-pill status-idle">未开始</span>
+          </div>
+          <div class="pipe-header-right">
+            <button id="cancelReleaseBtn" class="btn btn-danger btn-sm hidden">中止发布</button>
+          </div>
+        </div>
+
+        <!-- 阶段进度条 -->
+        <div id="pipelineStages" class="stages-timeline">
+          <div class="timeline-empty">请在左侧选择文件并点击“开始上传并构建部署”</div>
+        </div>
+
+        <!-- 上传分片进度条 -->
+        <div id="uploadProgressContainer" class="upload-progress-box hidden">
+          <div class="progress-bar-bg">
+            <div id="uploadProgressBar" class="progress-bar-fill"></div>
+          </div>
+          <div class="progress-text">
+            <span id="uploadProgressInfo">0%</span>
+            <span id="uploadSpeedInfo">0 KB/s</span>
+          </div>
+        </div>
+
+        <!-- 实时控制台终端 -->
+        <div class="terminal-box">
+          <div class="terminal-bar">
+            <div class="terminal-dots">
+              <span class="dot red"></span>
+              <span class="dot yellow"></span>
+              <span class="dot green"></span>
+            </div>
+            <span class="terminal-title">实时执行日志 (SSE 实时推流)</span>
+            <div class="terminal-opts">
+              <label><input type="checkbox" id="autoScrollLog" checked> 自动滚动</label>
+              <button id="clearLogBtn" class="btn-text">清空</button>
+            </div>
+          </div>
+          <pre id="logConsole" class="terminal-body"></pre>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- TAB 2: K8s Pod 监控与命名空间查看 -->
+  <section id="tab-pods" class="tab-pane">
+    <div class="card">
+      <div class="card-header">
+        <div class="pod-filter-bar">
+          <div class="filter-item">
+            <label>目标服务器:</label>
+            <select id="podServerSelect"></select>
+          </div>
+          <div class="filter-item">
+            <label>命名空间 (Namespace):</label>
+            <select id="podNamespaceSelect">
+              <option value="default">default</option>
+            </select>
+          </div>
+          <button id="refreshPodsBtn" class="btn btn-secondary">
+            <span class="btn-icon">🔄</span> 刷新 Pod 列表
+          </button>
+          <span id="podLoading" class="loading-spinner hidden"></span>
+        </div>
+        <div class="search-box">
+          <input type="text" id="podSearchInput" placeholder="按 Pod 名称过滤...">
+        </div>
+      </div>
+
+      <!-- Pod 表格 -->
+      <div class="table-responsive">
+        <table class="data-table" id="podsTable">
+          <thead>
+            <tr>
+              <th>Pod 名称</th>
+              <th>状态</th>
+              <th>就绪状态</th>
+              <th>重启次数</th>
+              <th>运行时长</th>
+              <th>Pod IP</th>
+              <th>运行节点</th>
+              <th>容器镜像</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="podsTableBody">
+            <tr><td colspan="9" class="td-empty">请点击“刷新 Pod 列表”加载状态</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- TAB 3: 服务器与应用目录配置 -->
+  <section id="tab-config" class="tab-pane">
+    <div class="config-grid">
+      <!-- SSH 服务器连接配置 (长连接池) -->
+      <div class="card">
+        <div class="card-header">
+          <h3>🖥️ SSH 服务器配置 (连接池管理)</h3>
+          <button id="addServerBtn" class="btn btn-primary btn-sm">+ 添加服务器</button>
+        </div>
+        <p class="config-hint">后台已启用 SSH 客户端长连接池与保活心跳，一次连接持续可用，无需反复登录触发安全限制。</p>
+        <div class="server-cards-list" id="serverCardsList"></div>
+      </div>
+
+      <!-- 应用与独立目录配置 -->
+      <div class="card">
+        <div class="card-header">
+          <h3>📂 应用与独立目录配置 (满足目录分离需求)</h3>
+          <button id="addAppBtn" class="btn btn-primary btn-sm">+ 添加应用</button>
+        </div>
+        <p class="config-hint">为每个应用指定服务器上的产物目录、构建镜像目录、K8s YAML 配置文件目录及构建部署命令。</p>
+        <div class="app-cards-list" id="appCardsList"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- TAB 4: 发布历史记录 -->
+  <section id="tab-history" class="tab-pane">
+    <!-- 统计指标卡片 -->
+    <div class="history-metrics-grid">
+      <div class="metric-card">
+        <div class="metric-icon blue">🚀</div>
+        <div class="metric-info">
+          <div class="metric-label">总发布次数</div>
+          <div class="metric-value" id="metricTotal">0</div>
+        </div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-icon green">✔</div>
+        <div class="metric-info">
+          <div class="metric-label">发布成功率</div>
+          <div class="metric-value" id="metricSuccessRate">100%</div>
+        </div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-icon orange">⚠️</div>
+        <div class="metric-info">
+          <div class="metric-label">强制覆盖版本</div>
+          <div class="metric-value" id="metricForceCount">0</div>
+        </div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-icon red">✖</div>
+        <div class="metric-info">
+          <div class="metric-label">失败记录</div>
+          <div class="metric-value" id="metricFailedCount">0</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 历史记录表格与筛选 -->
+    <div class="card">
+      <div class="card-header history-toolbar">
+        <div class="history-filter-group">
+          <div class="filter-item">
+            <label>应用筛选:</label>
+            <select id="historyAppFilter"><option value="">全部应用</option></select>
+          </div>
+          <div class="filter-item">
+            <label>状态筛选:</label>
+            <select id="historyStatusFilter">
+              <option value="">全部状态</option>
+              <option value="success">发布成功</option>
+              <option value="failed">发布失败</option>
+              <option value="force">强制覆盖</option>
+            </select>
+          </div>
+          <div class="filter-item search-item">
+            <input type="text" id="historySearchInput" placeholder="按 Tag、产物名或备注过滤...">
+          </div>
+        </div>
+        <div class="history-actions">
+          <button id="refreshHistoryBtn" class="btn btn-secondary btn-sm">
+            <span class="btn-icon">🔄</span> 刷新记录
+          </button>
+        </div>
+      </div>
+
+      <div class="table-responsive">
+        <table class="data-table history-table">
+          <thead>
+            <tr>
+              <th style="width:160px">发布时间</th>
+              <th style="width:140px">应用</th>
+              <th style="width:130px">镜像 Tag</th>
+              <th style="width:120px">执行状态</th>
+              <th>本地产物信息</th>
+              <th style="width:100px">总耗时</th>
+              <th>发布备注</th>
+              <th style="width:180px">操作</th>
+            </tr>
+          </thead>
+          <tbody id="historyTableBody"></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+</main>
+
+<!-- 模态弹窗：Tag 版本冲突确认覆盖 (需求 2 核心) -->
+<div id="conflictModal" class="modal-backdrop hidden">
+  <div class="modal-card modal-warn">
+    <div class="modal-header">
+      <div class="modal-icon-badge">⚠️</div>
+      <h3 class="modal-title">发现版本冲突 - 需二次确认</h3>
+    </div>
+    <div class="modal-body">
+      <p class="warn-text">检测到目标服务器或线上环境已存在与当前完全相同的镜像 Tag 版本：</p>
+      <div id="conflictItems" class="conflict-list"></div>
+      <p class="warn-foot">继续发布将<strong>覆盖构建该镜像</strong>并执行 K8s 滚动更新。请确认是否强制覆盖？</p>
+    </div>
+    <div class="modal-footer">
+      <button id="conflictCancelBtn" class="btn btn-secondary">取消发布</button>
+      <button id="conflictConfirmBtn" class="btn btn-danger">确认覆盖并继续发布</button>
+    </div>
+  </div>
+</div>
+
+<!-- 模态弹窗：查看 Pod 日志 -->
+<div id="podLogModal" class="modal-backdrop hidden">
+  <div class="modal-card modal-large">
+    <div class="modal-header">
+      <h3 class="modal-title" id="podLogTitle">Pod 容器日志</h3>
+      <button id="closePodLogBtn" class="close-btn">&times;</button>
+    </div>
+    <div class="modal-body">
+      <div class="log-modal-tools">
+        <span>显示最新 200 行日志</span>
+        <button id="refreshLogBtn" class="btn btn-secondary btn-sm">刷新日志</button>
+      </div>
+      <pre id="podLogContent" class="terminal-body pod-log-pre">加载中...</pre>
+    </div>
+  </div>
+</div>
+
+<!-- 模态弹窗：编辑 SSH 服务器 -->
+<div id="serverModal" class="modal-backdrop hidden">
+  <div class="modal-card">
+    <div class="modal-header">
+      <h3 class="modal-title" id="serverModalTitle">编辑 SSH 服务器</h3>
+      <button id="closeServerModalBtn" class="close-btn">&times;</button>
+    </div>
+    <div class="modal-body">
+      <input type="hidden" id="editServerId">
+      <div class="form-group">
+        <label>服务器名称</label>
+        <input type="text" id="editServerName" placeholder="如: 测试环境 Linux 构建机">
+      </div>
+      <div class="form-row">
+        <div class="form-group flex-2">
+          <label>主机 IP / 域名 <span class="req">*</span></label>
+          <input type="text" id="editServerHost" placeholder="192.168.1.100">
+        </div>
+        <div class="form-group flex-1">
+          <label>SSH 端口 <span class="req">*</span></label>
+          <input type="number" id="editServerPort" value="22">
+        </div>
+      </div>
+      <div class="form-group">
+        <label>SSH 用户名 <span class="req">*</span></label>
+        <input type="text" id="editServerUser" placeholder="root 或 deploy">
+      </div>
+      <div class="form-group">
+        <label>认证方式</label>
+        <select id="editServerAuthType">
+          <option value="password">密码认证</option>
+          <option value="key">私钥认证 (Key Path)</option>
+        </select>
+      </div>
+      <div class="form-group" id="pwdGroup">
+        <label>SSH 登录密码</label>
+        <input type="password" id="editServerPassword" placeholder="输入密码 (仅保存在本地配置)">
+      </div>
+      <div class="form-group hidden" id="keyGroup">
+        <label>本地私钥路径 (id_rsa)</label>
+        <input type="text" id="editServerKeyPath" placeholder="如: C:/Users/Administrator/.ssh/id_rsa">
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button id="testServerConnBtn" class="btn btn-secondary">测试连接</button>
+      <button id="saveServerBtn" class="btn btn-primary">保存服务器</button>
+    </div>
+  </div>
+</div>
+
+<!-- 模态弹窗：编辑应用配置 -->
+<div id="appModal" class="modal-backdrop hidden">
+  <div class="modal-card modal-large">
+    <div class="modal-header">
+      <h3 class="modal-title" id="appModalTitle">编辑应用配置</h3>
+      <button id="closeAppModalBtn" class="close-btn">&times;</button>
+    </div>
+    <div class="modal-body">
+      <input type="hidden" id="editAppId">
+      <div class="form-row">
+        <div class="form-group flex-1">
+          <label>应用标识 (ID) <span class="req">*</span></label>
+          <input type="text" id="editAppName" placeholder="如: order-service">
+        </div>
+        <div class="form-group flex-1">
+          <label>绑定 SSH 服务器</label>
+          <select id="editAppServerId"></select>
+        </div>
+        <div class="form-group flex-1">
+          <label>产物类型</label>
+          <select id="editAppType">
+            <option value="jar">Java (jar)</option>
+            <option value="go">Go 二进制 (Linux ELF)</option>
+            <option value="binary">通用可执行二进制</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="form-group">
+        <label>镜像名称 (不含 Tag) <span class="req">*</span></label>
+        <input type="text" id="editAppImage" placeholder="如: harbor.example.com/app/order-service">
+      </div>
+
+      <!-- 独立目录设置（满足需求 2） -->
+      <div class="highlight-config-box">
+        <h4>📂 服务器目录隔离设置 (需求 2)</h4>
+        <div class="form-group">
+          <label>1. 产物存放目录 (ArtifactDir)</label>
+          <input type="text" id="editAppArtifactDir" placeholder="如: /data/packages/order-service">
+          <div class="hint">本地上传的 jar 包或二进制将直接通过 SFTP 传输到此目录备份</div>
+        </div>
+        <div class="form-group">
+          <label>2. 镜像构建目录 (BuildDir)</label>
+          <input type="text" id="editAppBuildDir" placeholder="如: /data/docker-build/order-service">
+          <div class="hint">放置 Dockerfile 与构建上下文的目录，系统会自动将产物同步至此</div>
+        </div>
+        <div class="form-group">
+          <label>3. K8s YAML 配置目录 (K8sYamlDir)</label>
+          <input type="text" id="editAppK8sYamlDir" placeholder="如: /data/k8s-yaml/order-service">
+          <div class="hint">存放 Deployment / Service 等配置文件的目录</div>
+        </div>
+      </div>
+
+      <!-- 命令自定义模板 -->
+      <div class="form-group">
+        <label>构建镜像命令 (BuildCmd 模板)</label>
+        <input type="text" id="editAppBuildCmd" placeholder="cd {{.BuildDir}} && docker build -t {{.Image}}:{{.Tag}} .">
+        <div class="hint">支持变量: {{.BuildDir}}, {{.Image}}, {{.Tag}}, {{.ArtifactDir}}</div>
+      </div>
+      <div class="form-group">
+        <label>推送镜像命令 (PushCmd 模板，可选)</label>
+        <input type="text" id="editAppPushCmd" placeholder="docker push {{.Image}}:{{.Tag}} (单机模式可留空)">
+      </div>
+      <div class="form-group">
+        <label>K8s 部署命令 (DeployCmd 模板)</label>
+        <input type="text" id="editAppDeployCmd" placeholder="kubectl -n {{.Namespace}} set image deployment/{{.Deployment}} {{.Container}}={{.Image}}:{{.Tag}}">
+        <div class="hint">也可配置为: kubectl apply -f {{.K8sYamlDir}}</div>
+      </div>
+
+      <div class="form-row">
+        <div class="form-group flex-1">
+          <label>K8s 命名空间 (Namespace)</label>
+          <input type="text" id="editAppNamespace" placeholder="prod">
+        </div>
+        <div class="form-group flex-1">
+          <label>Deployment 名称</label>
+          <input type="text" id="editAppDeployment" placeholder="order-service">
+        </div>
+        <div class="form-group flex-1">
+          <label>容器名称 (Container)</label>
+          <input type="text" id="editAppContainer" placeholder="order-service">
+        </div>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button id="saveAppBtn" class="btn btn-primary">保存应用配置</button>
+    </div>
+  </div>
+</div>
+
+<!-- 模态弹窗：查看发布历史日志 -->
+<div id="releaseLogModal" class="modal-backdrop hidden">
+  <div class="modal-card modal-large">
+    <div class="modal-header">
+      <div>
+        <h3 class="modal-title" id="releaseLogModalTitle">发布流水线执行日志</h3>
+        <div class="tip" id="releaseLogModalSub">-</div>
+      </div>
+      <button id="closeReleaseLogBtn" class="close-btn">&times;</button>
+    </div>
+    <div class="modal-body">
+      <div class="log-modal-tools">
+        <span id="releaseLogMeta">完整日志输出</span>
+        <div class="log-actions">
+          <button id="copyReleaseLogBtn" class="btn btn-secondary btn-sm">📋 复制全部</button>
+          <a id="downloadReleaseLogLink" class="btn btn-secondary btn-sm" target="_blank" download>⬇️ 下载日志</a>
+        </div>
+      </div>
+      <pre id="releaseLogModalBody" class="terminal-body history-log-pre">加载中...</pre>
+    </div>
+  </div>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>
