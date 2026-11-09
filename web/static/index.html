@@ -45,7 +45,7 @@
           <div class="path-item"><span class="p-label">🖥️ 目标主机:</span> <span id="pvServer" class="p-val">-</span></div>
           <div class="path-item"><span class="p-label">📁 产物目录:</span> <span id="pvArtifactDir" class="p-val">-</span></div>
           <div class="path-item"><span class="p-label">🔨 构建目录:</span> <span id="pvBuildDir" class="p-val">-</span></div>
-          <div class="path-item"><span class="p-label">📄 K8s 目录:</span> <span id="pvYamlDir" class="p-val">-</span></div>
+          <div class="path-item"><span class="p-label">📄 K8s 配置:</span> <span id="pvYamlDir" class="p-val">-</span></div>
           <div class="path-item"><span class="p-label">🏷️ 目标镜像:</span> <span id="pvImage" class="p-val">-</span></div>
         </div>
 
@@ -403,9 +403,9 @@
         <input type="text" id="editAppImage" placeholder="如: harbor.example.com/app/order-service">
       </div>
 
-      <!-- 独立目录设置（满足需求 2） -->
+      <!-- 独立目录设置（满足需求 1 & 2） -->
       <div class="highlight-config-box">
-        <h4>📂 服务器目录隔离设置 (需求 2)</h4>
+        <h4>📂 服务器目录与配置文件隔离设置 (支持多服务共享目录不同文件名)</h4>
         <div class="form-group">
           <label>1. 产物存放目录 (ArtifactDir)</label>
           <input type="text" id="editAppArtifactDir" placeholder="如: /data/packages/order-service">
@@ -416,10 +416,17 @@
           <input type="text" id="editAppBuildDir" placeholder="如: /data/docker-build/order-service">
           <div class="hint">放置 Dockerfile 与构建上下文的目录，系统会自动将产物同步至此</div>
         </div>
-        <div class="form-group">
-          <label>3. K8s YAML 配置目录 (K8sYamlDir)</label>
-          <input type="text" id="editAppK8sYamlDir" placeholder="如: /data/k8s-yaml/order-service">
-          <div class="hint">存放 Deployment / Service 等配置文件的目录</div>
+        <div class="form-row">
+          <div class="form-group flex-1">
+            <label>3. K8s YAML 所在目录 (K8sYamlDir)</label>
+            <input type="text" id="editAppK8sYamlDir" placeholder="如: /data/k8s-yaml">
+            <div class="hint">多服务存放在同一目录下的共享路径</div>
+          </div>
+          <div class="form-group flex-1">
+            <label>4. K8s YAML 配置文件名 (K8sYamlFile)</label>
+            <input type="text" id="editAppK8sYamlFile" placeholder="如: order-service.yaml">
+            <div class="hint">各服务独立的 YAML 文件名</div>
+          </div>
         </div>
       </div>
 
@@ -431,12 +438,13 @@
       </div>
       <div class="form-group">
         <label>推送镜像命令 (PushCmd 模板，可选)</label>
-        <input type="text" id="editAppPushCmd" placeholder="docker push {{.Image}}:{{.Tag}} (单机模式可留空)">
+        <input type="text" id="editAppPushCmd" placeholder="如无需推送到外部仓库，直接留空即可 (本地构建镜像直接使用)">
+        <div class="hint">💡 镜像在服务器本地构建完成后已存在于 Docker 缓存中，直接部署无需 push，保持留空即可！</div>
       </div>
       <div class="form-group">
         <label>K8s 部署命令 (DeployCmd 模板)</label>
-        <input type="text" id="editAppDeployCmd" placeholder="kubectl -n {{.Namespace}} set image deployment/{{.Deployment}} {{.Container}}={{.Image}}:{{.Tag}}">
-        <div class="hint">也可配置为: kubectl apply -f {{.K8sYamlDir}}</div>
+        <input type="text" id="editAppDeployCmd" placeholder="kubectl apply -f {{.K8sYamlPath}}">
+        <div class="hint">支持变量: {{.K8sYamlPath}}, {{.K8sYamlDir}}, {{.K8sYamlFile}}, {{.Namespace}}, {{.Deployment}}</div>
       </div>
 
       <div class="form-row">

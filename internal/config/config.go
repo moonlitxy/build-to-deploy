@@ -37,7 +37,8 @@ type AppConfig struct {
 	// 目录分离配置（满足需求 2）
 	ArtifactDir string `yaml:"artifactDir" json:"artifactDir"` // 产物单独目录，如 /data/artifacts/order-service
 	BuildDir    string `yaml:"buildDir" json:"buildDir"`       // 镜像构建单独目录，如 /data/docker-build/order-service
-	K8sYamlDir  string `yaml:"k8sYamlDir" json:"k8sYamlDir"`   // K8s YAML 配置单独目录，如 /data/k8s/order-service
+	K8sYamlDir  string `yaml:"k8sYamlDir" json:"k8sYamlDir"`   // K8s YAML 配置目录，如 /data/k8s-yaml
+	K8sYamlFile string `yaml:"k8sYamlFile" json:"k8sYamlFile"` // K8s YAML 配置文件名，如 order-service.yaml (支持多个服务共用目录不同文件名)
 
 	// 镜像与部署命令（根据需求 2 灵活配置命令）
 	Image          string `yaml:"image" json:"image"`                   // 镜像名称（不含tag）
@@ -135,7 +136,13 @@ func (c *Config) normalize() {
 			app.BuildCmd = "cd {{.BuildDir}} && docker build -t {{.Image}}:{{.Tag}} ."
 		}
 		if app.DeployCmd == "" {
-			if app.K8sYamlDir != "" {
+			if app.K8sYamlFile != "" {
+				if app.K8sYamlDir != "" {
+					app.DeployCmd = "kubectl apply -f {{.K8sYamlDir}}/{{.K8sYamlFile}}"
+				} else {
+					app.DeployCmd = "kubectl apply -f {{.K8sYamlFile}}"
+				}
+			} else if app.K8sYamlDir != "" {
 				app.DeployCmd = "kubectl apply -f {{.K8sYamlDir}}"
 			} else {
 				app.DeployCmd = "kubectl -n {{.Namespace}} set image deployment/{{.Deployment}} {{.Container}}={{.Image}}:{{.Tag}}"

@@ -326,10 +326,20 @@ func (r *pipelineRunner) renderCmd(tplStr string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	yamlPath := r.app.K8sYamlDir
+	if r.app.K8sYamlFile != "" {
+		if r.app.K8sYamlDir != "" {
+			yamlPath = strings.TrimRight(r.app.K8sYamlDir, "/") + "/" + r.app.K8sYamlFile
+		} else {
+			yamlPath = r.app.K8sYamlFile
+		}
+	}
 	data := map[string]any{
 		"ArtifactDir": r.app.ArtifactDir,
 		"BuildDir":    r.app.BuildDir,
 		"K8sYamlDir":  r.app.K8sYamlDir,
+		"K8sYamlFile": r.app.K8sYamlFile,
+		"K8sYamlPath": yamlPath,
 		"Image":       r.app.Image,
 		"Tag":         r.rel.Tag,
 		"Namespace":   r.app.Namespace,
@@ -349,7 +359,11 @@ func (r *pipelineRunner) run() error {
 	r.hub.Logf(fmt.Sprintf("==> 目标服务器: %s@%s:%d", r.srv.User, r.srv.Host, r.srv.Port))
 	r.hub.Logf(fmt.Sprintf("==> 产物目录: %s", r.app.ArtifactDir))
 	r.hub.Logf(fmt.Sprintf("==> 构建目录: %s", r.app.BuildDir))
-	r.hub.Logf(fmt.Sprintf("==> K8s目录:  %s", r.app.K8sYamlDir))
+	if r.app.K8sYamlFile != "" {
+		r.hub.Logf(fmt.Sprintf("==> K8s配置:  %s/%s", r.app.K8sYamlDir, r.app.K8sYamlFile))
+	} else {
+		r.hub.Logf(fmt.Sprintf("==> K8s目录:  %s", r.app.K8sYamlDir))
+	}
 
 	// 1. 校验产物
 	if err := r.stage("validate", func(w io.Writer) error {

@@ -115,7 +115,8 @@ function updatePathPreview() {
   $('pvServer').textContent = srv ? `${srv.name} (${srv.user}@${srv.host})` : (app.serverId || '-');
   $('pvArtifactDir').textContent = app.artifactDir || '未配置';
   $('pvBuildDir').textContent = app.buildDir || '未配置';
-  $('pvYamlDir').textContent = app.k8sYamlDir || '未配置';
+  const yamlPath = app.k8sYamlFile ? (app.k8sYamlDir ? `${app.k8sYamlDir}/${app.k8sYamlFile}` : app.k8sYamlFile) : (app.k8sYamlDir || '未配置');
+  $('pvYamlDir').textContent = yamlPath;
   $('pvImage').textContent = app.image || '未配置';
 }
 
@@ -372,10 +373,45 @@ function renderStages(stages) {
 
 function appendLog(line) {
   const consoleEl = $('logConsole');
-  consoleEl.textContent += line + '\n';
+  const div = document.createElement('div');
+  div.innerHTML = colorizeLine(line);
+  consoleEl.appendChild(div);
   if ($('autoScrollLog').checked) {
     consoleEl.scrollTop = consoleEl.scrollHeight;
   }
+}
+
+// 日志语法高亮染色 (解决字体全白看不清问题)
+function colorizeLine(line) {
+  const esc = escapeHtml(line);
+  if (esc.startsWith('==&gt;') || esc.startsWith('==>')) {
+    return `<span class="log-stage">${esc}</span>`;
+  }
+  if (esc.startsWith('$ ')) {
+    return `<span class="log-cmd">${esc}</span>`;
+  }
+  if (esc.startsWith('[错误]') || esc.startsWith('[失败]')) {
+    return `<span class="log-err">${esc}</span>`;
+  }
+  if (esc.startsWith('[警告]') || esc.startsWith('⚠️')) {
+    return `<span class="log-warn">${esc}</span>`;
+  }
+  if (esc.startsWith('✔') || esc.includes('成功')) {
+    return `<span class="log-ok">${esc}</span>`;
+  }
+
+  let colored = esc;
+  colored = colored.replace(/^(\d{4}[-/]\d{2}[-/]\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)/, '<span class="log-ts">$1</span>');
+  colored = colored.replace(/\b(INFO|Info)\b/g, '<span class="log-info">$1</span>');
+  colored = colored.replace(/\b(WARN|WARNING|Warn|Warning)\b/g, '<span class="log-warn">$1</span>');
+  colored = colored.replace(/\b(ERROR|FATAL|Error|Fatal|Exception|CrashLoopBackOff|Failed)\b/g, '<span class="log-err">$1</span>');
+  colored = colored.replace(/\b(DEBUG|Debug)\b/g, '<span class="log-debug">$1</span>');
+  return `<span class="log-line">${colored}</span>`;
+}
+
+function colorizeLog(rawText) {
+  if (!rawText) return '<span class="log-debug">（无日志输出）</span>';
+  return rawText.split('\n').map(colorizeLine).join('');
 }
 
 function updateStatus(status, text) {
@@ -465,17 +501,19 @@ window.viewPodLog = async function (podName, containerName) {
   const srvId = $('podServerSelect').value;
   const ns = $('podNamespaceSelect').value;
   $('podLogTitle').textContent = `Pod 日志: ${podName}`;
-  $('podLogContent').textContent = '正在获取最新日志...';
+  $('podLogContent').innerHTML = '<span class="log-debug">正在获取最新日志...</span>';
   $('podLogModal').classList.remove('hidden');
 
   $('refreshLogBtn').onclick = () => window.viewPodLog(podName, containerName);
 
   const res = await api('GET', `/api/k8s/pod-logs?serverId=${encodeURIComponent(srvId)}&namespace=${encodeURIComponent(ns)}&pod=${encodeURIComponent(podName)}&container=${encodeURIComponent(containerName)}&tail=200`);
   if (!res.ok) {
-    $('podLogContent').textContent = `获取日志失败: ${res.data.error || '未知错误'}`;
+    $('podLogContent').innerHTML = `<span class="log-err">获取日志失败: ${escapeHtml(res.data.error || '未知错误')}</span>`;
     return;
   }
-  $('podLogContent').textContent = res.data.logs || '（容器暂无日志输出）';
+  const raw = res.data.logs || '';
+  window._rawPodLog = raw;
+  $('podLogContent').innerHTML = colorizeLog(raw);
 };
 
 // ---------------- 服务器管理 (长连接池保持) ----------------
@@ -600,9 +638,9 @@ function renderAppCards() {
       </div>
       <div class="item-card-desc"><strong>产物目录:</strong> <code>${escapeHtml(a.artifactDir || '-')}</code></div>
       <div class="item-card-desc"><strong>构建目录:</strong> <code>${escapeHtml(a.buildDir || '-')}</code></div>
-      <div class="item-card-desc"><strong>K8s 目录:</strong> <code>${escapeHtml(a.k8sYamlDir || '-')}</code></div>
+      <div class="item-card-desc"><strong>K8s 配置:</strong> <code>${escapeHtml(a.k8sYamlFile ? (a.k8sYamlDir ? a.k8sYamlDir + '/' + a.k8sYamlFile : a.k8sYamlFile) : (a.k8sYamlDir || '-'))}</code></div>
       <div class="item-card-desc"><strong>目标镜像:</strong> <code>${escapeHtml(a.image || '-')}</code></div>
-      <div class="item-card-desc"><strong>K8s 配置:</strong> ns: <code>${escapeHtml(a.namespace)}</code>, deploy: <code>${escapeHtml(a.deployment)}</code></div>
+      <div class="item-card-desc"><strong>K8s 部署:</strong> ns: <code>${escapeHtml(a.namespace)}</code>, deploy: <code>${escapeHtml(a.deployment)}</code></div>
     </div>
   `).join('');
 }
@@ -615,9 +653,10 @@ function openAppModal(app) {
   $('editAppArtifactDir').value = app ? (app.artifactDir || '') : '/data/packages';
   $('editAppBuildDir').value = app ? (app.buildDir || '') : '/data/docker-build';
   $('editAppK8sYamlDir').value = app ? (app.k8sYamlDir || '') : '/data/k8s-yaml';
+  $('editAppK8sYamlFile').value = app ? (app.k8sYamlFile || '') : '';
   $('editAppBuildCmd').value = app ? (app.buildCmd || '') : 'cd {{.BuildDir}} && docker build -t {{.Image}}:{{.Tag}} .';
   $('editAppPushCmd').value = app ? (app.pushCmd || '') : '';
-  $('editAppDeployCmd').value = app ? (app.deployCmd || '') : 'kubectl -n {{.Namespace}} set image deployment/{{.Deployment}} {{.Container}}={{.Image}}:{{.Tag}}';
+  $('editAppDeployCmd').value = app ? (app.deployCmd || '') : 'kubectl apply -f {{.K8sYamlPath}}';
   $('editAppNamespace').value = app ? (app.namespace || '') : 'default';
   $('editAppDeployment').value = app ? (app.deployment || '') : '';
   $('editAppContainer').value = app ? (app.container || '') : '';
@@ -654,6 +693,7 @@ async function saveApp() {
     artifactDir: $('editAppArtifactDir').value.trim(),
     buildDir: $('editAppBuildDir').value.trim(),
     k8sYamlDir: $('editAppK8sYamlDir').value.trim(),
+    k8sYamlFile: $('editAppK8sYamlFile').value.trim(),
     buildCmd: $('editAppBuildCmd').value.trim(),
     pushCmd: $('editAppPushCmd').value.trim(),
     deployCmd: $('editAppDeployCmd').value.trim(),
@@ -825,23 +865,24 @@ window.reuseReleaseTag = function (appId, tag) {
 window.openReleaseLogModal = async function (id, app, tag) {
   $('releaseLogModalTitle').textContent = `发布日志: ${app} [${tag}]`;
   $('releaseLogModalSub').textContent = `任务编号: ${id}`;
-  $('releaseLogModalBody').textContent = '正在获取构建日志...';
+  $('releaseLogModalBody').innerHTML = '<span class="log-debug">正在获取构建日志...</span>';
   $('downloadReleaseLogLink').href = `/api/releases/${id}/log`;
   $('releaseLogModal').classList.remove('hidden');
 
+  let rawLog = '';
   $('copyReleaseLogBtn').onclick = () => {
-    navigator.clipboard.writeText($('releaseLogModalBody').textContent).then(() => {
+    navigator.clipboard.writeText(rawLog).then(() => {
       alert('日志已复制到剪贴板！');
     });
   };
 
   const res = await fetch(`/api/releases/${id}/log`);
   if (!res.ok) {
-    $('releaseLogModalBody').textContent = `获取日志失败 HTTP ${res.status}`;
+    $('releaseLogModalBody').innerHTML = `<span class="log-err">获取日志失败 HTTP ${res.status}</span>`;
     return;
   }
-  const text = await res.text();
-  $('releaseLogModalBody').textContent = text || '（该次发布无日志内容）';
+  rawLog = await res.text();
+  $('releaseLogModalBody').innerHTML = colorizeLog(rawLog);
 };
 
 $('closeReleaseLogBtn').addEventListener('click', () => {
