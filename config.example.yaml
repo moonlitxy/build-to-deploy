@@ -23,16 +23,22 @@ apps:
     serverId: "prod-server"
     type: "jar"             # jar 或 go
 
-    # 1. 独立目录配置（核心需求）
-    artifactDir: "/data/packages/order-service"      # 服务器放构建产物的单独目录
-    buildDir: "/data/docker-build/order-service"     # 服务器构建镜像的单独目录
-    k8sYamlDir: "/data/k8s-yaml/order-service"       # 服务器放 K8s yaml 配置文件的单独目录
+    # 0. 本地编译与产物配置（可选：支持一键执行本地编译后上传，也可跳过编译直接上传已有产物）
+    localProjectDir: "~/workspace/order-service"     # 本地源码目录
+    localBuildCmd: "mvn clean package -DskipTests"   # 本地编译命令
+    localArtifactPath: "target/order-service.jar"    # 编译产出文件路径（支持相对 localProjectDir）
 
-    # 2. 镜像与构建命令模板
+    # 1. 目录与配置文件配置（核心需求：多服务共享 K8s YAML 目录 + 不同 YAML 文件名，构建目录各自独立）
+    artifactDir: "/data/packages/order-service"      # 该服务放构建产物的独立目录
+    buildDir: "/data/docker-build/order-service"     # 该服务构建镜像的独立目录 (含各自 Dockerfile)
+    k8sYamlDir: "/data/k8s-yaml"                     # 多个服务共用的 K8s YAML 目录
+    k8sYamlFile: "order-service.yaml"                # 该服务独立的 YAML 配置文件名
+
+    # 2. 独立镜像名与动态 Tag 构建部署命令模板
     image: "harbor.example.com/app/order-service"
     buildCmd: "cd {{.BuildDir}} && docker build -t {{.Image}}:{{.Tag}} ."
-    pushCmd: "docker push {{.Image}}:{{.Tag}}"       # 单机不需要推送可留空
-    deployCmd: "kubectl -n {{.Namespace}} set image deployment/{{.Deployment}} {{.Container}}={{.Image}}:{{.Tag}}"
+    pushCmd: ""                                      # 单机不需要推送可留空
+    deployCmd: "kubectl apply -f {{.K8sYamlPath}}"   # 部署前系统会自动修改 YAML 文件中的 image 为 {{.Image}}:{{.Tag}} 并持久化保存
     
     # 3. K8s 部署信息
     namespace: "prod"

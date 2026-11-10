@@ -16,6 +16,7 @@ import (
 
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/agent"
 )
 
 // ServerConfig SSH 服务器连接配置
@@ -94,7 +95,7 @@ func (p *Pool) GetClient(cfg *ServerConfig) (*ssh.Client, *sftp.Client, error) {
 		key = fmt.Sprintf("%s@%s:%d", cfg.User, cfg.Host, cfg.Port)
 	}
 
-	if c, ok := p.conns[key]; ok {
+	if c, ok := p.conns[key]; ok && c.sshClient != nil {
 		// 探测连接是否可用
 		if _, _, err := c.sshClient.SendRequest("keepalive@buildtodeploy", true, nil); err == nil {
 			c.lastUsed = time.Now()
@@ -125,21 +126,102 @@ func (p *Pool) GetClient(cfg *ServerConfig) (*ssh.Client, *sftp.Client, error) {
 	}
 
 	// 开启心跳协程，每 25 秒探测一次，保持长连接避免由于空闲被防火墙或 sshd 踢掉
-	go func(cli *ssh.Client, stop chan struct{}) {
+	go func(connKey string, cli *ssh.Client, stop chan struct{}) {
 		t := time.NewTicker(25 * time.Second)
 		defer t.Stop()
+		failCount := 0
 		for {
 			select {
 			case <-t.C:
-				_, _, _ = cli.SendRequest("keepalive@buildtodeploy", true, nil)
+				_, _, err := cli.SendRequest("keepalive@buildtodeploy", true, nil)
+				if err != nil {
+					failCount++
+					if failCount >= 2 {
+						// 连续 2 次心跳失败，说明连接确已断开，主动清理剔除
+						p.mu.Lock()
+						if c, ok := p.conns[connKey]; ok && c.sshClient == cli {
+							c.close()
+							delete(p.conns, connKey)
+						}
+						p.mu.Unlock()
+						return
+					}
+				} else {
+					failCount = 0
+				}
 			case <-stop:
 				return
 			}
 		}
-	}(client, stopCh)
+	}(key, client, stopCh)
 
 	p.conns[key] = cached
 	return client, sftpCli, nil
+}
+
+// Invalidate 主动清理并断开指定服务器的缓存连接
+func (p *Pool) Invalidate(cfg *ServerConfig) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	key := cfg.ID
+	if key == "" {
+		key = fmt.Sprintf("%s@%s:%d", cfg.User, cfg.Host, cfg.Port)
+	}
+	if c, ok := p.conns[key]; ok {
+		c.close()
+		delete(p.conns, key)
+	}
+}
+
+// Disconnect 主动断开指定服务器（或全部）长连接，释放本地网络资源
+func (p *Pool) Disconnect(serverID string) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	count := 0
+	if serverID == "" || serverID == "all" {
+		for key, c := range p.conns {
+			c.close()
+			delete(p.conns, key)
+			count++
+		}
+		return count
+	}
+
+	for key, c := range p.conns {
+		if key == serverID || strings.HasPrefix(key, serverID+"@") {
+			c.close()
+			delete(p.conns, key)
+			count++
+		}
+	}
+	return count
+}
+
+// ActiveKeys 返回当前正在保活的长连接列表
+func (p *Pool) ActiveKeys() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var keys []string
+	for k := range p.conns {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+// MarkSimulated 在演练模式 (DryRun) 下标记服务器长连接已建立，以便前端状态一致
+func (p *Pool) MarkSimulated(cfg *ServerConfig) {
+	if cfg == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	key := cfg.ID
+	if key == "" {
+		key = fmt.Sprintf("%s@%s:%d", cfg.User, cfg.Host, cfg.Port)
+	}
+	p.conns[key] = &cachedConn{
+		lastUsed: time.Now(),
+	}
 }
 
 func dialSSH(cfg *ServerConfig) (*ssh.Client, error) {
@@ -150,23 +232,56 @@ func dialSSH(cfg *ServerConfig) (*ssh.Client, error) {
 	addr := net.JoinHostPort(cfg.Host, strconv.Itoa(port))
 
 	var authMethods []ssh.AuthMethod
-	if cfg.AuthType == "key" || cfg.KeyPath != "" {
-		keyBytes, err := os.ReadFile(cfg.KeyPath)
-		if err != nil {
-			return nil, fmt.Errorf("读取私钥失败: %w", err)
+
+	// 1. 尝试连接本地 SSH Agent（若存在 SSH_AUTH_SOCK）
+	if sock := os.Getenv("SSH_AUTH_SOCK"); sock != "" {
+		if agentConn, err := net.Dial("unix", sock); err == nil {
+			agentCli := agent.NewClient(agentConn)
+			authMethods = append(authMethods, ssh.PublicKeysCallback(agentCli.Signers))
 		}
-		var signer ssh.Signer
-		if cfg.Passphrase != "" {
-			signer, err = ssh.ParsePrivateKeyWithPassphrase(keyBytes, []byte(cfg.Passphrase))
-		} else {
-			signer, err = ssh.ParsePrivateKey(keyBytes)
+	}
+
+	// 2. 处理私钥认证
+	keyPath := cfg.KeyPath
+	if strings.HasPrefix(keyPath, "~/") || strings.HasPrefix(keyPath, "~\\") {
+		if home, err := os.UserHomeDir(); err == nil {
+			keyPath = filepath.Join(home, keyPath[2:])
 		}
-		if err != nil {
-			return nil, fmt.Errorf("解析私钥失败: %w", err)
+	}
+	// 如果选择 key 鉴权但未填路径，自动探测默认私钥
+	if (cfg.AuthType == "key" || cfg.AuthType == "agent") && keyPath == "" {
+		if home, err := os.UserHomeDir(); err == nil {
+			for _, defKey := range []string{".ssh/id_ed25519", ".ssh/id_rsa"} {
+				p := filepath.Join(home, defKey)
+				if _, err := os.Stat(p); err == nil {
+					keyPath = p
+					break
+				}
+			}
 		}
-		authMethods = append(authMethods, ssh.PublicKeys(signer))
-	} else {
+	}
+
+	if keyPath != "" {
+		if keyBytes, err := os.ReadFile(keyPath); err == nil {
+			var signer ssh.Signer
+			if cfg.Passphrase != "" {
+				signer, err = ssh.ParsePrivateKeyWithPassphrase(keyBytes, []byte(cfg.Passphrase))
+			} else {
+				signer, err = ssh.ParsePrivateKey(keyBytes)
+			}
+			if err == nil {
+				authMethods = append(authMethods, ssh.PublicKeys(signer))
+			}
+		}
+	}
+
+	// 3. 密码鉴权
+	if cfg.Password != "" {
 		authMethods = append(authMethods, ssh.Password(cfg.Password))
+	}
+
+	if len(authMethods) == 0 {
+		return nil, errors.New("未配置有效的 SSH 认证方式（请提供密码、私钥或开启 SSH Agent）")
 	}
 
 	sshConfig := &ssh.ClientConfig{
@@ -210,7 +325,16 @@ func (p *Pool) RunCommand(ctx context.Context, cfg *ServerConfig, cmd string, w 
 	}
 	session, err := client.NewSession()
 	if err != nil {
-		return fmt.Errorf("创建 SSH 会话失败: %w", err)
+		// 旧长连接可能在网络抖动中已断开，自愈剔除并重新建立连接重试一次
+		p.Invalidate(cfg)
+		client, _, err = p.GetClient(cfg)
+		if err != nil {
+			return fmt.Errorf("重新连接 SSH 失败: %w", err)
+		}
+		session, err = client.NewSession()
+		if err != nil {
+			return fmt.Errorf("创建 SSH 会话失败: %w", err)
+		}
 	}
 	defer session.Close()
 
@@ -240,7 +364,16 @@ func (p *Pool) ExecuteOutput(ctx context.Context, cfg *ServerConfig, cmd string)
 	}
 	session, err := client.NewSession()
 	if err != nil {
-		return "", fmt.Errorf("创建 SSH 会话失败: %w", err)
+		// 旧长连接失效自愈重试一次
+		p.Invalidate(cfg)
+		client, _, err = p.GetClient(cfg)
+		if err != nil {
+			return "", fmt.Errorf("重新连接 SSH 失败: %w", err)
+		}
+		session, err = client.NewSession()
+		if err != nil {
+			return "", fmt.Errorf("创建 SSH 会话失败: %w", err)
+		}
 	}
 	defer session.Close()
 
@@ -332,5 +465,42 @@ func (p *Pool) UploadFile(ctx context.Context, cfg *ServerConfig, localPath stri
 		}
 	}
 
+	return nil
+}
+
+// ReadRemoteFile 通过 SFTP 读取远程服务器上的文本文件内容
+func (p *Pool) ReadRemoteFile(cfg *ServerConfig, remotePath string) (string, error) {
+	_, sftpCli, err := p.GetClient(cfg)
+	if err != nil {
+		return "", err
+	}
+	remotePath = filepath.ToSlash(remotePath)
+	f, err := sftpCli.Open(remotePath)
+	if err != nil {
+		return "", fmt.Errorf("打开远程文件 %s 失败: %w", remotePath, err)
+	}
+	defer f.Close()
+	b, err := io.ReadAll(f)
+	if err != nil {
+		return "", fmt.Errorf("读取远程文件 %s 失败: %w", remotePath, err)
+	}
+	return string(b), nil
+}
+
+// WriteRemoteFile 通过 SFTP 将修改后的文本内容写回远程服务器文件
+func (p *Pool) WriteRemoteFile(cfg *ServerConfig, remotePath string, content string) error {
+	_, sftpCli, err := p.GetClient(cfg)
+	if err != nil {
+		return err
+	}
+	remotePath = filepath.ToSlash(remotePath)
+	f, err := sftpCli.Create(remotePath)
+	if err != nil {
+		return fmt.Errorf("打开远程文件 %s 写入失败: %w", remotePath, err)
+	}
+	defer f.Close()
+	if _, err := f.Write([]byte(content)); err != nil {
+		return fmt.Errorf("写入远程文件 %s 失败: %w", remotePath, err)
+	}
 	return nil
 }

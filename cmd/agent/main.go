@@ -25,12 +25,23 @@ import (
 var version = "2.0-local"
 
 func main() {
-	cfgPath := flag.String("config", "config.yaml", "配置文件路径")
+	cfgPath := flag.String("config", "", "配置文件路径 (默认优先使用 config.yaml 或 config.dev.yaml)")
 	flag.Parse()
 
-	cfg, err := config.Load(*cfgPath)
+	targetCfg := *cfgPath
+	if targetCfg == "" {
+		if _, err := os.Stat("config.yaml"); err == nil {
+			targetCfg = "config.yaml"
+		} else if _, err := os.Stat("config.dev.yaml"); err == nil {
+			targetCfg = "config.dev.yaml"
+		} else {
+			targetCfg = "config.yaml"
+		}
+	}
+
+	cfg, err := config.Load(targetCfg)
 	if err != nil {
-		log.Fatalf("加载配置失败: %v", err)
+		log.Fatalf("加载配置失败 [%s]: %v", targetCfg, err)
 	}
 
 	if abs, err := filepath.Abs(cfg.Server.DataDir); err == nil {

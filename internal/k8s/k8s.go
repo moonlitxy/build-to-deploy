@@ -209,6 +209,22 @@ func (c *Client) RolloutStatus(ctx context.Context, w io.Writer, srv *sshpool.Se
 	return c.Pool.RunCommand(ctx, srv, cmd, w)
 }
 
+// RestartDeployment 执行 Deployment 滚动重启
+func (c *Client) RestartDeployment(ctx context.Context, srv *sshpool.ServerConfig, namespace, deployment string) error {
+	if namespace == "" {
+		namespace = "default"
+	}
+	if c.DryRun {
+		return nil
+	}
+	cmd := fmt.Sprintf("kubectl -n %s rollout restart deployment/%s", namespace, deployment)
+	out, err := c.Pool.ExecuteOutput(ctx, srv, cmd)
+	if err != nil {
+		return fmt.Errorf("重启 Deployment %s 失败: %w (%s)", deployment, err, out)
+	}
+	return nil
+}
+
 func formatDuration(d time.Duration) string {
 	if d < time.Minute {
 		return fmt.Sprintf("%ds", int(d.Seconds()))

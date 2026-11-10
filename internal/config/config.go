@@ -34,6 +34,11 @@ type AppConfig struct {
 	ServerID    string `yaml:"serverId" json:"serverId"` // 关联的 SSH 服务器 ID
 	Type        string `yaml:"type" json:"type"`         // jar | go | binary
 
+	// 本地编译配置（可选，支持本地一键编译后再通过 VPN 上传产物，也可不编译直接上传）
+	LocalProjectDir   string `yaml:"localProjectDir" json:"localProjectDir"`     // 本地项目源码目录，如 /Users/mac/work/order-service
+	LocalBuildCmd     string `yaml:"localBuildCmd" json:"localBuildCmd"`         // 本地编译命令，如 mvn clean package -DskipTests
+	LocalArtifactPath string `yaml:"localArtifactPath" json:"localArtifactPath"` // 本地编译生成的默认产物路径（可相对 LocalProjectDir），如 target/order-service.jar
+
 	// 目录分离配置（满足需求 2）
 	ArtifactDir string `yaml:"artifactDir" json:"artifactDir"` // 产物单独目录，如 /data/artifacts/order-service
 	BuildDir    string `yaml:"buildDir" json:"buildDir"`       // 镜像构建单独目录，如 /data/docker-build/order-service
@@ -95,21 +100,22 @@ func Default() *Config {
 		},
 		Apps: []*AppConfig{
 			{
-				ID:          "order-service",
-				Name:        "order-service",
-				Description: "订单服务",
-				ServerID:    "default-linux",
-				Type:        "jar",
-				ArtifactDir: "/data/artifacts/order-service",
-				BuildDir:    "/data/docker-build/order-service",
-				K8sYamlDir:  "/data/k8s/order-service",
-				Image:       "harbor.example.com/app/order-service",
-				BuildCmd:    "cd {{.BuildDir}} && docker build -t {{.Image}}:{{.Tag}} .",
-				PushCmd:     "docker push {{.Image}}:{{.Tag}}",
-				DeployCmd:   "kubectl -n {{.Namespace}} set image deployment/{{.Deployment}} {{.Container}}={{.Image}}:{{.Tag}}",
-				Namespace:   "prod",
-				Deployment:  "order-service",
-				Container:   "order-service",
+				ID:             "order-service",
+				Name:           "order-service",
+				Description:    "订单服务",
+				ServerID:       "default-linux",
+				Type:           "jar",
+				ArtifactDir:    "/data/packages/order-service",
+				BuildDir:       "/data/docker-build/order-service",
+				K8sYamlDir:     "/data/k8s-yaml",
+				K8sYamlFile:    "order-service.yaml",
+				Image:          "harbor.example.com/app/order-service",
+				BuildCmd:       "cd {{.BuildDir}} && docker build -t {{.Image}}:{{.Tag}} .",
+				PushCmd:        "",
+				DeployCmd:      "kubectl apply -f {{.K8sYamlPath}}",
+				Namespace:      "prod",
+				Deployment:     "order-service",
+				Container:      "order-service",
 				RolloutTimeout: 300,
 				AutoRollback:   true,
 			},
@@ -137,11 +143,7 @@ func (c *Config) normalize() {
 		}
 		if app.DeployCmd == "" {
 			if app.K8sYamlFile != "" {
-				if app.K8sYamlDir != "" {
-					app.DeployCmd = "kubectl apply -f {{.K8sYamlDir}}/{{.K8sYamlFile}}"
-				} else {
-					app.DeployCmd = "kubectl apply -f {{.K8sYamlFile}}"
-				}
+				app.DeployCmd = "kubectl apply -f {{.K8sYamlPath}}"
 			} else if app.K8sYamlDir != "" {
 				app.DeployCmd = "kubectl apply -f {{.K8sYamlDir}}"
 			} else {
@@ -170,14 +172,7 @@ func (c *Config) normalize() {
 func (c *Config) Save() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	b, err := yaml.Marshal(c)
-	if err != nil {
-		return err
-	}
-	if c.path == "" {
-		c.path = "config.yaml"
-	}
-	return os.WriteFile(c.path, b, 0644)
+	return c.saveUnlocked()
 }
 
 func (c *Config) FindApp(idOrName string) *AppConfig {
@@ -275,3 +270,31 @@ func (c *Config) saveUnlocked() error {
 	}
 	return os.WriteFile(c.path, b, 0644)
 }
+
+func expandHome(p string) string {
+	p = strings.TrimSpace(p)
+	if strings.HasPrefix(p, "~/") || strings.HasPrefix(p, "~\\") {
+		if home, err := os.UserHomeDir(); err == nil {
+			return filepath.Join(home, p[2:])
+		}
+	}
+	return p
+}
+
+// ResolveLocalProjectDir 返回展开 ~ 后的本地项目目录路径
+func (a *AppConfig) ResolveLocalProjectDir() string {
+	return expandHome(a.LocalProjectDir)
+}
+
+// ResolveLocalArtifactPath 返回展开 ~ 且结合 LocalProjectDir 解析后的本地默认产物绝对路径
+func (a *AppConfig) ResolveLocalArtifactPath() string {
+	p := expandHome(a.LocalArtifactPath)
+	if p == "" {
+		return ""
+	}
+	if !filepath.IsAbs(p) && strings.TrimSpace(a.LocalProjectDir) != "" {
+		return filepath.Join(a.ResolveLocalProjectDir(), p)
+	}
+	return p
+}
+

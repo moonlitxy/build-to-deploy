@@ -10,6 +10,8 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -49,11 +51,15 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/servers", s.saveServer)
 	mux.HandleFunc("DELETE /api/servers/{id}", s.deleteServer)
 	mux.HandleFunc("POST /api/servers/test", s.testServer)
+	mux.HandleFunc("POST /api/servers/disconnect", s.disconnectServer)
+	mux.HandleFunc("GET /api/servers/connections", s.activeConnections)
 
 	// 应用管理（支持产物目录、构建目录、K8s目录独立配置）
 	mux.HandleFunc("GET /api/apps", s.listApps)
 	mux.HandleFunc("POST /api/apps", s.saveApp)
 	mux.HandleFunc("DELETE /api/apps/{id}", s.deleteApp)
+	mux.HandleFunc("GET /api/apps/{id}/local-artifact", s.inspectLocalArtifact)
+	mux.HandleFunc("POST /api/local/pick-path", s.pickLocalPath)
 
 	// 预检版本冲突（满足需求 2）
 	mux.HandleFunc("POST /api/precheck", s.precheck)
@@ -62,6 +68,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/k8s/namespaces", s.getNamespaces)
 	mux.HandleFunc("GET /api/k8s/pods", s.getPods)
 	mux.HandleFunc("GET /api/k8s/pod-logs", s.getPodLogs)
+	mux.HandleFunc("POST /api/k8s/restart", s.restartDeployment)
 
 	// 本地文件分片上传
 	mux.HandleFunc("POST /api/uploads", s.createUpload)
@@ -72,6 +79,7 @@ func (s *Server) Handler() http.Handler {
 	// 发布流水线
 	mux.HandleFunc("GET /api/releases", s.listReleases)
 	mux.HandleFunc("POST /api/releases", s.startRelease)
+	mux.HandleFunc("POST /api/releases/{id}/rollback", s.rollbackRelease)
 	mux.HandleFunc("GET /api/releases/{id}", s.getRelease)
 	mux.HandleFunc("GET /api/releases/{id}/events", s.releaseEvents)
 	mux.HandleFunc("GET /api/releases/{id}/log", s.releaseLog)
@@ -155,15 +163,64 @@ func (s *Server) testServer(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if srv.Host == "" && srv.ID != "" {
+		if existing := s.cfg.FindServer(srv.ID); existing != nil {
+			srv = *existing
+		}
+	}
 	if s.cfg.Server.DryRun {
-		writeJSON(w, http.StatusOK, map[string]string{"message": "[dry-run] 连接测试通过 (模拟)"})
+		s.pool.MarkSimulated(&srv)
+		writeJSON(w, http.StatusOK, map[string]string{"message": fmt.Sprintf("SSH 长连接已建立 [%s@%s] (演练模式)", srv.User, srv.Host)})
 		return
 	}
 	if err := s.pool.TestConnection(&srv); err != nil {
 		writeErr(w, http.StatusBadRequest, "SSH 连接失败: "+err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"message": "SSH 连接成功！心跳长连接已保持。"})
+	writeJSON(w, http.StatusOK, map[string]string{"message": fmt.Sprintf("SSH 连接成功 [%s@%s]！心跳长连接已保持。", srv.User, srv.Host)})
+}
+
+func (s *Server) disconnectServer(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ServerID string `json:"serverId"`
+	}
+	_ = readJSON(r, &req)
+	n := s.pool.Disconnect(req.ServerID)
+	msg := fmt.Sprintf("已断开 %d 个 SSH 长连接并释放本地资源", n)
+	if n == 0 {
+		msg = "当前没有活动的长连接"
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":      true,
+		"closed":  n,
+		"message": msg,
+	})
+}
+
+func (s *Server) activeConnections(w http.ResponseWriter, r *http.Request) {
+	keys := s.pool.ActiveKeys()
+	var details []map[string]string
+	for _, k := range keys {
+		if srv := s.cfg.FindServer(k); srv != nil && srv.ID == k {
+			details = append(details, map[string]string{
+				"id":   srv.ID,
+				"name": srv.Name,
+				"host": srv.Host,
+				"user": srv.User,
+			})
+		} else {
+			details = append(details, map[string]string{
+				"id":   k,
+				"name": k,
+				"host": k,
+			})
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"active":  keys,
+		"servers": details,
+		"count":   len(keys),
+	})
 }
 
 // ---------- 应用配置管理 ----------
@@ -199,6 +256,91 @@ func (s *Server) deleteApp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) inspectLocalArtifact(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	app := s.cfg.FindApp(id)
+	if app == nil {
+		writeErr(w, http.StatusNotFound, "应用不存在")
+		return
+	}
+	resolved := app.ResolveLocalArtifactPath()
+	hasLocalBuild := strings.TrimSpace(app.LocalBuildCmd) != "" && resolved != ""
+	res := map[string]any{
+		"configured":    resolved != "",
+		"hasLocalBuild": hasLocalBuild,
+		"projectDir":    app.ResolveLocalProjectDir(),
+		"buildCmd":      app.LocalBuildCmd,
+		"path":          resolved,
+		"exists":        false,
+	}
+	if resolved != "" {
+		if st, err := os.Stat(resolved); err == nil && !st.IsDir() {
+			res["exists"] = true
+			res["fileName"] = st.Name()
+			res["size"] = st.Size()
+			res["modTime"] = st.ModTime()
+		}
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+// pickLocalPath 唤起本机系统原生的文件夹或文件选择对话框，返回真实绝对路径
+func (s *Server) pickLocalPath(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Mode   string `json:"mode"` // "dir" 或 "file"
+		Prompt string `json:"prompt"`
+	}
+	_ = readJSON(r, &req)
+	isDir := req.Mode == "dir"
+	prompt := req.Prompt
+	if prompt == "" {
+		if isDir {
+			prompt = "请选择本地项目源码目录"
+		} else {
+			prompt = "请选择本地构建产物文件"
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 120*time.Second)
+	defer cancel()
+
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		script := fmt.Sprintf(`POSIX path of (choose file with prompt %q)`, prompt)
+		if isDir {
+			script = fmt.Sprintf(`POSIX path of (choose folder with prompt %q)`, prompt)
+		}
+		cmd = exec.CommandContext(ctx, "osascript", "-e", script)
+	case "windows":
+		var ps string
+		if isDir {
+			ps = `Add-Type -AssemblyName System.Windows.Forms; $f = New-Object System.Windows.Forms.FolderBrowserDialog; if ($f.ShowDialog() -eq 'OK') { Write-Output $f.SelectedPath }`
+		} else {
+			ps = `Add-Type -AssemblyName System.Windows.Forms; $f = New-Object System.Windows.Forms.OpenFileDialog; if ($f.ShowDialog() -eq 'OK') { Write-Output $f.FileName }`
+		}
+		cmd = exec.CommandContext(ctx, "powershell", "-NoProfile", "-Command", ps)
+	default:
+		if isDir {
+			cmd = exec.CommandContext(ctx, "zenity", "--file-selection", "--directory", "--title="+prompt)
+		} else {
+			cmd = exec.CommandContext(ctx, "zenity", "--file-selection", "--title="+prompt)
+		}
+	}
+
+	out, err := cmd.Output()
+	if err != nil {
+		// 用户点击了取消
+		writeJSON(w, http.StatusOK, map[string]any{"canceled": true, "path": ""})
+		return
+	}
+	selected := strings.TrimSpace(string(out))
+	if isDir && len(selected) > 1 {
+		selected = strings.TrimRight(selected, "/")
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"canceled": false, "path": selected})
 }
 
 // ---------- 预检版本冲突 (需求 2) ----------
@@ -290,6 +432,35 @@ func (s *Server) getPodLogs(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"logs": logs})
 }
 
+func (s *Server) restartDeployment(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ServerID   string `json:"serverId"`
+		Namespace  string `json:"namespace"`
+		Deployment string `json:"deployment"`
+	}
+	if err := readJSON(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	srv := s.cfg.FindServer(req.ServerID)
+	if srv == nil {
+		writeErr(w, http.StatusBadRequest, "未指定或找不到 SSH 服务器")
+		return
+	}
+	if req.Deployment == "" {
+		writeErr(w, http.StatusBadRequest, "Deployment 名称不能为空")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+
+	if err := s.kube.RestartDeployment(ctx, srv, req.Namespace, req.Deployment); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": fmt.Sprintf("Deployment %s 重启指令已成功下发", req.Deployment)})
+}
+
 // ---------- 上传接口 ----------
 
 func (s *Server) createUpload(w http.ResponseWriter, r *http.Request) {
@@ -354,22 +525,35 @@ func (s *Server) listReleases(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) startRelease(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		AppID    string `json:"appId"`
-		Tag      string `json:"tag"`
-		UploadID string `json:"uploadId"`
-		Force    bool   `json:"force"`
-		Remark   string `json:"remark"`
+		AppID             string `json:"appId"`
+		Tag               string `json:"tag"`
+		UploadID          string `json:"uploadId"`
+		RunLocalBuild     bool   `json:"runLocalBuild"`
+		UseLocalArtifact  bool   `json:"useLocalArtifact"`
+		LocalArtifactPath string `json:"localArtifactPath"`
+		Force             bool   `json:"force"`
+		Remark            string `json:"remark"`
 	}
 	if err := readJSON(r, &req); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	// 如果用户在发布界面直接选定了新的本地产物路径，自动持久化保存到该应用配置中，下次打开自动复用
+	if strings.TrimSpace(req.LocalArtifactPath) != "" {
+		if app := s.cfg.FindApp(req.AppID); app != nil {
+			cp := *app
+			cp.LocalArtifactPath = strings.TrimSpace(req.LocalArtifactPath)
+			_ = s.cfg.UpdateApp(&cp)
+		}
+	}
 	rel, err := s.engine.StartDeploy(pipeline.StartRequest{
-		AppID:    req.AppID,
-		Tag:      strings.TrimSpace(req.Tag),
-		UploadID: req.UploadID,
-		Force:    req.Force,
-		Remark:   req.Remark,
+		AppID:            req.AppID,
+		Tag:              strings.TrimSpace(req.Tag),
+		UploadID:         req.UploadID,
+		RunLocalBuild:    req.RunLocalBuild,
+		UseLocalArtifact: req.UseLocalArtifact,
+		Force:            req.Force,
+		Remark:           req.Remark,
 	})
 	if err != nil {
 		var ce *pipeline.ConflictError
@@ -384,6 +568,24 @@ func (s *Server) startRelease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, rel)
+}
+
+func (s *Server) rollbackRelease(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var req struct {
+		Remark string `json:"remark"`
+	}
+	_ = readJSON(r, &req)
+
+	rel, err := s.engine.StartRollback(pipeline.RollbackRequest{
+		ReleaseID: id,
+		Remark:    req.Remark,
+	})
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusAccepted, rel)
 }
 
 func (s *Server) getRelease(w http.ResponseWriter, r *http.Request) {

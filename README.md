@@ -30,15 +30,15 @@
 
 ## 快速使用
 
-### 1. 本地启动（Windows / Mac / Linux）
+### 1. 本地极简启动（Mac / Linux / Windows）
 
-直接双击或在终端运行：
-```powershell
-.\bin\build-to-deploy.exe -config config.dev.yaml
+在项目根目录下直接运行（自动探测并加载配置文件）：
+```bash
+go run .
 ```
 
 打开本地浏览器访问：
-👉 **http://localhost:8080**
+👉 **http://localhost:8080** (无需输入任何登录密码)
 
 ### 2. 发布操作流程
 

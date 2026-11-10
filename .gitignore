@@ -1,5 +1,10 @@
 /bin/
 /data/
 /data-dev/
+data/
+logs/
+*.log
+*.part
 config.yaml
 *.exe
+.DS_Store

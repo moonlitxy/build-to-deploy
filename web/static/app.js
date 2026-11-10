@@ -3,17 +3,61 @@
 const $ = (id) => document.getElementById(id);
 const CHUNK_SIZE = 4 * 1024 * 1024;
 const TAG_RE = /^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$/;
+const PREFS_KEY = 'btd_user_prefs_v1';
 
 const state = {
   apps: [],
   servers: [],
+  activeServerIds: [],
+  activeServers: [],
+  deployMode: 'upload', // 'upload' | 'local_build'
+  localArtifactInfo: null,
   selectedFile: null,
   uploadId: null,
   releaseId: null,
   eventSource: null,
   isDeploying: false,
   pendingReleaseParams: null,
+  prefs: {
+    selectedAppId: '',
+    deployModeByApp: {},
+    useDefaultArtifactByApp: {},
+    lastTagByApp: {},
+  },
 };
+
+function loadPrefs() {
+  try {
+    const raw = localStorage.getItem(PREFS_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      state.prefs = {
+        selectedAppId: parsed.selectedAppId || '',
+        deployModeByApp: parsed.deployModeByApp || {},
+        useDefaultArtifactByApp: parsed.useDefaultArtifactByApp || {},
+        lastTagByApp: parsed.lastTagByApp || {},
+      };
+    }
+  } catch (_) {}
+}
+
+function savePrefs() {
+  try {
+    localStorage.setItem(PREFS_KEY, JSON.stringify(state.prefs));
+  } catch (_) {}
+}
+
+async function pickLocalPath(mode, promptText) {
+  const res = await api('POST', '/api/local/pick-path', { mode, prompt: promptText });
+  if (!res.ok) {
+    alert(`打开本地文件选择器失败: ${res.data.error || '未知错误'}`);
+    return null;
+  }
+  if (res.data.canceled || !res.data.path) {
+    return null;
+  }
+  return res.data.path;
+}
 
 // ---------------- 基础工具函数 ----------------
 async function api(method, url, body) {
@@ -53,11 +97,28 @@ function escapeHtml(str) {
 }
 
 // ---------------- 初始化 ----------------
+function clearBrowserAutofill() {
+  const badValues = ['admin', 'root', 'deploy'];
+  ['tagInput', 'remarkInput'].forEach((id) => {
+    const el = $(id);
+    if (el && badValues.includes(el.value.trim().toLowerCase())) {
+      el.value = '';
+    }
+  });
+}
+
 document.addEventListener('DOMContentLoaded', async () => {
+  loadPrefs();
   setupTabs();
   setupDropZone();
   setupButtons();
+  $('remarkInput').value = '';
+  $('tagInput').value = '';
+  // 多重延迟防御浏览器密码管理器把保存的 admin 自动填入 Tag 或备注输入框
+  [50, 150, 400, 900].forEach((ms) => setTimeout(clearBrowserAutofill, ms));
   await refreshConfigs();
+  await updateConnStatus();
+  setInterval(updateConnStatus, 10000);
 });
 
 function setupTabs() {
@@ -94,8 +155,12 @@ async function refreshConfigs() {
 }
 
 function renderAppSelects() {
+  const prevVal = $('deployAppSelect').value || state.prefs.selectedAppId;
   const opts = state.apps.map((a) => `<option value="${a.id}">${escapeHtml(a.name)} (${escapeHtml(a.type)})</option>`).join('');
   $('deployAppSelect').innerHTML = opts || '<option value="">暂无应用，请先在配置中添加</option>';
+  if (prevVal && state.apps.some((a) => a.id === prevVal)) {
+    $('deployAppSelect').value = prevVal;
+  }
   $('historyAppFilter').innerHTML = '<option value="">全部应用</option>' + opts;
 
   // Pod 页面服务器下拉
@@ -110,14 +175,123 @@ function updatePathPreview() {
     $('appPathPreview').classList.add('hidden');
     return;
   }
+  // 保存上次选择的应用
+  state.prefs.selectedAppId = appId;
+  savePrefs();
+
+  // 恢复该应用上次选择的构建/上传模式
+  const savedMode = state.prefs.deployModeByApp[appId];
+  if (savedMode && (savedMode === 'upload' || savedMode === 'local_build') && savedMode !== state.deployMode) {
+    switchDeployMode(savedMode, false);
+  }
+
   $('appPathPreview').classList.remove('hidden');
   const srv = state.servers.find((s) => s.id === app.serverId);
   $('pvServer').textContent = srv ? `${srv.name} (${srv.user}@${srv.host})` : (app.serverId || '-');
   $('pvArtifactDir').textContent = app.artifactDir || '未配置';
   $('pvBuildDir').textContent = app.buildDir || '未配置';
-  const yamlPath = app.k8sYamlFile ? (app.k8sYamlDir ? `${app.k8sYamlDir}/${app.k8sYamlFile}` : app.k8sYamlFile) : (app.k8sYamlDir || '未配置');
-  $('pvYamlDir').textContent = yamlPath;
-  $('pvImage').textContent = app.image || '未配置';
+  if (app.k8sYamlDir && app.k8sYamlFile) {
+    $('pvYamlDir').innerHTML = `<span>${escapeHtml(app.k8sYamlDir)}/</span><strong style="color:#2563eb">${escapeHtml(app.k8sYamlFile)}</strong>`;
+  } else {
+    $('pvYamlDir').textContent = app.k8sYamlFile || app.k8sYamlDir || '未配置';
+  }
+  const curTag = $('tagInput').value.trim() || '<Tag>';
+  $('pvImage').innerHTML = app.image
+    ? `<span>${escapeHtml(app.image)}:</span><strong style="color:#059669">${escapeHtml(curTag)}</strong>`
+    : '未配置';
+
+  // 更新本地编译配置预览
+  $('pvLocalDir').textContent = app.localProjectDir || '未配置 (可在应用配置中设置)';
+  $('pvLocalCmd').textContent = app.localBuildCmd || '未配置 (请点击右上角“修改编译配置”填写)';
+  $('pvLocalArtifact').textContent = app.localArtifactPath || '未配置';
+
+  inspectLocalArtifact(app.id);
+}
+
+async function inspectLocalArtifact(appId) {
+  if (!appId) return;
+  const res = await api('GET', `/api/apps/${encodeURIComponent(appId)}/local-artifact`);
+  if (!res.ok) return;
+  const info = res.data;
+  state.localArtifactInfo = info;
+
+  const quickBox = $('localArtifactQuickBox');
+  const checkEl = $('useDefaultArtifactCheck');
+  const badgeEl = $('localArtifactStatusBadge');
+  const pathEl = $('localArtifactPathText');
+
+  quickBox.classList.remove('hidden');
+
+  if (!info.configured) {
+    quickBox.classList.add('missing');
+    badgeEl.textContent = '未设置默认产物路径';
+    pathEl.textContent = '可点击右侧“📄 选择文件”选取本地产物并自动记住该路径';
+    checkEl.checked = false;
+    checkEl.disabled = true;
+    updateDropZoneVisual();
+    return;
+  }
+
+  pathEl.textContent = info.path;
+
+  if (info.exists) {
+    quickBox.classList.remove('missing');
+    badgeEl.textContent = `已就绪 · ${fmtSize(info.size)} (${fmtTime(info.modTime)})`;
+    checkEl.disabled = false;
+    const savedPref = state.prefs.useDefaultArtifactByApp[appId];
+    if (!state.selectedFile) {
+      checkEl.checked = savedPref !== undefined ? !!savedPref : true;
+    }
+  } else {
+    quickBox.classList.add('missing');
+    badgeEl.textContent = '本地暂未生成此文件 (可点击右侧“📄 选择文件”重新指定)';
+    checkEl.checked = false;
+    checkEl.disabled = true;
+  }
+  updateDropZoneVisual();
+}
+
+function switchDeployMode(mode, persist = true) {
+  state.deployMode = mode;
+  const appId = $('deployAppSelect') ? $('deployAppSelect').value : '';
+  if (persist && appId) {
+    state.prefs.deployModeByApp[appId] = mode;
+    savePrefs();
+  }
+  document.querySelectorAll('#deployModeTabs .mode-tab-btn').forEach((btn) => {
+    btn.classList.toggle('active', btn.dataset.mode === mode);
+  });
+
+  const isLocalBuild = mode === 'local_build';
+  $('directUploadPanel').classList.toggle('hidden', isLocalBuild);
+  $('localBuildPanel').classList.toggle('hidden', !isLocalBuild);
+
+  const startBtn = $('startDeployBtn');
+  if (isLocalBuild) {
+    startBtn.classList.add('mode-local-build');
+    startBtn.innerHTML = '<span class="btn-icon">⚡</span> 执行本地编译并上传部署';
+  } else {
+    startBtn.classList.remove('mode-local-build');
+    startBtn.innerHTML = '<span class="btn-icon">🚀</span> 开始上传并构建部署';
+  }
+}
+
+function updateDropZoneVisual() {
+  const dropZone = $('dropZone');
+  const useDefault = $('useDefaultArtifactCheck') && $('useDefaultArtifactCheck').checked;
+  if (state.selectedFile) {
+    dropZone.classList.add('has-file');
+    dropZone.classList.remove('disabled-zone');
+    $('dropText').textContent = `已选择手动文件: ${state.selectedFile.name} (${fmtSize(state.selectedFile.size)})`;
+  } else if (useDefault && state.localArtifactInfo && state.localArtifactInfo.exists) {
+    dropZone.classList.remove('has-file');
+    dropZone.classList.add('disabled-zone');
+    $('dropText').textContent = '当前已勾选使用上方本地默认产物 (也可点击此处重选其他文件)';
+  } else {
+    dropZone.classList.remove('has-file');
+    dropZone.classList.remove('disabled-zone');
+    $('dropText').textContent = '点击选择 或 将编译好的产物拖拽至此处';
+  }
 }
 
 $('deployAppSelect').addEventListener('change', updatePathPreview);
@@ -150,9 +324,10 @@ function setupDropZone() {
 
 function handleSelectedFile(file) {
   state.selectedFile = file;
-  const dropZone = $('dropZone');
-  dropZone.classList.add('has-file');
-  $('dropText').textContent = `已选择: ${file.name} (${fmtSize(file.size)})`;
+  if ($('useDefaultArtifactCheck')) {
+    $('useDefaultArtifactCheck').checked = false;
+  }
+  updateDropZoneVisual();
 
   // 自动从文件名提取 tag (例如 order-service-1.2.3.jar -> v1.2.3)
   if (!$('tagInput').value.trim()) {
@@ -175,6 +350,110 @@ function setupButtons() {
   $('podSearchInput').addEventListener('input', filterPodsTable);
   $('closePodLogBtn').addEventListener('click', () => $('podLogModal').classList.add('hidden'));
 
+  // 构建与上传模式切换绑定
+  document.querySelectorAll('#deployModeTabs .mode-tab-btn').forEach((btn) => {
+    btn.addEventListener('click', () => switchDeployMode(btn.dataset.mode));
+  });
+
+  if ($('useDefaultArtifactCheck')) {
+    $('useDefaultArtifactCheck').addEventListener('change', (e) => {
+      if (e.target.checked) {
+        state.selectedFile = null;
+        $('fileInput').value = '';
+      }
+      const appId = $('deployAppSelect').value;
+      if (appId) {
+        state.prefs.useDefaultArtifactByApp[appId] = e.target.checked;
+        savePrefs();
+      }
+      updateDropZoneVisual();
+    });
+  }
+
+  // 发布页：直接点击“📄 选择文件”选取本地产物文件并自动保存到当前应用配置
+  if ($('quickPickLocalArtifactBtn')) {
+    $('quickPickLocalArtifactBtn').addEventListener('click', async () => {
+      const appId = $('deployAppSelect').value;
+      const app = state.apps.find((a) => a.id === appId);
+      if (!app) return alert('请先选择目标应用');
+      const btn = $('quickPickLocalArtifactBtn');
+      const origText = btn.textContent;
+      btn.textContent = '选择中...';
+      btn.disabled = true;
+      const picked = await pickLocalPath('file', `请选择 ${app.name} 的本地编译产物文件`);
+      btn.textContent = origText;
+      btn.disabled = false;
+      if (!picked) return;
+
+      app.localArtifactPath = picked;
+      const saveRes = await api('POST', '/api/apps', app);
+      if (saveRes.ok) {
+        state.selectedFile = null;
+        $('fileInput').value = '';
+        state.prefs.useDefaultArtifactByApp[appId] = true;
+        savePrefs();
+        await inspectLocalArtifact(appId);
+        // 自动尝试从文件名提取版本号
+        if (!$('tagInput').value.trim()) {
+          const baseName = picked.split(/[\\/]/).pop() || '';
+          const match = baseName.match(/(\d+\.\d+(?:\.\d+)?)/);
+          if (match) {
+            $('tagInput').value = 'v' + match[1];
+          }
+        }
+      }
+    });
+  }
+
+  // 编辑应用弹窗：点击“📂 选择目录”或“📄 选择文件”
+  if ($('pickProjectDirBtn')) {
+    $('pickProjectDirBtn').addEventListener('click', async () => {
+      const btn = $('pickProjectDirBtn');
+      const orig = btn.textContent;
+      btn.textContent = '打开中...';
+      btn.disabled = true;
+      const picked = await pickLocalPath('dir', '请选择本地项目源码根目录');
+      btn.textContent = orig;
+      btn.disabled = false;
+      if (picked) {
+        $('editAppLocalProjectDir').value = picked;
+      }
+    });
+  }
+
+  if ($('pickArtifactFileBtn')) {
+    $('pickArtifactFileBtn').addEventListener('click', async () => {
+      const btn = $('pickArtifactFileBtn');
+      const orig = btn.textContent;
+      btn.textContent = '打开中...';
+      btn.disabled = true;
+      const picked = await pickLocalPath('file', '请选择本地编译产出文件 (.jar / .tar.gz / .zip)');
+      btn.textContent = orig;
+      btn.disabled = false;
+      if (picked) {
+        $('editAppLocalArtifactPath').value = picked;
+      }
+    });
+  }
+
+  if ($('appConfigSearchInput')) {
+    $('appConfigSearchInput').addEventListener('input', () => renderAppCards());
+  }
+
+  if ($('quickEditAppBuildBtn')) {
+    $('quickEditAppBuildBtn').addEventListener('click', () => {
+      const appId = $('deployAppSelect').value;
+      if (appId) window.editApp(appId);
+    });
+  }
+
+  if ($('cancelReleaseBtn')) {
+    $('cancelReleaseBtn').addEventListener('click', async () => {
+      if (!state.releaseId) return;
+      await api('POST', `/api/releases/${state.releaseId}/cancel`);
+    });
+  }
+
   // 配置相关模态框事件
   $('addServerBtn').addEventListener('click', () => openServerModal());
   $('closeServerModalBtn').addEventListener('click', () => $('serverModal').classList.add('hidden'));
@@ -188,6 +467,40 @@ function setupButtons() {
   $('addAppBtn').addEventListener('click', () => openAppModal());
   $('closeAppModalBtn').addEventListener('click', () => $('appModal').classList.add('hidden'));
   $('saveAppBtn').addEventListener('click', saveApp);
+  if ($('connectSrvBtn')) {
+    $('connectSrvBtn').addEventListener('click', connectCurrentServer);
+  }
+  $('disconnectAllBtn').addEventListener('click', disconnectAllConnections);
+  $('tagInput').addEventListener('input', () => {
+    const appId = $('deployAppSelect').value;
+    const app = state.apps.find((a) => a.id === appId);
+    if (app && app.image) {
+      const curTag = $('tagInput').value.trim() || '<Tag>';
+      $('pvImage').innerHTML = `<span>${escapeHtml(app.image)}:</span><strong style="color:#059669">${escapeHtml(curTag)}</strong>`;
+    }
+  });
+
+  // 应用配置弹窗联动：输入应用名或点击“按应用名自动填充”时自动生成独立构建目录、独立YAML文件名与独立镜像名
+  if ($('autoFillAppPathsBtn')) {
+    $('autoFillAppPathsBtn').addEventListener('click', () => autoFillAppPathsByName(true));
+  }
+  if ($('editAppName')) {
+    $('editAppName').addEventListener('input', () => {
+      if (!$('editAppId').value) {
+        autoFillAppPathsByName(false);
+      }
+    });
+  }
+  if ($('tplYamlApplyBtn')) {
+    $('tplYamlApplyBtn').addEventListener('click', () => {
+      $('editAppDeployCmd').value = "kubectl apply -f {{.K8sYamlPath}}";
+    });
+  }
+  if ($('tplSetImageBtn')) {
+    $('tplSetImageBtn').addEventListener('click', () => {
+      $('editAppDeployCmd').value = "kubectl -n {{.Namespace}} set image deployment/{{.Deployment}} {{.Container}}={{.Image}}:{{.Tag}}";
+    });
+  }
 }
 
 async function onStartDeployClick() {
@@ -197,10 +510,33 @@ async function onStartDeployClick() {
   const remark = $('remarkInput').value.trim();
 
   if (!appId) return alert('请先选择要发布的应用');
-  if (!state.selectedFile) return alert('请先选择本地构建产物 (Jar 或 二进制文件)');
+  const app = state.apps.find((a) => a.id === appId);
+
+  const isLocalBuild = state.deployMode === 'local_build';
+  const useDefaultArtifact = !isLocalBuild && !state.selectedFile && $('useDefaultArtifactCheck') && $('useDefaultArtifactCheck').checked;
+
+  // 保存当前应用的发布模式与选项，以便下次打开直接恢复
+  state.prefs.selectedAppId = appId;
+  state.prefs.deployModeByApp[appId] = state.deployMode;
+  state.prefs.useDefaultArtifactByApp[appId] = !!useDefaultArtifact;
+  if (tag) {
+    state.prefs.lastTagByApp[appId] = tag;
+  }
+  savePrefs();
+
+  if (isLocalBuild) {
+    if (!app || !app.localBuildCmd || !app.localArtifactPath) {
+      return alert('当前应用尚未配置“本地编译命令”或“本地编译产出文件路径”，请先点击“修改编译配置”填写！');
+    }
+  } else {
+    if (!state.selectedFile && !useDefaultArtifact) {
+      return alert('请先选择本地构建产物文件，或切换至“⚡ 本地一键编译并上传”模式');
+    }
+  }
+
   if (!tag || !TAG_RE.test(tag)) return alert('请输入合法的镜像 Tag (只能包含字母、数字、点、减号、下划线)');
 
-  appendLog(`\n[本地] 准备发布应用: ${appId}, Tag: ${tag}`);
+  appendLog(`\n[本地] 准备发布应用: ${appId}, Tag: ${tag} (${isLocalBuild ? '本地一键编译并上传' : '直接上传已有产物'})`);
   appendLog('[本地] 正在向服务器执行版本预检 (Precheck)...');
 
   // 1. 版本冲突预检 (需求 2 核心要求)
@@ -213,13 +549,13 @@ async function onStartDeployClick() {
   const conflicts = preRes.data.conflicts || [];
   if (conflicts.length > 0) {
     // 发现同版本 Tag，弹出确认弹窗
-    state.pendingReleaseParams = { appId, tag, remark };
+    state.pendingReleaseParams = { appId, tag, remark, isLocalBuild, useDefaultArtifact };
     showConflictModal(conflicts, tag);
     return;
   }
 
   // 无冲突，直接开始
-  startDeployPipeline(appId, tag, remark, false);
+  startDeployPipeline(appId, tag, remark, false, isLocalBuild, useDefaultArtifact);
 }
 
 function showConflictModal(conflicts, tag) {
@@ -231,27 +567,36 @@ function showConflictModal(conflicts, tag) {
 async function onConfirmConflictDeploy() {
   $('conflictModal').classList.add('hidden');
   if (!state.pendingReleaseParams) return;
-  const { appId, tag, remark } = state.pendingReleaseParams;
+  const { appId, tag, remark, isLocalBuild, useDefaultArtifact } = state.pendingReleaseParams;
   appendLog(`[确认覆盖] 用户确认强制覆盖同名镜像版本: ${tag}`);
-  startDeployPipeline(appId, tag, remark, true);
+  startDeployPipeline(appId, tag, remark, true, isLocalBuild, useDefaultArtifact);
 }
 
-async function startDeployPipeline(appId, tag, remark, force) {
+async function startDeployPipeline(appId, tag, remark, force, isLocalBuild, useDefaultArtifact) {
   state.isDeploying = true;
   $('startDeployBtn').disabled = true;
-  updateStatus('running', '正在上传产物...');
+  $('cancelReleaseBtn').classList.remove('hidden');
+  updateStatus('running', isLocalBuild ? '正在执行本地编译...' : '正在准备产物...');
 
   try {
-    // 2. 本地文件分片上传
-    const upId = await uploadFileChunks(state.selectedFile);
-    state.uploadId = upId;
+    let upId = '';
+    if (!isLocalBuild && state.selectedFile) {
+      // 2. 手动选择的本地文件分片上传至本地暂存区
+      updateStatus('running', '正在上传产物...');
+      upId = await uploadFileChunks(state.selectedFile);
+      state.uploadId = upId;
+    }
 
     // 3. 发起发布任务
-    appendLog('[本地] 产物已上传至暂存区，触发服务器构建部署流水线...');
+    appendLog(isLocalBuild
+      ? '[本地] 触发本地一键编译与远程构建部署流水线...'
+      : '[本地] 产物就绪，触发远程服务器构建部署流水线...');
     const startRes = await api('POST', '/api/releases', {
       appId,
       tag,
       uploadId: upId,
+      runLocalBuild: !!isLocalBuild,
+      useLocalArtifact: !!useDefaultArtifact,
       force,
       remark,
     });
@@ -262,6 +607,8 @@ async function startDeployPipeline(appId, tag, remark, force) {
 
     state.releaseId = startRes.data.id;
     appendLog(`[成功] 流水线已启动，任务 ID: ${state.releaseId}`);
+    $('remarkInput').value = '';
+    updateConnStatus();
 
     // 4. 监听 SSE 实时进度与日志
     listenReleaseEvents(state.releaseId);
@@ -270,6 +617,7 @@ async function startDeployPipeline(appId, tag, remark, force) {
     updateStatus('failed', '发布失败');
     state.isDeploying = false;
     $('startDeployBtn').disabled = false;
+    $('cancelReleaseBtn').classList.add('hidden');
   }
 }
 
@@ -351,7 +699,9 @@ function listenReleaseEvents(releaseId) {
     es.close();
     state.isDeploying = false;
     $('startDeployBtn').disabled = false;
+    $('cancelReleaseBtn').classList.add('hidden');
     $('uploadProgressContainer').classList.add('hidden');
+    updatePathPreview();
   });
 
   es.onerror = () => {
@@ -479,7 +829,10 @@ function renderPodsTable(pods) {
       <td>${escapeHtml(p.node || '-')}</td>
       <td><div style="font-size:11px;max-width:280px;word-break:break-all">${(p.images || []).map(escapeHtml).join('<br>')}</div></td>
       <td>
-        <button class="btn btn-secondary btn-sm" onclick="viewPodLog('${escapeHtml(p.name)}', '${escapeHtml(p.containers[0] || '')}')">查看日志</button>
+        <div style="display:flex;gap:6px;">
+          <button class="btn btn-secondary btn-sm" onclick="viewPodLog('${escapeHtml(p.name)}')">查看日志</button>
+          <button class="btn btn-secondary btn-sm" title="滚动重启该 Deployment" onclick="restartPodDeployment('${escapeHtml(p.name)}')">🔄 重启</button>
+        </div>
       </td>
     </tr>`;
   }).join('');
@@ -497,23 +850,116 @@ function filterPodsTable() {
   renderPodsTable(filtered);
 }
 
+let podLogTimer = null;
+let currentViewingPod = null;
+let currentViewingContainer = '';
+
+function stopPodLogFollow() {
+  if (podLogTimer) {
+    clearInterval(podLogTimer);
+    podLogTimer = null;
+  }
+}
+
 window.viewPodLog = async function (podName, containerName) {
   const srvId = $('podServerSelect').value;
   const ns = $('podNamespaceSelect').value;
+  currentViewingPod = podName;
+
+  const podObj = currentPods.find((p) => p.name === podName);
+  const containers = (podObj && podObj.containers) ? podObj.containers : [];
+
+  const wrapEl = $('podLogContainerWrap');
+  const selectEl = $('podLogContainerSelect');
+
+  if (containers.length > 1) {
+    wrapEl.classList.remove('hidden');
+    selectEl.innerHTML = containers.map((c) => `<option value="${escapeHtml(c)}"${c === containerName ? ' selected' : ''}>${escapeHtml(c)}</option>`).join('');
+    currentViewingContainer = containerName || selectEl.value;
+    selectEl.onchange = () => {
+      currentViewingContainer = selectEl.value;
+      fetchPodLogContent(srvId, ns, currentViewingPod, currentViewingContainer);
+    };
+  } else {
+    wrapEl.classList.add('hidden');
+    currentViewingContainer = containerName || (containers[0] || '');
+  }
+
   $('podLogTitle').textContent = `Pod 日志: ${podName}`;
   $('podLogContent').innerHTML = '<span class="log-debug">正在获取最新日志...</span>';
   $('podLogModal').classList.remove('hidden');
 
-  $('refreshLogBtn').onclick = () => window.viewPodLog(podName, containerName);
+  $('refreshLogBtn').onclick = () => fetchPodLogContent(srvId, ns, currentViewingPod, currentViewingContainer);
 
+  $('autoFollowPodLog').onchange = (e) => {
+    stopPodLogFollow();
+    if (e.target.checked) {
+      podLogTimer = setInterval(() => {
+        fetchPodLogContent(srvId, ns, currentViewingPod, currentViewingContainer, true);
+      }, 2500);
+    }
+  };
+
+  await fetchPodLogContent(srvId, ns, currentViewingPod, currentViewingContainer);
+};
+
+async function fetchPodLogContent(srvId, ns, podName, containerName, isAuto) {
   const res = await api('GET', `/api/k8s/pod-logs?serverId=${encodeURIComponent(srvId)}&namespace=${encodeURIComponent(ns)}&pod=${encodeURIComponent(podName)}&container=${encodeURIComponent(containerName)}&tail=200`);
   if (!res.ok) {
-    $('podLogContent').innerHTML = `<span class="log-err">获取日志失败: ${escapeHtml(res.data.error || '未知错误')}</span>`;
+    if (!isAuto) {
+      $('podLogContent').innerHTML = `<span class="log-err">获取日志失败: ${escapeHtml(res.data.error || '未知错误')}</span>`;
+    }
     return;
   }
   const raw = res.data.logs || '';
   window._rawPodLog = raw;
   $('podLogContent').innerHTML = colorizeLog(raw);
+  if ($('autoFollowPodLog').checked) {
+    const el = $('podLogContent');
+    el.scrollTop = el.scrollHeight;
+  }
+}
+
+$('closePodLogBtn').addEventListener('click', () => {
+  stopPodLogFollow();
+  $('autoFollowPodLog').checked = false;
+  $('podLogModal').classList.add('hidden');
+});
+
+window.restartPodDeployment = async function (podName) {
+  const srvId = $('podServerSelect').value;
+  const ns = $('podNamespaceSelect').value;
+
+  // 推断 Deployment 名称：匹配 app 中的 deployment 或者按 pod 名称切分
+  let deployName = '';
+  const matchedApp = state.apps.find((a) => a.deployment && podName.startsWith(a.deployment));
+  if (matchedApp) {
+    deployName = matchedApp.deployment;
+  } else {
+    const parts = podName.split('-');
+    if (parts.length >= 3) {
+      deployName = parts.slice(0, parts.length - 2).join('-');
+    } else {
+      deployName = podName;
+    }
+  }
+
+  const ok = confirm(`确定要对 Deployment [${deployName}] (命名空间: ${ns}) 执行滚动重启吗？\n将执行: kubectl -n ${ns} rollout restart deployment/${deployName}`);
+  if (!ok) return;
+
+  const res = await api('POST', '/api/k8s/restart', {
+    serverId: srvId,
+    namespace: ns,
+    deployment: deployName,
+  });
+
+  if (!res.ok) {
+    alert(`重启失败: ${res.data.error || '未知错误'}`);
+    return;
+  }
+
+  alert(`✔ 重启指令已下发！请稍候刷新查看 Pod 重建进度。`);
+  setTimeout(loadPods, 1500);
 };
 
 // ---------------- 服务器管理 (长连接池保持) ----------------
@@ -522,20 +968,97 @@ function renderServerCards() {
     $('serverCardsList').innerHTML = '<div class="config-hint">尚未配置服务器，请点击右上角添加。</div>';
     return;
   }
-  $('serverCardsList').innerHTML = state.servers.map((s) => `
-    <div class="item-card">
-      <div class="item-card-header">
-        <span class="item-card-title">${escapeHtml(s.name)}</span>
-        <div>
-          <button class="btn btn-secondary btn-sm" onclick="testOneServer('${s.id}')">⚡ 测试长连接</button>
-          <button class="btn btn-secondary btn-sm" onclick="editServer('${s.id}')">编辑</button>
-          <button class="btn btn-danger btn-sm" onclick="deleteServer('${s.id}')">删除</button>
+  $('serverCardsList').innerHTML = state.servers.map((s) => {
+    const isConnected = state.activeServerIds.includes(s.id);
+    const statusBadge = isConnected
+      ? '<span class="pod-status-badge pod-status-running" style="margin-left:8px;">🟢 已建立长连接</span>'
+      : '<span class="pod-status-badge" style="margin-left:8px;background:#f1f5f9;color:#64748b;">⚪ 未连接</span>';
+    return `
+      <div class="item-card">
+        <div class="item-card-header">
+          <span class="item-card-title">${escapeHtml(s.name)}${statusBadge}</span>
+          <div style="display:flex;gap:6px;">
+            <button class="btn btn-secondary btn-sm" onclick="testOneServer('${s.id}')">${isConnected ? '🔄 重新检测' : '⚡ 建立连接'}</button>
+            ${isConnected ? `<button class="btn btn-secondary btn-sm" style="color:#ef4444;" onclick="disconnectOneServer('${s.id}')">🔌 断开连接</button>` : ''}
+            <button class="btn btn-secondary btn-sm" onclick="editServer('${s.id}')">编辑</button>
+            <button class="btn btn-danger btn-sm" onclick="deleteServer('${s.id}')">删除</button>
+          </div>
         </div>
+        <div class="item-card-desc">连接信息: <code>${escapeHtml(s.user)}@${escapeHtml(s.host)}:${s.port || 22}</code> (认证: ${s.authType === 'key' ? '私钥' : '密码'})</div>
+        <div class="item-card-desc">连接池机制: 首次连接或发布时自动建立 SSH 长连接并保持心跳，仅在已连接状态下可手动断开释放句柄</div>
       </div>
-      <div class="item-card-desc">连接信息: <code>${escapeHtml(s.user)}@${escapeHtml(s.host)}:${s.port || 22}</code> (认证: ${s.authType === 'key' ? '私钥' : '密码'})</div>
-      <div class="item-card-desc">连接池机制: 常驻长连接保持，免重复握手验证</div>
-    </div>
-  `).join('');
+    `;
+  }).join('');
+}
+
+async function connectCurrentServer() {
+  const appId = $('deployAppSelect').value;
+  const app = state.apps.find((a) => a.id === appId);
+  let srv = app ? state.servers.find((s) => s.id === app.serverId) : null;
+  if (!srv && state.servers.length > 0) {
+    srv = state.servers[0];
+  }
+  if (!srv) {
+    return alert('尚未配置 SSH 服务器，请先在“服务器与目录配置”中添加');
+  }
+  const btn = $('connectSrvBtn');
+  const origText = btn.textContent;
+  btn.textContent = '连接中...';
+  btn.disabled = true;
+  const res = await api('POST', '/api/servers/test', srv);
+  btn.textContent = origText;
+  btn.disabled = false;
+  if (res.ok) {
+    await updateConnStatus();
+  } else {
+    alert(`✖ 连接失败: ${res.data.error || '未知错误'}`);
+  }
+}
+
+window.disconnectOneServer = async function (srvId) {
+  const res = await api('POST', '/api/servers/disconnect', { serverId: srvId });
+  if (res.ok) {
+    await updateConnStatus();
+  } else {
+    alert(`断开失败: ${res.data.error || '未知错误'}`);
+  }
+};
+
+async function disconnectAllConnections() {
+  const res = await api('POST', '/api/servers/disconnect', {});
+  if (res.ok) {
+    await updateConnStatus();
+  }
+}
+
+async function updateConnStatus() {
+  const res = await api('GET', '/api/servers/connections');
+  if (res.ok) {
+    const count = res.data.count || 0;
+    state.activeServerIds = res.data.active || [];
+    state.activeServers = res.data.servers || [];
+
+    const dot = $('connStatusDot');
+    const txt = $('connStatusText');
+    const connBtn = $('connectSrvBtn');
+    const discBtn = $('disconnectAllBtn');
+
+    if (count > 0) {
+      const names = state.activeServers.map((s) => `${s.name} (${s.host})`).join(', ');
+      if (dot) dot.classList.add('connected');
+      txt.textContent = `SSH 已连接 · ${names || count + ' 台主机'}`;
+      txt.className = 'conn-text connected';
+      if (connBtn) connBtn.classList.add('hidden');
+      if (discBtn) discBtn.classList.remove('hidden');
+    } else {
+      if (dot) dot.classList.remove('connected');
+      txt.textContent = 'SSH 未连接';
+      txt.className = 'conn-text';
+      if (connBtn) connBtn.classList.remove('hidden');
+      if (discBtn) discBtn.classList.add('hidden');
+    }
+    renderServerCards();
+  }
 }
 
 window.testOneServer = async function (srvId) {
@@ -543,6 +1066,7 @@ window.testOneServer = async function (srvId) {
   if (!srv) return;
   const res = await api('POST', '/api/servers/test', srv);
   if (res.ok) {
+    await updateConnStatus();
     alert(`✔ ${res.data.message || '连接测试成功！'}`);
   } else {
     alert(`✖ 连接失败: ${res.data.error || '未知错误'}`);
@@ -623,43 +1147,121 @@ async function saveServer() {
 
 // ---------------- 应用配置管理 (独立目录配置) ----------------
 function renderAppCards() {
+  if ($('appCountBadge')) {
+    $('appCountBadge').textContent = `${state.apps.length} 个服务`;
+  }
   if (state.apps.length === 0) {
     $('appCardsList').innerHTML = '<div class="config-hint">尚未配置应用，请点击右上角添加。</div>';
     return;
   }
-  $('appCardsList').innerHTML = state.apps.map((a) => `
+  const kw = ($('appConfigSearchInput') ? $('appConfigSearchInput').value : '').trim().toLowerCase();
+  const filtered = kw
+    ? state.apps.filter((a) =>
+        (a.name || '').toLowerCase().includes(kw) ||
+        (a.image || '').toLowerCase().includes(kw) ||
+        (a.k8sYamlFile || '').toLowerCase().includes(kw) ||
+        (a.namespace || '').toLowerCase().includes(kw)
+      )
+    : state.apps;
+
+  if (filtered.length === 0) {
+    $('appCardsList').innerHTML = '<div class="config-hint">未找到匹配搜索关键词的服务配置。</div>';
+    return;
+  }
+
+  $('appCardsList').innerHTML = filtered.map((a) => `
     <div class="item-card">
       <div class="item-card-header">
-        <span class="item-card-title">${escapeHtml(a.name)} (${escapeHtml(a.type)})</span>
-        <div>
+        <span class="item-card-title">${escapeHtml(a.name)} <span class="app-type-tag">${escapeHtml(a.type)}</span></span>
+        <div style="display:flex;gap:6px;">
           <button class="btn btn-secondary btn-sm" onclick="editApp('${a.id}')">编辑</button>
           <button class="btn btn-danger btn-sm" onclick="deleteApp('${a.id}')">删除</button>
         </div>
       </div>
-      <div class="item-card-desc"><strong>产物目录:</strong> <code>${escapeHtml(a.artifactDir || '-')}</code></div>
-      <div class="item-card-desc"><strong>构建目录:</strong> <code>${escapeHtml(a.buildDir || '-')}</code></div>
-      <div class="item-card-desc"><strong>K8s 配置:</strong> <code>${escapeHtml(a.k8sYamlFile ? (a.k8sYamlDir ? a.k8sYamlDir + '/' + a.k8sYamlFile : a.k8sYamlFile) : (a.k8sYamlDir || '-'))}</code></div>
-      <div class="item-card-desc"><strong>目标镜像:</strong> <code>${escapeHtml(a.image || '-')}</code></div>
-      <div class="item-card-desc"><strong>K8s 部署:</strong> ns: <code>${escapeHtml(a.namespace)}</code>, deploy: <code>${escapeHtml(a.deployment)}</code></div>
+      ${a.localBuildCmd || a.localArtifactPath ? `<div class="item-card-desc"><strong>⚡ 本地编译/默认产物:</strong> <code>${escapeHtml(a.localBuildCmd || '仅指定默认产物')}</code> (产物: <code>${escapeHtml(a.localArtifactPath || '-')}</code>)</div>` : ''}
+      <div class="item-card-desc"><strong>📦 独立产物目录:</strong> <code>${escapeHtml(a.artifactDir || '-')}</code></div>
+      <div class="item-card-desc"><strong>🔨 独立构建目录:</strong> <code>${escapeHtml(a.buildDir || '-')}</code></div>
+      <div class="item-card-desc"><strong>📄 共享 K8s 目录 + 独立 YAML:</strong> <code>${escapeHtml(a.k8sYamlDir || '-')}</code> / <code style="color:#2563eb;font-weight:700;">${escapeHtml(a.k8sYamlFile || (a.name + '.yaml'))}</code></div>
+      <div class="item-card-desc"><strong>🏷️ 独立镜像与动态 Tag:</strong> <code>${escapeHtml(a.image || '-')}:&lt;Tag&gt;</code></div>
+      <div class="item-card-desc"><strong>☸️ K8s 目标工作负载:</strong> ns: <code>${escapeHtml(a.namespace)}</code>, deployment: <code>${escapeHtml(a.deployment)}</code></div>
     </div>
   `).join('');
 }
 
+function getSharedK8sYamlDir() {
+  const found = state.apps.find((a) => a.k8sYamlDir);
+  return found ? found.k8sYamlDir : '/data/k8s-yaml';
+}
+
+function getImagePrefix() {
+  const found = state.apps.find((a) => a.image && a.image.includes('/'));
+  if (found) {
+    const idx = found.image.lastIndexOf('/');
+    return found.image.substring(0, idx + 1);
+  }
+  return 'harbor.example.com/app/';
+}
+
+function autoFillAppPathsByName(forceOverwrite) {
+  const name = $('editAppName').value.trim();
+  if (!name) return;
+  const imgPrefix = getImagePrefix();
+  const sharedYamlDir = getSharedK8sYamlDir();
+
+  if (forceOverwrite || !$('editAppImage').value.trim() || $('editAppImage').dataset.auto === '1') {
+    $('editAppImage').value = `${imgPrefix}${name}`;
+    $('editAppImage').dataset.auto = '1';
+  }
+  if (forceOverwrite || !$('editAppArtifactDir').value.trim() || $('editAppArtifactDir').dataset.auto === '1') {
+    $('editAppArtifactDir').value = `/data/packages/${name}`;
+    $('editAppArtifactDir').dataset.auto = '1';
+  }
+  if (forceOverwrite || !$('editAppBuildDir').value.trim() || $('editAppBuildDir').dataset.auto === '1') {
+    $('editAppBuildDir').value = `/data/docker-build/${name}`;
+    $('editAppBuildDir').dataset.auto = '1';
+  }
+  if (forceOverwrite || !$('editAppK8sYamlDir').value.trim()) {
+    $('editAppK8sYamlDir').value = sharedYamlDir;
+  }
+  if (forceOverwrite || !$('editAppK8sYamlFile').value.trim() || $('editAppK8sYamlFile').dataset.auto === '1') {
+    $('editAppK8sYamlFile').value = `${name}.yaml`;
+    $('editAppK8sYamlFile').dataset.auto = '1';
+  }
+  if (forceOverwrite || !$('editAppDeployment').value.trim() || $('editAppDeployment').dataset.auto === '1') {
+    $('editAppDeployment').value = name;
+    $('editAppDeployment').dataset.auto = '1';
+  }
+  if (forceOverwrite || !$('editAppContainer').value.trim() || $('editAppContainer').dataset.auto === '1') {
+    $('editAppContainer').value = name;
+    $('editAppContainer').dataset.auto = '1';
+  }
+}
+
 function openAppModal(app) {
+  const sharedYamlDir = getSharedK8sYamlDir();
   $('editAppId').value = app ? app.id : '';
   $('editAppName').value = app ? app.name : '';
   $('editAppType').value = app ? (app.type || 'jar') : 'jar';
   $('editAppImage').value = app ? (app.image || '') : '';
-  $('editAppArtifactDir').value = app ? (app.artifactDir || '') : '/data/packages';
-  $('editAppBuildDir').value = app ? (app.buildDir || '') : '/data/docker-build';
-  $('editAppK8sYamlDir').value = app ? (app.k8sYamlDir || '') : '/data/k8s-yaml';
-  $('editAppK8sYamlFile').value = app ? (app.k8sYamlFile || '') : '';
+  $('editAppImage').dataset.auto = app ? '0' : '1';
+  $('editAppLocalProjectDir').value = app ? (app.localProjectDir || '') : '';
+  $('editAppLocalBuildCmd').value = app ? (app.localBuildCmd || '') : '';
+  $('editAppLocalArtifactPath').value = app ? (app.localArtifactPath || '') : '';
+  $('editAppArtifactDir').value = app ? (app.artifactDir || '') : '';
+  $('editAppArtifactDir').dataset.auto = app ? '0' : '1';
+  $('editAppBuildDir').value = app ? (app.buildDir || '') : '';
+  $('editAppBuildDir').dataset.auto = app ? '0' : '1';
+  $('editAppK8sYamlDir').value = app ? (app.k8sYamlDir || sharedYamlDir) : sharedYamlDir;
+  $('editAppK8sYamlFile').value = app ? (app.k8sYamlFile || (app.name ? app.name + '.yaml' : '')) : '';
+  $('editAppK8sYamlFile').dataset.auto = app ? '0' : '1';
   $('editAppBuildCmd').value = app ? (app.buildCmd || '') : 'cd {{.BuildDir}} && docker build -t {{.Image}}:{{.Tag}} .';
   $('editAppPushCmd').value = app ? (app.pushCmd || '') : '';
   $('editAppDeployCmd').value = app ? (app.deployCmd || '') : 'kubectl apply -f {{.K8sYamlPath}}';
-  $('editAppNamespace').value = app ? (app.namespace || '') : 'default';
+  $('editAppNamespace').value = app ? (app.namespace || '') : 'prod';
   $('editAppDeployment').value = app ? (app.deployment || '') : '';
+  $('editAppDeployment').dataset.auto = app ? '0' : '1';
   $('editAppContainer').value = app ? (app.container || '') : '';
+  $('editAppContainer').dataset.auto = app ? '0' : '1';
 
   // 渲染绑定服务器选项
   $('editAppServerId').innerHTML = state.servers.map((s) => `
@@ -690,6 +1292,9 @@ async function saveApp() {
     type: $('editAppType').value,
     serverId: $('editAppServerId').value,
     image: $('editAppImage').value.trim(),
+    localProjectDir: $('editAppLocalProjectDir').value.trim(),
+    localBuildCmd: $('editAppLocalBuildCmd').value.trim(),
+    localArtifactPath: $('editAppLocalArtifactPath').value.trim(),
     artifactDir: $('editAppArtifactDir').value.trim(),
     buildDir: $('editAppBuildDir').value.trim(),
     k8sYamlDir: $('editAppK8sYamlDir').value.trim(),
@@ -716,7 +1321,6 @@ let rawHistoryList = [];
 
 async function loadHistory() {
   const appId = $('historyAppFilter').value;
-  $('historyTableBody').innerHTML = '<tr><td colspan="8" class="td-empty">正在加载历史发布记录...</td></tr>';
 
   const res = await api('GET', `/api/releases?limit=100${appId ? '&app=' + encodeURIComponent(appId) : ''}`);
   if (!res.ok) {
@@ -734,7 +1338,7 @@ function renderHistoryMetrics(list) {
   const successCount = list.filter((r) => r.status === 'success').length;
   const failedCount = list.filter((r) => r.status === 'failed').length;
   const forceCount = list.filter((r) => r.force).length;
-  const rate = total > 0 ? Math.round((successCount / total) * 100) : 100;
+  const rate = total > 0 ? Math.round((successCount / total) * 100) : 0;
 
   $('metricTotal').textContent = total;
   $('metricSuccessRate').textContent = rate + '%';
@@ -770,7 +1374,10 @@ function filterHistoryList() {
 
 function renderHistoryTable(list) {
   if (list.length === 0) {
-    $('historyTableBody').innerHTML = '<tr><td colspan="8" class="td-empty">未匹配到发布记录</td></tr>';
+    const emptyMsg = rawHistoryList.length === 0
+      ? '暂无发布记录（完成首次构建发布后将在此展示）'
+      : '未匹配到符合筛选条件的发布记录';
+    $('historyTableBody').innerHTML = `<tr><td colspan="8" class="td-empty">${emptyMsg}</td></tr>`;
     return;
   }
 
@@ -839,6 +1446,11 @@ function renderHistoryTable(list) {
             <button class="btn btn-secondary btn-sm" title="填入发布面板" onclick="reuseReleaseTag('${escapeHtml(r.app)}', '${escapeHtml(r.tag)}')">
               🚀 选用
             </button>
+            ${isSuccess ? `
+              <button class="btn btn-secondary btn-sm" style="color:#d97706;border-color:#fde68a;" title="回滚线上至此历史版本" onclick="triggerRollback('${r.id}')">
+                ↩️ 回滚
+              </button>
+            ` : ''}
           </div>
         </td>
       </tr>
@@ -893,3 +1505,59 @@ $('historyAppFilter').addEventListener('change', loadHistory);
 $('historyStatusFilter').addEventListener('change', filterHistoryList);
 $('historySearchInput').addEventListener('input', filterHistoryList);
 $('refreshHistoryBtn').addEventListener('click', loadHistory);
+
+// ---------------- 一键回滚流程交互 (优化项 1) ----------------
+let pendingRollbackRelease = null;
+
+window.triggerRollback = function (releaseId) {
+  const rel = rawHistoryList.find((r) => r.id === releaseId);
+  if (!rel) return;
+  pendingRollbackRelease = rel;
+
+  $('rbAppName').textContent = rel.app || '-';
+  $('rbTag').textContent = rel.tag || '-';
+  $('rbImage').textContent = rel.image || '-';
+  $('rollbackModal').classList.remove('hidden');
+};
+
+$('closeRollbackModalBtn').addEventListener('click', () => {
+  $('rollbackModal').classList.add('hidden');
+  pendingRollbackRelease = null;
+});
+
+$('rollbackCancelBtn').addEventListener('click', () => {
+  $('rollbackModal').classList.add('hidden');
+  pendingRollbackRelease = null;
+});
+
+$('rollbackConfirmBtn').addEventListener('click', async () => {
+  if (!pendingRollbackRelease) return;
+  const targetId = pendingRollbackRelease.id;
+  const targetTag = pendingRollbackRelease.tag;
+  const targetApp = pendingRollbackRelease.app;
+  $('rollbackModal').classList.add('hidden');
+
+  const res = await api('POST', `/api/releases/${targetId}/rollback`, {
+    remark: `回滚至历史版本 [${targetTag}]`,
+  });
+
+  if (!res.ok) {
+    alert(`发起回滚失败: ${res.data.error || '未知错误'}`);
+    return;
+  }
+
+  const newRel = res.data;
+  // 切换到控制台 TAB 1 并开启实时推流
+  document.querySelector('.tab-btn[data-tab="deploy"]').click();
+  $('deployAppSelect').value = targetApp;
+  $('tagInput').value = targetTag;
+  updatePathPreview();
+
+  $('logConsole').textContent = '';
+  $('pipelineStages').innerHTML = '';
+  updateStatus('running', '回滚部署中');
+  state.isDeploying = true;
+  $('startDeployBtn').disabled = true;
+
+  listenReleaseEvents(newRel.id);
+});

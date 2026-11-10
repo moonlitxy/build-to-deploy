@@ -4,10 +4,10 @@ LDFLAGS := -s -w -X main.version=$(VERSION)
 .PHONY: build linux dev
 
 build:
-	go build -trimpath -ldflags "$(LDFLAGS)" -o bin/build-to-deploy ./cmd/agent
+	go build -trimpath -ldflags "$(LDFLAGS)" -o bin/build-to-deploy .
 
 linux:
-	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS)" -o bin/build-to-deploy-linux-amd64 ./cmd/agent
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS)" -o bin/build-to-deploy-linux-amd64 .
 
 dev:
-	go run ./cmd/agent -config config.dev.yaml
+	go run .
