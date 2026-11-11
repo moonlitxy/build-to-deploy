@@ -313,9 +313,32 @@ func (s *Server) testServer(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if srv.Host == "" && srv.ID != "" {
+	// 页面上回传的是脱敏占位符（或用户只改了部分字段）：按 ID 取已保存的真实凭据补全。
+	// 之前只在下发 host 为空时才回退，导致连接按钮把 "******" 当密码发送，认证必然失败。
+	if srv.ID != "" {
 		if existing := s.cfg.FindServer(srv.ID); existing != nil {
-			srv = *existing
+			if srv.Host == "" {
+				srv.Host = existing.Host
+			}
+			if srv.User == "" {
+				srv.User = existing.User
+			}
+			if srv.Port <= 0 {
+				srv.Port = existing.Port
+			}
+			if srv.AuthType == "" {
+				srv.AuthType = existing.AuthType
+			}
+			if srv.KeyPath == "" {
+				srv.KeyPath = existing.KeyPath
+			}
+			// 用户显式输入的新密码优先；留空或仍是掩码时使用已保存值
+			if srv.Password == "" || srv.Password == maskedValue {
+				srv.Password = existing.Password
+			}
+			if srv.Passphrase == "" || srv.Passphrase == maskedValue {
+				srv.Passphrase = existing.Passphrase
+			}
 		}
 	}
 	// 通过快照读取：直接访问 cfg.Server 会绕过读写锁，与配置保存并发时构成数据竞争

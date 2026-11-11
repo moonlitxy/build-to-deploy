@@ -23,6 +23,8 @@ const state = {
     deployModeByApp: {},
     useDefaultArtifactByApp: {},
     lastTagByApp: {},
+    podServerId: '',
+    podNamespace: '',
   },
 };
 
@@ -36,6 +38,8 @@ function loadPrefs() {
         deployModeByApp: parsed.deployModeByApp || {},
         useDefaultArtifactByApp: parsed.useDefaultArtifactByApp || {},
         lastTagByApp: parsed.lastTagByApp || {},
+        podServerId: parsed.podServerId || '',
+        podNamespace: parsed.podNamespace || '',
       };
     }
   } catch (_) {}
@@ -164,9 +168,15 @@ function renderAppSelects() {
   }
   $('historyAppFilter').innerHTML = '<option value="">全部应用</option>' + opts;
 
-  // Pod 页面服务器下拉
+  // Pod 页面服务器下拉：优先恢复上次查看的服务器
   const srvOpts = state.servers.map((s) => `<option value="${escapeHtml(s.id)}">${escapeHtml(s.name)} (${escapeHtml(s.host)})</option>`).join('');
   $('podServerSelect').innerHTML = srvOpts || '<option value="">暂无服务器</option>';
+  const savedSrv = state.prefs.podServerId;
+  if (savedSrv && state.servers.some((s) => s.id === savedSrv)) {
+    $('podServerSelect').value = savedSrv;
+  } else if (state.servers.length > 0) {
+    $('podServerSelect').value = state.servers[0].id;
+  }
 }
 
 function updatePathPreview() {
@@ -346,8 +356,18 @@ function setupButtons() {
   $('conflictCancelBtn').addEventListener('click', () => $('conflictModal').classList.add('hidden'));
   $('clearLogBtn').addEventListener('click', () => { $('logConsole').textContent = ''; });
   $('refreshPodsBtn').addEventListener('click', loadPods);
-  $('podServerSelect').addEventListener('change', loadNamespacesAndPods);
-  $('podNamespaceSelect').addEventListener('change', loadPods);
+  $('podServerSelect').addEventListener('change', () => {
+    // 记住 Pod 监控页最后查看的服务器
+    state.prefs.podServerId = $('podServerSelect').value;
+    savePrefs();
+    loadNamespacesAndPods();
+  });
+  $('podNamespaceSelect').addEventListener('change', () => {
+    // 记住最后查看的命名空间
+    state.prefs.podNamespace = $('podNamespaceSelect').value;
+    savePrefs();
+    loadPods();
+  });
   $('podSearchInput').addEventListener('input', filterPodsTable);
   $('closePodLogBtn').addEventListener('click', () => $('podLogModal').classList.add('hidden'));
 
@@ -460,6 +480,7 @@ function setupButtons() {
   $('closeServerModalBtn').addEventListener('click', () => $('serverModal').classList.add('hidden'));
   $('saveServerBtn').addEventListener('click', saveServer);
   $('testServerConnBtn').addEventListener('click', testServerConnection);
+  bindServerPasswordToggle();
   if ($('refreshBackupsBtn')) $('refreshBackupsBtn').addEventListener('click', loadConfigBackups);
   $('editServerAuthType').addEventListener('change', (e) => {
     $('pwdGroup').classList.toggle('hidden', e.target.value === 'key');
@@ -738,18 +759,19 @@ function listenReleaseEvents(releaseId, isReconnect = false) {
   es.addEventListener('release', (e) => {
     const rel = JSON.parse(e.data);
     renderStages(rel.stages || []);
+    const finished = ['success', 'failed', 'canceled', 'rolledback'].includes(rel.status);
     if (rel.status === 'success') {
       updateStatus('success', '发布完成');
-      state.isDeploying = false;
-      $('startDeployBtn').disabled = false;
     } else if (rel.status === 'failed' || rel.status === 'canceled') {
       updateStatus('failed', rel.status === 'canceled' ? '已中止' : '发布失败');
-      state.isDeploying = false;
-      $('startDeployBtn').disabled = false;
     } else if (rel.status === 'rolledback') {
       updateStatus('failed', '已自动回滚');
+    }
+    // 终态立即收起中止按钮：不能等 SSE end，否则发布完成后仍显示可中止
+    if (finished) {
       state.isDeploying = false;
       $('startDeployBtn').disabled = false;
+      $('cancelReleaseBtn').classList.add('hidden');
     }
   });
 
@@ -885,6 +907,13 @@ async function loadNamespacesAndPods() {
   if (nsRes.ok && nsRes.data) {
     const opts = nsRes.data.map((ns) => `<option value="${escapeHtml(ns)}">${escapeHtml(ns)}</option>`).join('');
     $('podNamespaceSelect').innerHTML = opts || '<option value="default">default</option>';
+    // 恢复上次查看的命名空间；不存在时回到第一个
+    const savedNs = state.prefs.podNamespace;
+    if (savedNs && nsRes.data.includes(savedNs)) {
+      $('podNamespaceSelect').value = savedNs;
+    } else if (nsRes.data.length > 0) {
+      $('podNamespaceSelect').value = nsRes.data[0];
+    }
   }
   loadPods();
 }
@@ -893,6 +922,11 @@ async function loadPods() {
   const srvId = $('podServerSelect').value;
   const ns = $('podNamespaceSelect').value;
   if (!srvId) return;
+  // 记录当前命名空间，切换服务器自动回退到第一个时也能被记住
+  if (ns && state.prefs.podNamespace !== ns) {
+    state.prefs.podNamespace = ns;
+    savePrefs();
+  }
 
   $('podLoading').classList.remove('hidden');
   $('podsTableBody').innerHTML = '<tr><td colspan="9" class="td-empty">正在加载 Pod 状态...</td></tr>';
@@ -1179,6 +1213,34 @@ window.testOneServer = async function (srvId) {
   }
 };
 
+// syncPwdToggle 已保存的密码只显示 ******，此时禁用显示/隐藏按钮
+function syncPwdToggle() {
+  const input = $('editServerPassword');
+  const btn = $('toggleServerPwdBtn');
+  if (!input || !btn) return;
+  const masked = input.value === '******';
+  if (masked) {
+    input.type = 'password';
+    btn.textContent = '显示';
+  }
+  btn.disabled = masked;
+  btn.title = masked ? '已保存的密码不可查看' : '显示/隐藏输入内容';
+}
+
+function bindServerPasswordToggle() {
+  const input = $('editServerPassword');
+  const btn = $('toggleServerPwdBtn');
+  if (!input || !btn) return;
+  // 用户清空并输入新密码后，按钮恢复可用
+  input.addEventListener('input', syncPwdToggle);
+  btn.addEventListener('click', () => {
+    if (input.value === '******') return;
+    const show = input.type === 'password';
+    input.type = show ? 'text' : 'password';
+    btn.textContent = show ? '隐藏' : '显示';
+  });
+}
+
 function openServerModal(srv) {
   $('editServerId').value = srv ? srv.id : '';
   $('editServerName').value = srv ? srv.name : '';
@@ -1190,6 +1252,7 @@ function openServerModal(srv) {
   // 后端不再回传真实密码，仅返回 ****** 占位符：编辑时提示保留原密码
   $('editServerPassword').placeholder = srv && srv.password === '******' ? '已保存（留空或保持 ****** 表示不修改）' : '';
   $('editServerKeyPath').value = srv ? srv.keyPath : '';
+  syncPwdToggle();
 
   $('pwdGroup').classList.toggle('hidden', srv && srv.authType === 'key');
   $('keyGroup').classList.toggle('hidden', !srv || srv.authType !== 'key');
@@ -1548,7 +1611,7 @@ function renderHistoryTable(list) {
         </td>
         <td>
           <div class="history-row-actions">
-            <button class="btn btn-secondary btn-sm" onclick="openReleaseLogModal('${escapeHtml(r.id)}', '${escapeHtml(r.app)}', '${escapeHtml(r.tag)}')">
+            <button class="btn btn-secondary btn-sm" onclick="openReleaseLogModal('${escapeHtml(r.id)}', '${escapeHtml(r.app)}', '${escapeHtml(r.tag)}', '${escapeHtml(r.createdAt || '')}')">
               📋 查看日志
             </button>
             <button class="btn btn-secondary btn-sm" title="填入发布面板" onclick="reuseReleaseTag('${escapeHtml(r.app)}', '${escapeHtml(r.tag)}')">
@@ -1582,11 +1645,27 @@ window.reuseReleaseTag = function (appId, tag) {
   updatePathPreview();
 };
 
-window.openReleaseLogModal = async function (id, app, tag) {
+// buildLogFileName 生成下载文件名：服务名 + Tag + 发布时间，避免下载后分不清是哪个服务
+function buildLogFileName(app, tag, id, createdAt) {
+  const safe = (s) => String(s || '').replace(/[^\w.-]/g, '_');
+  let ts = '';
+  const d = createdAt ? new Date(createdAt) : null;
+  if (d && !isNaN(d.getTime())) {
+    const p = (n) => String(n).padStart(2, '0');
+    ts = `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+  } else {
+    ts = String(id || '').split('-')[0];
+  }
+  return `${safe(app)}_${safe(tag)}_${ts}.log`;
+}
+
+window.openReleaseLogModal = async function (id, app, tag, createdAt) {
   $('releaseLogModalTitle').textContent = `发布日志: ${app} [${tag}]`;
   $('releaseLogModalSub').textContent = `任务编号: ${id}`;
   $('releaseLogModalBody').innerHTML = '<span class="log-debug">正在获取构建日志...</span>';
-  $('downloadReleaseLogLink').href = `/api/releases/${id}/log`;
+  const link = $('downloadReleaseLogLink');
+  link.href = `/api/releases/${id}/log`;
+  link.download = buildLogFileName(app, tag, id, createdAt);
   $('releaseLogModal').classList.remove('hidden');
 
   let rawLog = '';

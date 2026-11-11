@@ -228,15 +228,28 @@ body {
 
 .form-card {
   height: 100%;
+  min-height: 0;
   overflow-y: auto;
   display: flex;
   flex-direction: column;
   margin-bottom: 0;
   padding: 16px 18px;
 }
+/* 面板标题固定，滚动表单内容时不再跟着移动 */
+.form-card .card-header {
+  position: sticky;
+  top: -16px;
+  z-index: 5;
+  background: var(--card-bg);
+  margin: -16px -18px 12px;
+  padding: 16px 18px 10px;
+  border-top-left-radius: 12px;
+  border-top-right-radius: 12px;
+}
 
 .terminal-card {
   height: 100%;
+  min-height: 0;
   display: flex;
   flex-direction: column;
   margin-bottom: 0;
@@ -246,6 +259,12 @@ body {
   margin-bottom: 10px;
   padding-bottom: 8px;
   flex-shrink: 0;
+}
+.pipe-header-left,
+.pipe-header-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
 }
 .stages-timeline {
   margin-bottom: 10px;
@@ -264,7 +283,7 @@ body {
 }
 .terminal-body {
   flex: 1;
-  height: 100% !important;
+  height: auto !important;
   min-height: 0 !important;
   max-height: none !important;
   overflow-y: auto;
@@ -1014,13 +1033,19 @@ input:focus, select:focus, textarea:focus {
   font-size: 12px;
   color: var(--text-muted);
   margin-bottom: 10px;
+  /* 弹窗内容滚动时工具栏保持可见 */
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  background: var(--card-bg);
+  padding: 6px 0 10px;
 }
 .log-actions {
   display: flex;
   gap: 8px;
 }
 
-/* 控制台日志语法高亮色彩体系 (根据窗口高度自动伸展) */
+/* 控制台日志语法高亮色彩体系：高度交给 flex 填充，避免固定高度溢出卡片导致底部被裁 */
 .terminal-body {
   padding: 16px 20px;
   font-family: Consolas, "JetBrains Mono", "Fira Code", Monaco, Menlo, monospace;
@@ -1028,9 +1053,10 @@ input:focus, select:focus, textarea:focus {
   line-height: 1.65;
   color: #e2e8f0;
   background: #0d1117;
-  height: calc(100vh - 280px);
-  min-height: 520px;
-  max-height: 840px;
+  flex: 1 1 auto;
+  min-height: 0;
+  height: auto;
+  max-height: none;
   overflow-y: auto;
   white-space: pre-wrap;
   word-break: break-all;
@@ -1183,6 +1209,12 @@ input:focus, select:focus, textarea:focus {
   display: flex;
   gap: 6px;
   align-items: center;
+}
+/* 三个行内操作按钮统一尺寸，避免文字长短导致宽高参差 */
+.history-row-actions .btn {
+  min-width: 96px;
+  min-height: 30px;
+  white-space: nowrap;
 }
 
 .hidden { display: none !important; }

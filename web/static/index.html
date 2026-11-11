@@ -149,9 +149,9 @@
         <div class="card-header">
           <div class="pipe-header-left">
             <h3>流水线执行状态</h3>
-            <span id="currentStatusBadge" class="status-pill status-idle">未开始</span>
           </div>
           <div class="pipe-header-right">
+            <span id="currentStatusBadge" class="status-pill status-idle">未开始</span>
             <button id="cancelReleaseBtn" class="btn btn-danger btn-sm hidden">中止发布</button>
           </div>
         </div>
@@ -475,7 +475,11 @@
       </div>
       <div class="form-group" id="pwdGroup">
         <label>SSH 登录密码</label>
-        <input type="password" id="editServerPassword" placeholder="输入密码 (仅保存在本地配置)" autocomplete="new-password">
+        <div class="input-with-btn">
+          <input type="password" id="editServerPassword" placeholder="输入密码 (仅保存在本地配置)" autocomplete="new-password">
+          <button type="button" class="btn btn-secondary btn-picker" id="toggleServerPwdBtn" title="显示/隐藏输入内容">显示</button>
+        </div>
+        <div class="hint">首次输入可切换显示核对；已保存的密码只显示 ******，不可查看</div>
       </div>
       <div class="form-group hidden" id="keyGroup">
         <label>本地私钥路径 (id_rsa)</label>
