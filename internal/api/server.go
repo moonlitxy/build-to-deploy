@@ -14,6 +14,8 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -127,11 +129,26 @@ func guard(next http.Handler) http.Handler {
 				writeErr(w, http.StatusForbidden, "跨站请求已被拒绝 (Origin 不匹配)")
 				return
 			}
+			// 跨站表单提交（text/plain 等"简单" Content-Type）不触发预检、也可能不带 Origin，
+			// 因此除上传分片外，写接口一律只接受 JSON
+			if ct := strings.ToLower(r.Header.Get("Content-Type")); ct != "" && !isJSONContentType(ct) && !(r.Method == http.MethodPut && strings.HasPrefix(ct, "application/octet-stream")) {
+				writeErr(w, http.StatusUnsupportedMediaType, "仅接受 application/json 请求体")
+				return
+			}
 		}
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Referrer-Policy", "no-referrer")
 		next.ServeHTTP(w, r)
 	})
+}
+
+func isJSONContentType(ct string) bool {
+	// 允许 "application/json; charset=utf-8" 这类带参数的形式
+	if i := strings.IndexByte(ct, ';'); i >= 0 {
+		ct = strings.TrimSpace(ct[:i])
+	}
+	return ct == "application/json"
 }
 
 func isLocalHost(hostport string) bool {
@@ -171,6 +188,27 @@ func writeErr(w http.ResponseWriter, code int, msg string) {
 	writeJSON(w, code, map[string]any{"error": msg})
 }
 
+// hostRe SSH 主机名 / 用户名白名单：不允许空白、引号、分号等可进入 shell 或显示信息的字符
+var hostRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:@%\[\]-]{0,253}$`)
+
+// checkID 校验会参与文件路径拼接的 ID（发布 ID、上传 ID、应用 ID）
+func checkID(id string) error {
+	if !config.IDRe.MatchString(id) {
+		return fmt.Errorf("ID 格式不合法: %q", id)
+	}
+	return nil
+}
+
+// releaseID 读取并校验路径中的发布 ID，失败时已写出响应
+func releaseID(w http.ResponseWriter, r *http.Request) (string, bool) {
+	id := r.PathValue("id")
+	if err := checkID(id); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return "", false
+	}
+	return id, true
+}
+
 func readJSON(r *http.Request, v any) error {
 	dec := json.NewDecoder(http.MaxBytesReader(nil, r.Body, 2<<20))
 	if err := dec.Decode(v); err != nil {
@@ -204,6 +242,23 @@ func (s *Server) saveServer(w http.ResponseWriter, r *http.Request) {
 	}
 	if srv.Host == "" || srv.User == "" {
 		writeErr(w, http.StatusBadRequest, "主机地址和用户名不能为空")
+		return
+	}
+	if srv.Port < 1 || srv.Port > 65535 {
+		writeErr(w, http.StatusBadRequest, "端口必须在 1-65535 之间")
+		return
+	}
+	// 主机、用户会被拼进 ssh command 的显示信息，认证方式决定是否会送出新添加的服务器本机凭据
+	if !hostRe.MatchString(srv.Host) {
+		writeErr(w, http.StatusBadRequest, "主机地址不合法（只允许域名、IPv4 或 IPv6 字面量）")
+		return
+	}
+	if !hostRe.MatchString(srv.User) {
+		writeErr(w, http.StatusBadRequest, "用户名不合法")
+		return
+	}
+	if srv.AuthType != "" && srv.AuthType != "password" && srv.AuthType != "key" && srv.AuthType != "agent" {
+		writeErr(w, http.StatusBadRequest, "认证方式只能是 password、key 或 agent")
 		return
 	}
 	// 编辑时前端回填的是脱敏占位符（或留空），收到时保留原凭据，避免把真实密码覆盖成 ******/空
@@ -339,6 +394,10 @@ func (s *Server) deleteApp(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) inspectLocalArtifact(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	if err := checkID(id); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	app := s.cfg.FindApp(id)
 	if app == nil {
 		writeErr(w, http.StatusNotFound, "应用不存在")
@@ -373,7 +432,7 @@ func (s *Server) pickLocalPath(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = readJSON(r, &req)
 	isDir := req.Mode == "dir"
-	prompt := req.Prompt
+	prompt := sanitizePrompt(req.Prompt)
 	if prompt == "" {
 		if isDir {
 			prompt = "请选择本地项目源码目录"
@@ -388,9 +447,9 @@ func (s *Server) pickLocalPath(w http.ResponseWriter, r *http.Request) {
 	var cmd *exec.Cmd
 	switch runtime.GOOS {
 	case "darwin":
-		script := fmt.Sprintf(`POSIX path of (choose file with prompt %q)`, prompt)
+		script := fmt.Sprintf(`POSIX path of (choose file with prompt "%s")`, prompt)
 		if isDir {
-			script = fmt.Sprintf(`POSIX path of (choose folder with prompt %q)`, prompt)
+			script = fmt.Sprintf(`POSIX path of (choose folder with prompt "%s")`, prompt)
 		}
 		cmd = exec.CommandContext(ctx, "osascript", "-e", script)
 	case "windows":
@@ -560,6 +619,10 @@ func (s *Server) createUpload(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) getUpload(w http.ResponseWriter, r *http.Request) {
+	if err := checkID(r.PathValue("id")); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	u, err := s.engine.Uploads.Get(r.PathValue("id"))
 	if err != nil {
 		writeErr(w, http.StatusNotFound, err.Error())
@@ -572,6 +635,10 @@ func (s *Server) writeChunk(w http.ResponseWriter, r *http.Request) {
 	offset, err := strconv.ParseInt(r.URL.Query().Get("offset"), 10, 64)
 	if err != nil || offset < 0 {
 		writeErr(w, http.StatusBadRequest, "offset 参数错误")
+		return
+	}
+	if err := checkID(r.PathValue("id")); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	body := http.MaxBytesReader(w, r.Body, maxChunkSize)
@@ -588,6 +655,10 @@ func (s *Server) writeChunk(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) completeUpload(w http.ResponseWriter, r *http.Request) {
+	if err := checkID(r.PathValue("id")); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	u, err := s.engine.Uploads.Complete(r.PathValue("id"))
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
@@ -606,7 +677,12 @@ func (s *Server) listReleases(w http.ResponseWriter, r *http.Request) {
 	if limit > maxListLimit {
 		limit = maxListLimit
 	}
-	writeJSON(w, http.StatusOK, s.engine.Store.List(r.URL.Query().Get("app"), limit))
+	appFilter := r.URL.Query().Get("app")
+	if appFilter != "" && !config.IDRe.MatchString(appFilter) {
+		writeErr(w, http.StatusBadRequest, "app 参数不合法")
+		return
+	}
+	writeJSON(w, http.StatusOK, s.engine.Store.List(appFilter, limit))
 }
 
 func (s *Server) startRelease(w http.ResponseWriter, r *http.Request) {
@@ -625,16 +701,20 @@ func (s *Server) startRelease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 如果用户在发布界面直接选定了新的本地产物路径，自动持久化保存到该应用配置中，下次打开自动复用
-	if strings.TrimSpace(req.LocalArtifactPath) != "" {
-		if app := s.cfg.FindApp(req.AppID); app != nil {
-			cp := *app
-			cp.LocalArtifactPath = strings.TrimSpace(req.LocalArtifactPath)
-			// 产物路径决定将被上传到远程的文件，拒绝包含控制字符的异常输入
-			if strings.ContainsFunc(cp.LocalArtifactPath, unicode.IsControl) {
-				writeErr(w, http.StatusBadRequest, "本地产物路径包含非法字符")
-				return
-			}
-			_ = s.cfg.UpdateApp(&cp)
+	if p := strings.TrimSpace(req.LocalArtifactPath); p != "" {
+		// 产物路径决定将被上传到远程的文件，拒绝包含控制字符的异常输入
+		if strings.ContainsFunc(p, unicode.IsControl) {
+			writeErr(w, http.StatusBadRequest, "本地产物路径包含非法字符")
+			return
+		}
+		// 只接受绝对路径：来源必须是文件选择器或用户显式填写的完整路径
+		if exp := config.ExpandHome(p); !filepath.IsAbs(exp) {
+			writeErr(w, http.StatusBadRequest, "本地产物路径必须是绝对路径")
+			return
+		}
+		if err := s.cfg.UpdateLocalArtifactPath(req.AppID, p); err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
 		}
 	}
 	rel, err := s.engine.StartDeploy(pipeline.StartRequest{
@@ -662,7 +742,10 @@ func (s *Server) startRelease(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) rollbackRelease(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
+	id, ok := releaseID(w, r)
+	if !ok {
+		return
+	}
 	var req struct {
 		Remark string `json:"remark"`
 	}
@@ -680,7 +763,11 @@ func (s *Server) rollbackRelease(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) getRelease(w http.ResponseWriter, r *http.Request) {
-	rel, err := s.engine.Store.Get(r.PathValue("id"))
+	id, ok := releaseID(w, r)
+	if !ok {
+		return
+	}
+	rel, err := s.engine.Store.Get(id)
 	if err != nil {
 		writeErr(w, http.StatusNotFound, err.Error())
 		return
@@ -689,7 +776,11 @@ func (s *Server) getRelease(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) cancelRelease(w http.ResponseWriter, r *http.Request) {
-	if err := s.engine.Cancel(r.PathValue("id")); err != nil {
+	id, ok := releaseID(w, r)
+	if !ok {
+		return
+	}
+	if err := s.engine.Cancel(id); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -697,7 +788,10 @@ func (s *Server) cancelRelease(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) releaseLog(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
+	id, ok := releaseID(w, r)
+	if !ok {
+		return
+	}
 	if _, err := s.engine.Store.Get(id); err != nil {
 		writeErr(w, http.StatusNotFound, err.Error())
 		return
@@ -708,7 +802,10 @@ func (s *Server) releaseLog(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) releaseEvents(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
+	id, ok := releaseID(w, r)
+	if !ok {
+		return
+	}
 	rel, err := s.engine.Store.Get(id)
 	if err != nil {
 		writeErr(w, http.StatusNotFound, err.Error())
@@ -815,11 +912,28 @@ func readLines(path string) []string {
 	var lines []string
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 64*1024), 1<<20)
+	// 环回写入：日志文件可能有数十万行，逐行 append+切片会反复搬运整个窗口
 	for sc.Scan() {
-		lines = append(lines, sc.Text())
-		if len(lines) > maxReadLines {
-			lines = lines[len(lines)-maxReadLines:]
+		if len(lines) < maxReadLines {
+			lines = append(lines, sc.Text())
+			continue
 		}
+		copy(lines, lines[1:])
+		lines[len(lines)-1] = sc.Text()
 	}
 	return lines
+}
+
+// sanitizePrompt 用户输入会被拼进 AppleScript 字符串或作为 zenity 参数，剔除引号、反斜杠与控制字符
+func sanitizePrompt(p string) string {
+	p = strings.Map(func(r rune) rune {
+		if r == '"' || r == '\\' || unicode.IsControl(r) {
+			return -1
+		}
+		return r
+	}, p)
+	if r := []rune(p); len(r) > 60 {
+		p = string(r[:60])
+	}
+	return p
 }

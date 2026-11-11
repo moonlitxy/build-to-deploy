@@ -50,9 +50,27 @@ func main() {
 	}
 
 	// 本服务无登录认证，能力等价于远程 root shell：仅允许监听本机回环地址，避免局域网任意主机操控发布
-	if h, _, _ := net.SplitHostPort(cfg.Server.Listen); h != "" && h != "localhost" {
-		if ip := net.ParseIP(h); ip == nil || !ip.IsLoopback() {
-			log.Fatalf("安全限制：listen 地址必须为本机回环地址 (如 127.0.0.1:8080)，当前配置为 %q", cfg.Server.Listen)
+	if h, port, err := net.SplitHostPort(cfg.Server.Listen); err != nil || port == "" {
+		log.Fatalf("安全限制：listen 必须形如 127.0.0.1:8080，当前配置为 %q", cfg.Server.Listen)
+	} else if h != "" && h != "localhost" {
+		// "localhost" 可能被 hosts 解析到内网地址，必须逐个校验其解析结果。
+		// 使用解析器（不走 HTTP_PROXY/SOCKS 代理）以免环境变量干扰判断，
+		// 但解析失败时直接退出，保留原有的严格校验
+		var addrs []net.IP
+		if ip := net.ParseIP(h); ip != nil {
+			addrs = []net.IP{ip}
+		} else if ips, err := (&net.Resolver{PreferGo: true}).LookupIPAddr(context.Background(), h); err == nil {
+			for _, a := range ips {
+				addrs = append(addrs, a.IP)
+			}
+		}
+		if len(addrs) == 0 {
+			log.Fatalf("安全限制：无法确认 listen 主机 %q 为本机回环地址", h)
+		}
+		for _, ip := range addrs {
+			if !ip.IsLoopback() {
+				log.Fatalf("安全限制：listen 地址必须为本机回环地址 (如 127.0.0.1:8080)，当前配置为 %q 解析到 %s", cfg.Server.Listen, ip)
+			}
 		}
 	}
 
@@ -101,6 +119,9 @@ func main() {
 		Addr:              cfg.Server.Listen,
 		Handler:           server.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		// 防止慢速请求体耗尽资源；SSE 不受影响（仅设置读超时，且远大于单个分片上传耗时）
+		ReadTimeout: 30 * time.Minute,
 	}
 
 	go func() {

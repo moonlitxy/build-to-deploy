@@ -43,6 +43,11 @@ type Client struct {
 	DryRun bool
 }
 
+// SetDryRun 切换演练模式（跟随当前加载的配置，配置在网页上修改后立即生效）
+func (c *Client) SetDryRun(v bool) {
+	c.DryRun = v
+}
+
 func NewClient(pool *sshpool.Pool, dryRun bool) *Client {
 	return &Client{
 		Pool:   pool,
@@ -104,7 +109,7 @@ func (c *Client) ListPods(ctx context.Context, srv *sshpool.ServerConfig, namesp
 		}, nil
 	}
 
-	cmd := fmt.Sprintf("kubectl get pods -n %s -o json", namespace)
+	cmd := fmt.Sprintf("kubectl get pods -n %s -o json", sshpool.ShellQuote(namespace))
 	out, err := c.Pool.ExecuteOutput(ctx, srv, cmd)
 	if err != nil {
 		return nil, fmt.Errorf("查询 Pod 列表失败: %w", err)
@@ -217,11 +222,10 @@ func (c *Client) GetPodLogs(ctx context.Context, srv *sshpool.ServerConfig, name
 		return fmt.Sprintf("[dry-run] 日志示例 - Pod: %s, Namespace: %s, Container: %s\n2026-11-09T22:00:00Z INFO [main] Application started successfully\n2026-11-09T22:00:01Z INFO [http] Listening on :8080", pod, namespace, container), nil
 	}
 
-	cmd := fmt.Sprintf("kubectl logs -n %s %s", namespace, pod)
+	cmd := fmt.Sprintf("kubectl logs -n %s %s --tail=%d", sshpool.ShellQuote(namespace), sshpool.ShellQuote(pod), tailLines)
 	if container != "" {
-		cmd += " -c " + container
+		cmd += " -c " + sshpool.ShellQuote(container)
 	}
-	cmd += fmt.Sprintf(" --tail=%d", tailLines)
 
 	return c.Pool.ExecuteOutput(ctx, srv, cmd)
 }
@@ -249,7 +253,7 @@ func (c *Client) RolloutStatus(ctx context.Context, w io.Writer, srv *sshpool.Se
 		fmt.Fprintln(w, "deployment successfully rolled out")
 		return nil
 	}
-	cmd := fmt.Sprintf("kubectl -n %s rollout status deployment/%s --timeout=%ds", namespace, deployment, timeoutSec)
+	cmd := fmt.Sprintf("kubectl -n %s rollout status deployment/%s --timeout=%ds", sshpool.ShellQuote(namespace), sshpool.ShellQuote(deployment), timeoutSec)
 	return c.Pool.RunCommand(ctx, srv, cmd, w)
 }
 
@@ -267,12 +271,31 @@ func (c *Client) RestartDeployment(ctx context.Context, srv *sshpool.ServerConfi
 	if c.DryRun {
 		return nil
 	}
-	cmd := fmt.Sprintf("kubectl -n %s rollout restart deployment/%s", namespace, deployment)
+	cmd := fmt.Sprintf("kubectl -n %s rollout restart deployment/%s", sshpool.ShellQuote(namespace), sshpool.ShellQuote(deployment))
 	out, err := c.Pool.ExecuteOutput(ctx, srv, cmd)
 	if err != nil {
 		return fmt.Errorf("重启 Deployment %s 失败: %w (%s)", deployment, err, out)
 	}
 	return nil
+}
+
+// SetImage 切换指定 Deployment 中容器的镜像（无独立 K8s YAML 文件时用于回滚）
+func (c *Client) SetImage(ctx context.Context, w io.Writer, srv *sshpool.ServerConfig, namespace, deployment, container, image string) error {
+	for kind, v := range map[string]string{"命名空间": namespace, "Deployment": deployment, "容器": container} {
+		if err := checkName(kind, v); err != nil {
+			return err
+		}
+	}
+	// set image 的 container=image 参数以逗号分隔，镜像引用中不允许出现逗号或空白
+	if image == "" || strings.ContainsAny(image, ", \t\r\n") {
+		return fmt.Errorf("镜像引用不合法: %q", image)
+	}
+	cmd := fmt.Sprintf("kubectl -n %s set image deployment/%s %s=%s", sshpool.ShellQuote(namespace), sshpool.ShellQuote(deployment), sshpool.ShellQuote(container), sshpool.ShellQuote(image))
+	if c.DryRun {
+		fmt.Fprintf(w, "[dry-run] $ %s\n", cmd)
+		return nil
+	}
+	return c.Pool.RunCommand(ctx, srv, cmd, w)
 }
 
 func formatDuration(d time.Duration) string {

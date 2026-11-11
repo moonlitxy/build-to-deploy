@@ -174,6 +174,10 @@ func (c *Config) normalize() {
 	if c.Server.MaxUploadMB <= 0 {
 		c.Server.MaxUploadMB = 2048
 	}
+	// 上限 1 PB：再大就会在 <<20 换算字节时溢出为负数，使上传大小校验失效
+	if c.Server.MaxUploadMB > 1<<30 {
+		c.Server.MaxUploadMB = 1 << 30
+	}
 
 	for _, app := range c.Apps {
 		if app.ID == "" {
@@ -331,6 +335,9 @@ func (c *Config) UpdateApp(app *AppConfig) error {
 	if err := ValidateApp(app); err != nil {
 		return err
 	}
+	if !IDRe.MatchString(app.Name) {
+		return fmt.Errorf("应用名称会同时用作应用 ID，只能包含字母、数字、. _ -，且以字母或数字开头 (当前: %q)", app.Name)
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	found := false
@@ -347,6 +354,25 @@ func (c *Config) UpdateApp(app *AppConfig) error {
 		c.Apps = append(c.Apps, &cp)
 	}
 	return c.saveUnlocked()
+}
+
+// UpdateLocalArtifactPath 只更新某个应用的本地产物路径（发布时用户临时选择新文件）。
+// 加锁顺序必须与 Save 一致：先 c.mu 再走导出，否则与保存并发时会死锁。
+func (c *Config) UpdateLocalArtifactPath(appID, path string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for i, a := range c.Apps {
+		if a.ID == appID || a.Name == appID {
+			cp := *a
+			cp.LocalArtifactPath = path
+			if err := ValidateApp(&cp); err != nil {
+				return err
+			}
+			c.Apps[i] = &cp
+			return c.saveUnlocked()
+		}
+	}
+	return nil
 }
 
 func (c *Config) DeleteApp(id string) error {
@@ -383,8 +409,16 @@ func (c *Config) saveUnlocked() error {
 	return os.Rename(tmp, c.path)
 }
 
+// ExpandHome 展开开头的 ~ 为当前用户主目录
+func ExpandHome(p string) string { return expandHome(p) }
+
 func expandHome(p string) string {
 	p = strings.TrimSpace(p)
+	if p == "~" {
+		if home, err := os.UserHomeDir(); err == nil {
+			return home
+		}
+	}
 	if strings.HasPrefix(p, "~/") || strings.HasPrefix(p, "~\\") {
 		if home, err := os.UserHomeDir(); err == nil {
 			return filepath.Join(home, p[2:])

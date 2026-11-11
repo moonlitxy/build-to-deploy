@@ -59,6 +59,9 @@ func NewEngine(cfg *config.Config, st *store.Store, ups *upload.Manager, pool *s
 	return e
 }
 
+// dryRun 每次读取当前配置：网页上切换演练模式后无需重启即可生效
+func (e *Engine) dryRun() bool { return e.Cfg.ServerSettingsSnapshot().DryRun }
+
 func (e *Engine) logDir() string           { return filepath.Join(e.DataDir, "logs") }
 func (e *Engine) LogPath(id string) string { return filepath.Join(e.logDir(), id+".log") }
 
@@ -98,7 +101,7 @@ func (e *Engine) Precheck(ctx context.Context, app *config.AppConfig, tag string
 		return nil, fmt.Errorf("找不到对应的 SSH 服务器配置 [%s]", app.ServerID)
 	}
 
-	if e.Cfg.Server.DryRun {
+	if e.dryRun() {
 		e.SSH.MarkSimulated(srv)
 		res.Warnings = append(res.Warnings, "演练模式 (DryRun)：不连接真实远程主机")
 		return res, nil
@@ -109,14 +112,17 @@ func (e *Engine) Precheck(ctx context.Context, app *config.AppConfig, tag string
 	imgCheckCmd := fmt.Sprintf("docker images -q %s", shellQuote(ref))
 	imgId, err := e.SSH.ExecuteOutput(ctx, srv, imgCheckCmd)
 	if err == nil && strings.TrimSpace(imgId) != "" {
+		id := firstN(strings.TrimSpace(imgId), 12)
 		res.Conflicts = append(res.Conflicts, Conflict{
 			Source:  "docker",
-			Message: fmt.Sprintf("服务器本地已存在镜像 %s (ID: %s)", ref, strings.TrimSpace(imgId)[:12]),
+			Message: fmt.Sprintf("服务器本地已存在镜像 %s (ID: %s)", ref, id),
 		})
 	}
 
-	// 2. 检查 K8s 当前 Deployment 的镜像版本
-	k8sCheckCmd := fmt.Sprintf("kubectl -n %s get deployment %s -o jsonpath='{.spec.template.spec.containers[?(@.name==\"%s\")].image}'", app.Namespace, app.Deployment, app.Container)
+	// 2. 检查 K8s 当前 Deployment 的镜像版本（变量全部经过白名单校验并 shell 转义）
+	k8sCheckCmd := fmt.Sprintf("kubectl -n %s get deployment %s -o jsonpath=%s",
+		shellQuote(app.Namespace), shellQuote(app.Deployment),
+		shellQuote(fmt.Sprintf(`{.spec.template.spec.containers[?(@.name=="%s")].image}`, app.Container)))
 	curImg, err := e.SSH.ExecuteOutput(ctx, srv, k8sCheckCmd)
 	if err == nil && strings.TrimSpace(curImg) != "" {
 		res.Current = strings.TrimSpace(curImg)
@@ -141,13 +147,19 @@ func extractTag(image string) string {
 	return "latest"
 }
 
+// firstN 取字符串前 n 个字节；输出可能为空或非 ASCII，直接切片会越界
+func firstN(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
+}
+
 // imageRefRe 镜像引用白名单（含 tag / digest）。Precheck 结果会进入回滚命令，必须校验
 var imageRefRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/:@-]*$`)
 
 // shellQuote 将变量安全地拼入远程 sh 命令：单引号包裹并转义内部单引号
-func shellQuote(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
-}
+func shellQuote(s string) string { return sshpool.ShellQuote(s) }
 
 // isYamlPath 统一判断远程路径是否为 K8s YAML 文件（大小写不敏感，两处调用保持一致）
 func isYamlPath(p string) bool {
@@ -266,7 +278,7 @@ func (e *Engine) StartDeploy(req StartRequest) (*store.Release, error) {
 		}
 		name, sz, sum, err := fileStatAndSHA256(localArtifact)
 		if err != nil {
-			if e.Cfg.Server.DryRun {
+			if e.dryRun() {
 				fileName = filepath.Base(localArtifact)
 			} else {
 				return nil, fmt.Errorf("读取本地默认产物失败 (%s): %w", localArtifact, err)
@@ -398,6 +410,11 @@ func (e *Engine) StartRollback(req RollbackRequest) (*store.Release, error) {
 			e.mu.Unlock()
 		}
 	}()
+
+	// 发布记录会被回滚流水线再次使用，其中的镜像引用会进入远程命令，必须与表单输入同样校验
+	if !config.ImageRe.MatchString(app.Image) {
+		return nil, fmt.Errorf("应用镜像名不合法 (当前: %q)", app.Image)
+	}
 
 	stages := []store.Stage{
 		{Name: "deploy", Title: "执行 K8s 镜像更新", Status: store.StatusPending},
@@ -611,7 +628,7 @@ func (r *pipelineRunner) updateRemoteK8sYamlImage(w io.Writer, targetImage strin
 		return nil
 	}
 
-	if r.engine.Cfg.Server.DryRun {
+	if r.engine.dryRun() {
 		fmt.Fprintf(w, "[dry-run] 📄 读取并修改远程 K8s YAML 文件: %s\n", yamlPath)
 		fmt.Fprintf(w, "[dry-run] ✔ 已将 %s 中的 image 字段持久化更新为: %s\n", filepath.Base(yamlPath), targetImage)
 		return nil
@@ -704,7 +721,7 @@ func (r *pipelineRunner) run() error {
 			fmt.Fprintf(w, "$ %s\n", cmd)
 
 			// 若处于演练模式且本地项目目录不存在，则模拟本地编译过程
-			if r.engine.Cfg.Server.DryRun {
+			if r.engine.dryRun() {
 				if projDir == "" {
 					time.Sleep(600 * time.Millisecond)
 					fmt.Fprintf(w, "[dry-run] ✔ 本地编译完成，已生成产物: %s\n", r.artifact)
@@ -746,7 +763,7 @@ func (r *pipelineRunner) run() error {
 
 	// 1. 校验产物
 	if err := r.stage("validate", func(w io.Writer) error {
-		if r.engine.Cfg.Server.DryRun {
+		if r.engine.dryRun() {
 			if _, statErr := os.Stat(r.artifact); os.IsNotExist(statErr) {
 				fmt.Fprintf(w, "[dry-run] ✔ 产物文件 (%s) 校验通过 (模拟)\n", r.rel.FileName)
 				return nil
@@ -760,7 +777,7 @@ func (r *pipelineRunner) run() error {
 	// 2. 上传到服务器产物目录
 	remoteArtifactPath := fmt.Sprintf("%s/%s", r.app.ArtifactDir, r.rel.FileName)
 	if err := r.stage("upload", func(w io.Writer) error {
-		if r.engine.Cfg.Server.DryRun {
+		if r.engine.dryRun() {
 			fmt.Fprintf(w, "[dry-run] 模拟通过 SFTP 上传 %s -> %s\n", r.rel.FileName, remoteArtifactPath)
 			time.Sleep(500 * time.Millisecond)
 			return nil
@@ -784,7 +801,7 @@ func (r *pipelineRunner) run() error {
 		if r.app.Type == "go" || r.app.Type == "binary" {
 			syncCmd += fmt.Sprintf(" && chmod +x %s", shellQuote(r.app.BuildDir+"/"+targetName))
 		}
-		if r.engine.Cfg.Server.DryRun {
+		if r.engine.dryRun() {
 			fmt.Fprintf(w, "[dry-run] $ %s\n", syncCmd)
 			return nil
 		}
@@ -799,7 +816,7 @@ func (r *pipelineRunner) run() error {
 		if err != nil {
 			return fmt.Errorf("渲染构建命令失败: %w", err)
 		}
-		if r.engine.Cfg.Server.DryRun {
+		if r.engine.dryRun() {
 			fmt.Fprintf(w, "[dry-run] $ %s\n", cmd)
 			time.Sleep(1 * time.Second)
 			fmt.Fprintln(w, "[dry-run] 镜像构建成功: "+r.rel.Image)
@@ -817,7 +834,7 @@ func (r *pipelineRunner) run() error {
 			if err != nil {
 				return fmt.Errorf("渲染推送命令失败: %w", err)
 			}
-			if r.engine.Cfg.Server.DryRun {
+			if r.engine.dryRun() {
 				fmt.Fprintf(w, "[dry-run] $ %s\n", cmd)
 				return nil
 			}
@@ -836,7 +853,7 @@ func (r *pipelineRunner) run() error {
 		if err != nil {
 			return fmt.Errorf("渲染部署命令失败: %w", err)
 		}
-		if r.engine.Cfg.Server.DryRun {
+		if r.engine.dryRun() {
 			fmt.Fprintf(w, "[dry-run] $ %s\n", cmd)
 			return nil
 		}
@@ -872,11 +889,25 @@ func (r *pipelineRunner) tryAutoRollback(cause error, reason string) {
 		r.hub.Logf("\n[警告] 发布已被取消，跳过自动回滚（YAML 与线上可能保留新版本，请确认）")
 		return
 	}
+	// 非 YAML 部署（set image 模板）要求命名空间/Deployment/容器齐全，否则回滚命令必然失败
+	if !isYamlPath(r.k8sYamlFilePath()) {
+		if err := validateK8sTarget(r.app); err != nil {
+			r.hub.Logf(fmt.Sprintf("\n[警告] 无法执行自动回滚：%v", err))
+			return
+		}
+	}
 
 	r.hub.Logf(fmt.Sprintf("\n[警告] %s，触发自动回滚到上一版本: %s", reason, r.rel.PrevImage))
-	// 回滚使用独立 ctx，不受已失败流程的取消状态影响
+	// 回滚使用独立 ctx，不受已失败流程的取消状态影响；但若用户此时主动取消，仍应尽快中止
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
+	go func() {
+		select {
+		case <-r.ctx.Done():
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
 
 	var lastErr error
 	if yamlPath := r.k8sYamlFilePath(); isYamlPath(yamlPath) {
@@ -886,20 +917,15 @@ func (r *pipelineRunner) tryAutoRollback(cause error, reason string) {
 		}
 		// 回滚 apply 必须带命名空间，与 DeployCmd 语义保持一致
 		rbCmd := fmt.Sprintf("kubectl -n %s apply -f %s", shellQuote(r.app.Namespace), shellQuote(yamlPath))
-		if r.engine.Cfg.Server.DryRun {
+		if r.engine.dryRun() {
 			r.hub.Logf("[dry-run] $ " + rbCmd)
 		} else if err := r.engine.SSH.RunCommand(ctx, r.srv, rbCmd, r.hub); err != nil {
 			lastErr = err
 			r.hub.Logf("[错误] 回滚 apply 失败: " + err.Error())
 		}
-	} else {
-		rbCmd := fmt.Sprintf("kubectl -n %s set image deployment/%s %s=%s", shellQuote(r.app.Namespace), shellQuote(r.app.Deployment), shellQuote(r.app.Container), shellQuote(r.rel.PrevImage))
-		if r.engine.Cfg.Server.DryRun {
-			r.hub.Logf("[dry-run] $ " + rbCmd)
-		} else if err := r.engine.SSH.RunCommand(ctx, r.srv, rbCmd, r.hub); err != nil {
-			lastErr = err
-			r.hub.Logf("[错误] 回滚 set image 失败: " + err.Error())
-		}
+	} else if err := r.engine.Kube.SetImage(ctx, r.hub, r.srv, r.app.Namespace, r.app.Deployment, r.app.Container, r.rel.PrevImage); err != nil {
+		lastErr = err
+		r.hub.Logf("[错误] 回滚 set image 失败: " + err.Error())
 	}
 
 	if lastErr == nil {
@@ -928,7 +954,7 @@ func (r *pipelineRunner) runRollback() error {
 		if err != nil {
 			return fmt.Errorf("渲染部署命令失败: %w", err)
 		}
-		if r.engine.Cfg.Server.DryRun {
+		if r.engine.dryRun() {
 			fmt.Fprintf(w, "[dry-run] $ %s\n", cmd)
 			return nil
 		}
@@ -951,6 +977,7 @@ func (r *pipelineRunner) finish(err error) {
 	now := time.Now()
 	status := store.StatusSuccess
 	if err != nil {
+		// 阶段内已自行处理过的终态（如自动回滚成功）不应在结尾被覆盖
 		if errors.Is(err, context.Canceled) {
 			status = store.StatusCanceled
 		} else {
@@ -958,8 +985,8 @@ func (r *pipelineRunner) finish(err error) {
 		}
 	}
 	r.update(func(rel *store.Release) {
-		// 若回滚阶段已把状态标为 rolledback，则保留该终态
-		if rel.Status != store.StatusRolledBack || err == nil {
+		// 自动回滚成功时 tryAutoRollback 已把状态标为 rolledback：普通失败保留该终态，取消则如实记录
+		if rel.Status != store.StatusRolledBack || err == nil || errors.Is(err, context.Canceled) {
 			rel.Status = status
 		}
 		rel.FinishedAt = &now
@@ -983,17 +1010,20 @@ func (r *pipelineRunner) finish(err error) {
 func (r *pipelineRunner) cleanup() {
 	r.hub.Logf("\n==> 阶段 [cleanup]: 自动清理历史版本产物与回收镜像缓存")
 	keepCount := 5 // 默认保留最近 5 个产物版本
-	if r.app.ArtifactDir != "" {
+	if r.app.ArtifactDir != "" && r.app.ArtifactDir != "/" {
 		// 只清理本应用历次上传的产物文件，避免误删目录内手工放置的 Dockerfile、配置等
-		artifactNames := []string{}
+		seen := map[string]bool{}
+		var artifactNames []string
 		for _, rel := range r.engine.Store.List(r.app.ID, 0) {
-			if rel.FileName != "" && upload.ValidFileName(rel.FileName) {
+			if rel.FileName != "" && upload.ValidFileName(rel.FileName) && !seen[rel.FileName] {
+				seen[rel.FileName] = true
 				artifactNames = append(artifactNames, shellQuote(r.app.ArtifactDir+"/"+rel.FileName))
 			}
 		}
 		if len(artifactNames) > keepCount {
-			cleanCmd := fmt.Sprintf("ls -t %s 2>/dev/null | tail -n +%d | xargs -r rm -f --", strings.Join(artifactNames, " "), keepCount+1)
-			if r.engine.Cfg.Server.DryRun {
+			// tail 按输入顺序保留最后 keepCount 个（Store.List 已按时间倒序，即最近的），不使用 ls -t 排序
+			cleanCmd := fmt.Sprintf("printf '%%s\\n' %s | tail -n +%d | while IFS= read -r f; do [ -n \"$f\" ] && rm -f -- \"$f\"; done", strings.Join(artifactNames, " "), keepCount+1)
+			if r.engine.dryRun() {
 				r.hub.Logf(fmt.Sprintf("[dry-run] 模拟清理远程产物: $ %s", cleanCmd))
 			} else {
 				_ = r.engine.SSH.RunCommand(context.Background(), r.srv, cleanCmd, io.Discard)
@@ -1009,7 +1039,7 @@ func (r *pipelineRunner) cleanup() {
 	}
 
 	// 自动回收 Docker 悬空镜像 (dangling images)
-	if !r.engine.Cfg.Server.DryRun {
+	if !r.engine.dryRun() {
 		_ = r.engine.SSH.RunCommand(context.Background(), r.srv, "docker image prune -f", io.Discard)
 		r.hub.Logf("✔ 已回收远程 Docker 悬空虚悬镜像 (dangling images)")
 	}
@@ -1041,6 +1071,14 @@ func (e *Engine) Cancel(id string) error {
 		}
 	}
 	return errors.New("该发布未在运行")
+}
+
+// validateK8sTarget 校验 set image 回滚所需的命名空间/Deployment/容器是否齐全且合法
+func validateK8sTarget(app *config.AppConfig) error {
+	if app.Namespace == "" || app.Deployment == "" || app.Container == "" {
+		return errors.New("应用未配置完整的命名空间 / Deployment / 容器名称")
+	}
+	return config.ValidateApp(app)
 }
 
 func validateArtifact(w io.Writer, appType, path string) error {

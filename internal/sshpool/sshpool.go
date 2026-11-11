@@ -32,6 +32,12 @@ type ServerConfig struct {
 	Passphrase string `json:"passphrase" yaml:"passphrase"`
 }
 
+// ShellQuote 将变量安全地拼入远程 sh 命令：单引号包裹并转义内部单引号。
+// 所有会进入远程 shell 的变量都必须经过它。
+func ShellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
 type cachedConn struct {
 	sshClient  *ssh.Client
 	sftpClient *sftp.Client
@@ -219,6 +225,7 @@ func (p *Pool) Disconnect(serverID string) int {
 
 // ActiveKeys 返回当前正在保活的长连接列表
 func (p *Pool) ActiveKeys() []string {
+	// 清理协程会并发关闭连接，锁内完成快照
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	var keys []string
@@ -289,17 +296,21 @@ func dialSSH(cfg *ServerConfig) (*ssh.Client, error) {
 	}
 
 	if keyPath != "" {
-		if keyBytes, err := os.ReadFile(keyPath); err == nil {
-			var signer ssh.Signer
-			if cfg.Passphrase != "" {
-				signer, err = ssh.ParsePrivateKeyWithPassphrase(keyBytes, []byte(cfg.Passphrase))
-			} else {
-				signer, err = ssh.ParsePrivateKey(keyBytes)
-			}
-			if err == nil {
-				authMethods = append(authMethods, ssh.PublicKeys(signer))
-			}
+		// 私钥读取/口令错误必须显式报错：静默跳过后只会得到误导性的 "no supported methods remain"
+		keyBytes, err := os.ReadFile(keyPath)
+		if err != nil {
+			return nil, fmt.Errorf("读取私钥文件 (%s) 失败: %w", keyPath, err)
 		}
+		var signer ssh.Signer
+		if cfg.Passphrase != "" {
+			signer, err = ssh.ParsePrivateKeyWithPassphrase(keyBytes, []byte(cfg.Passphrase))
+		} else {
+			signer, err = ssh.ParsePrivateKey(keyBytes)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("解析私钥文件 (%s) 失败（口令错误或私钥受口令保护）: %w", keyPath, err)
+		}
+		authMethods = append(authMethods, ssh.PublicKeys(signer))
 	}
 
 	// 3. 密码鉴权
@@ -404,7 +415,7 @@ func (p *Pool) ExecuteOutput(ctx context.Context, cfg *ServerConfig, cmd string)
 	}
 	defer session.Close()
 
-	var stdout, stderr bytes.Buffer
+	var stdout, stderr syncBuffer
 	session.Stdout = &stdout
 	session.Stderr = &stderr
 
@@ -416,6 +427,8 @@ func (p *Pool) ExecuteOutput(ctx context.Context, cfg *ServerConfig, cmd string)
 	select {
 	case <-ctx.Done():
 		_ = session.Signal(ssh.SIGKILL)
+		// 必须等会话真正结束才能返回：否则调用方读到被并发追加的 buffer 构成数据竞争
+		<-done
 		return "", ctx.Err()
 	case err := <-done:
 		if err != nil {
@@ -427,6 +440,24 @@ func (p *Pool) ExecuteOutput(ctx context.Context, cfg *ServerConfig, cmd string)
 		}
 		return strings.TrimSpace(stdout.String()), nil
 	}
+}
+
+// syncBuffer 供 SSH 会话后台读取协程并发写入时使用（bytes.Buffer 非并发安全）
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 // UploadFile 通过长连接 SFTP 将本地文件上传到远程服务器的指定路径
