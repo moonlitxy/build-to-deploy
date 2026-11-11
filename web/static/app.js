@@ -156,7 +156,7 @@ async function refreshConfigs() {
 
 function renderAppSelects() {
   const prevVal = $('deployAppSelect').value || state.prefs.selectedAppId;
-  const opts = state.apps.map((a) => `<option value="${a.id}">${escapeHtml(a.name)} (${escapeHtml(a.type)})</option>`).join('');
+  const opts = state.apps.map((a) => `<option value="${escapeHtml(a.id)}">${escapeHtml(a.name)} (${escapeHtml(a.type)})</option>`).join('');
   $('deployAppSelect').innerHTML = opts || '<option value="">暂无应用，请先在配置中添加</option>';
   if (prevVal && state.apps.some((a) => a.id === prevVal)) {
     $('deployAppSelect').value = prevVal;
@@ -164,7 +164,7 @@ function renderAppSelects() {
   $('historyAppFilter').innerHTML = '<option value="">全部应用</option>' + opts;
 
   // Pod 页面服务器下拉
-  const srvOpts = state.servers.map((s) => `<option value="${s.id}">${escapeHtml(s.name)} (${escapeHtml(s.host)})</option>`).join('');
+  const srvOpts = state.servers.map((s) => `<option value="${escapeHtml(s.id)}">${escapeHtml(s.name)} (${escapeHtml(s.host)})</option>`).join('');
   $('podServerSelect').innerHTML = srvOpts || '<option value="">暂无服务器</option>';
 }
 
@@ -978,10 +978,10 @@ function renderServerCards() {
         <div class="item-card-header">
           <span class="item-card-title">${escapeHtml(s.name)}${statusBadge}</span>
           <div style="display:flex;gap:6px;">
-            <button class="btn btn-secondary btn-sm" onclick="testOneServer('${s.id}')">${isConnected ? '🔄 重新检测' : '⚡ 建立连接'}</button>
-            ${isConnected ? `<button class="btn btn-secondary btn-sm" style="color:#ef4444;" onclick="disconnectOneServer('${s.id}')">🔌 断开连接</button>` : ''}
-            <button class="btn btn-secondary btn-sm" onclick="editServer('${s.id}')">编辑</button>
-            <button class="btn btn-danger btn-sm" onclick="deleteServer('${s.id}')">删除</button>
+            <button class="btn btn-secondary btn-sm" onclick="testOneServer('${escapeHtml(s.id)}')">${isConnected ? '🔄 重新检测' : '⚡ 建立连接'}</button>
+            ${isConnected ? `<button class="btn btn-secondary btn-sm" style="color:#ef4444;" onclick="disconnectOneServer('${escapeHtml(s.id)}')">🔌 断开连接</button>` : ''}
+            <button class="btn btn-secondary btn-sm" onclick="editServer('${escapeHtml(s.id)}')">编辑</button>
+            <button class="btn btn-danger btn-sm" onclick="deleteServer('${escapeHtml(s.id)}')">删除</button>
           </div>
         </div>
         <div class="item-card-desc">连接信息: <code>${escapeHtml(s.user)}@${escapeHtml(s.host)}:${s.port || 22}</code> (认证: ${s.authType === 'key' ? '私钥' : '密码'})</div>
@@ -1080,7 +1080,9 @@ function openServerModal(srv) {
   $('editServerPort').value = srv ? srv.port : '22';
   $('editServerUser').value = srv ? srv.user : 'root';
   $('editServerAuthType').value = srv ? (srv.authType || 'password') : 'password';
-  $('editServerPassword').value = srv ? srv.password : '';
+  $('editServerPassword').value = srv ? (srv.password || '') : '';
+  // 后端不再回传真实密码，仅返回 ****** 占位符：编辑时提示保留原密码
+  $('editServerPassword').placeholder = srv && srv.password === '******' ? '已保存（留空或保持 ****** 表示不修改）' : '';
   $('editServerKeyPath').value = srv ? srv.keyPath : '';
 
   $('pwdGroup').classList.toggle('hidden', srv && srv.authType === 'key');
@@ -1174,8 +1176,8 @@ function renderAppCards() {
       <div class="item-card-header">
         <span class="item-card-title">${escapeHtml(a.name)} <span class="app-type-tag">${escapeHtml(a.type)}</span></span>
         <div style="display:flex;gap:6px;">
-          <button class="btn btn-secondary btn-sm" onclick="editApp('${a.id}')">编辑</button>
-          <button class="btn btn-danger btn-sm" onclick="deleteApp('${a.id}')">删除</button>
+          <button class="btn btn-secondary btn-sm" onclick="editApp('${escapeHtml(a.id)}')">编辑</button>
+          <button class="btn btn-danger btn-sm" onclick="deleteApp('${escapeHtml(a.id)}')">删除</button>
         </div>
       </div>
       ${a.localBuildCmd || a.localArtifactPath ? `<div class="item-card-desc"><strong>⚡ 本地编译/默认产物:</strong> <code>${escapeHtml(a.localBuildCmd || '仅指定默认产物')}</code> (产物: <code>${escapeHtml(a.localArtifactPath || '-')}</code>)</div>` : ''}
@@ -1265,7 +1267,7 @@ function openAppModal(app) {
 
   // 渲染绑定服务器选项
   $('editAppServerId').innerHTML = state.servers.map((s) => `
-    <option value="${s.id}" ${app && app.serverId === s.id ? 'selected' : ''}>${escapeHtml(s.name)} (${escapeHtml(s.host)})</option>
+    <option value="${escapeHtml(s.id)}" ${app && app.serverId === s.id ? 'selected' : ''}>${escapeHtml(s.name)} (${escapeHtml(s.host)})</option>
   `).join('');
 
   $('appModal').classList.remove('hidden');
@@ -1440,14 +1442,14 @@ function renderHistoryTable(list) {
         </td>
         <td>
           <div class="history-row-actions">
-            <button class="btn btn-secondary btn-sm" onclick="openReleaseLogModal('${r.id}', '${escapeHtml(r.app)}', '${escapeHtml(r.tag)}')">
+            <button class="btn btn-secondary btn-sm" onclick="openReleaseLogModal('${escapeHtml(r.id)}', '${escapeHtml(r.app)}', '${escapeHtml(r.tag)}')">
               📋 查看日志
             </button>
             <button class="btn btn-secondary btn-sm" title="填入发布面板" onclick="reuseReleaseTag('${escapeHtml(r.app)}', '${escapeHtml(r.tag)}')">
               🚀 选用
             </button>
             ${isSuccess ? `
-              <button class="btn btn-secondary btn-sm" style="color:#d97706;border-color:#fde68a;" title="回滚线上至此历史版本" onclick="triggerRollback('${r.id}')">
+              <button class="btn btn-secondary btn-sm" style="color:#d97706;border-color:#fde68a;" title="回滚线上至此历史版本" onclick="triggerRollback('${escapeHtml(r.id)}')">
                 ↩️ 回滚
               </button>
             ` : ''}

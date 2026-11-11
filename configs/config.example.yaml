@@ -1,6 +1,6 @@
 server:
-  listen: ":8080"          # 本地页面访问地址: http://localhost:8080
-  dataDir: "./data"        # 本地暂存文件与发布记录存放目录
+  listen: "127.0.0.1:8080"          # 本地页面访问地址: http://localhost:8080
+  dataDir: "./data"        # 本地暂存文件与发布记录存放目录（相对启动时的工作目录，建议在项目根目录启动）
   maxUploadMB: 2048        # 支持上传最大产物大小(MB)
   dryRun: false            # true 为演练模式(用于无网络环境模拟测试)
 

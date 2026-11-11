@@ -1,6 +1,6 @@
 server:
-  listen: ":8080"
-  dataDir: "./data-dev"
+  listen: "127.0.0.1:8080"
+  dataDir: "../data-dev"   # 相对项目根目录启动时使用；dev 配置配合 make dev 使用
   maxUploadMB: 2048
   dryRun: true             # 演练模式
 

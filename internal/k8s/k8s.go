@@ -5,11 +5,25 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"regexp"
 	"strings"
 	"time"
 
 	"build-to-deploy/internal/sshpool"
 )
+
+// k8sNameRe K8s 资源名（RFC 1123 label）。这些值会拼接进远程 shell 命令，必须白名单校验
+var k8sNameRe = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$`)
+
+// maxTailLines 日志最大行数，防止一次性拉取海量日志耗尽本机内存
+const maxTailLines = 4000
+
+func checkName(kind, v string) error {
+	if !k8sNameRe.MatchString(v) {
+		return fmt.Errorf("%s 名称不合法: %q（只允许小写字母、数字、-，且不超过 63 个字符）", kind, v)
+	}
+	return nil
+}
 
 type PodInfo struct {
 	Name       string   `json:"name"`
@@ -56,6 +70,10 @@ func (c *Client) ListNamespaces(ctx context.Context, srv *sshpool.ServerConfig) 
 func (c *Client) ListPods(ctx context.Context, srv *sshpool.ServerConfig, namespace string) ([]PodInfo, error) {
 	if namespace == "" {
 		namespace = "default"
+	}
+	// 命名空间校验放在 DryRun 分支之前，保证演练与真实模式行为一致
+	if err := checkName("命名空间", namespace); err != nil {
+		return nil, err
 	}
 	if c.DryRun {
 		return []PodInfo{
@@ -178,6 +196,23 @@ func (c *Client) GetPodLogs(ctx context.Context, srv *sshpool.ServerConfig, name
 	if tailLines <= 0 {
 		tailLines = 200
 	}
+	if tailLines > maxTailLines {
+		tailLines = maxTailLines
+	}
+	if namespace == "" {
+		namespace = "default"
+	}
+	if err := checkName("命名空间", namespace); err != nil {
+		return "", err
+	}
+	if err := checkName("Pod", pod); err != nil {
+		return "", err
+	}
+	if container != "" {
+		if err := checkName("容器", container); err != nil {
+			return "", err
+		}
+	}
 	if c.DryRun {
 		return fmt.Sprintf("[dry-run] 日志示例 - Pod: %s, Namespace: %s, Container: %s\n2026-11-09T22:00:00Z INFO [main] Application started successfully\n2026-11-09T22:00:01Z INFO [http] Listening on :8080", pod, namespace, container), nil
 	}
@@ -196,6 +231,15 @@ func (c *Client) RolloutStatus(ctx context.Context, w io.Writer, srv *sshpool.Se
 	if timeoutSec <= 0 {
 		timeoutSec = 300
 	}
+	if namespace == "" {
+		namespace = "default"
+	}
+	if err := checkName("命名空间", namespace); err != nil {
+		return err
+	}
+	if err := checkName("Deployment", deployment); err != nil {
+		return err
+	}
 	if c.DryRun {
 		fmt.Fprintf(w, "[dry-run] kubectl -n %s rollout status deployment/%s --timeout=%ds\n", namespace, deployment, timeoutSec)
 		for i := 1; i <= 3; i++ {
@@ -213,6 +257,12 @@ func (c *Client) RolloutStatus(ctx context.Context, w io.Writer, srv *sshpool.Se
 func (c *Client) RestartDeployment(ctx context.Context, srv *sshpool.ServerConfig, namespace, deployment string) error {
 	if namespace == "" {
 		namespace = "default"
+	}
+	if err := checkName("命名空间", namespace); err != nil {
+		return err
+	}
+	if err := checkName("Deployment", deployment); err != nil {
+		return err
 	}
 	if c.DryRun {
 		return nil

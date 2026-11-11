@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sync"
 	"time"
 )
@@ -47,6 +48,28 @@ func NewID() string {
 	return time.Now().Format("20060102150405") + "-" + hex.EncodeToString(b)[:8]
 }
 
+// maxPending 同时保留的未完成上传任务上限，防止无限创建临时文件
+const maxPending = 32
+
+// ErrNotFound 上传任务不存在或已过期
+var ErrNotFound = errors.New("上传任务不存在或已过期")
+
+// FileNameRe 上传文件名白名单：文件名会被拼入远程 shell 命令，禁止空格、分号、$、引号等
+var fileNameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
+
+// ValidFileName 判断文件名是否符合安全白名单
+func ValidFileName(name string) bool {
+	return fileNameRe.MatchString(name)
+}
+
+// ValidateFileName 校验文件名
+func ValidateFileName(name string) error {
+	if !fileNameRe.MatchString(name) {
+		return fmt.Errorf("文件名为空或不合法 (对于中文等特殊字符请重命名文件): %q", name)
+	}
+	return nil
+}
+
 func (m *Manager) Create(fileName string, size int64, owner string) (*Upload, error) {
 	if size <= 0 {
 		return nil, errors.New("文件大小不合法")
@@ -54,7 +77,23 @@ func (m *Manager) Create(fileName string, size int64, owner string) (*Upload, er
 	if size > m.maxSize {
 		return nil, fmt.Errorf("文件超过上限 %d MB", m.maxSize>>20)
 	}
-	u := &Upload{ID: NewID(), FileName: filepath.Base(fileName), Size: size, Owner: owner, CreatedAt: time.Now()}
+	name := filepath.Base(fileName)
+	if err := ValidateFileName(name); err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	pending := 0
+	for _, u := range m.m {
+		if !u.Done {
+			pending++
+		}
+	}
+	if pending >= maxPending {
+		m.mu.Unlock()
+		return nil, errors.New("未完成的上传任务过多，请稍后重试")
+	}
+	m.mu.Unlock()
+	u := &Upload{ID: NewID(), FileName: name, Size: size, Owner: owner, CreatedAt: time.Now()}
 	u.Path = filepath.Join(m.dir, u.ID+".part")
 	f, err := os.Create(u.Path)
 	if err != nil {
@@ -72,7 +111,7 @@ func (m *Manager) Get(id string) (*Upload, error) {
 	defer m.mu.Unlock()
 	u, ok := m.m[id]
 	if !ok {
-		return nil, errors.New("上传任务不存在或已过期")
+		return nil, ErrNotFound
 	}
 	return u, nil
 }
@@ -170,14 +209,20 @@ func (m *Manager) Take(id, dst string) (*Upload, error) {
 	return u, nil
 }
 
-// Cleanup 删除超过 ttl 未使用的上传任务。
+// Cleanup 删除超过 ttl 未使用的上传任务（跳过进行中的任务，避免删除正在写入的分片文件）。
 func (m *Manager) Cleanup(ttl time.Duration) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	var stale []*Upload
 	for id, u := range m.m {
 		if time.Since(u.CreatedAt) > ttl {
-			_ = os.Remove(u.Path)
+			stale = append(stale, u)
 			delete(m.m, id)
 		}
+	}
+	m.mu.Unlock()
+	for _, u := range stale {
+		u.mu.Lock()
+		_ = os.Remove(u.Path)
+		u.mu.Unlock()
 	}
 }

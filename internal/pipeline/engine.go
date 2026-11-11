@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -58,7 +59,7 @@ func NewEngine(cfg *config.Config, st *store.Store, ups *upload.Manager, pool *s
 	return e
 }
 
-func (e *Engine) logDir() string   { return filepath.Join(e.DataDir, "logs") }
+func (e *Engine) logDir() string           { return filepath.Join(e.DataDir, "logs") }
 func (e *Engine) LogPath(id string) string { return filepath.Join(e.logDir(), id+".log") }
 
 type Conflict struct {
@@ -105,7 +106,7 @@ func (e *Engine) Precheck(ctx context.Context, app *config.AppConfig, tag string
 
 	// 1. 检查服务器本地是否已有此镜像 tag
 	ref := fmt.Sprintf("%s:%s", app.Image, tag)
-	imgCheckCmd := fmt.Sprintf("docker images -q %s", ref)
+	imgCheckCmd := fmt.Sprintf("docker images -q %s", shellQuote(ref))
 	imgId, err := e.SSH.ExecuteOutput(ctx, srv, imgCheckCmd)
 	if err == nil && strings.TrimSpace(imgId) != "" {
 		res.Conflicts = append(res.Conflicts, Conflict{
@@ -138,6 +139,20 @@ func extractTag(image string) string {
 		return image[i+1:]
 	}
 	return "latest"
+}
+
+// imageRefRe 镜像引用白名单（含 tag / digest）。Precheck 结果会进入回滚命令，必须校验
+var imageRefRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/:@-]*$`)
+
+// shellQuote 将变量安全地拼入远程 sh 命令：单引号包裹并转义内部单引号
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// isYamlPath 统一判断远程路径是否为 K8s YAML 文件（大小写不敏感，两处调用保持一致）
+func isYamlPath(p string) bool {
+	lower := strings.ToLower(p)
+	return strings.HasSuffix(lower, ".yaml") || strings.HasSuffix(lower, ".yml")
 }
 
 type StartRequest struct {
@@ -181,25 +196,32 @@ func (e *Engine) StartDeploy(req StartRequest) (*store.Release, error) {
 		return nil, fmt.Errorf("未找到服务器配置: %s", app.ServerID)
 	}
 
+	// 在注册 running 之前生成 release ID 与 ctx，保证同一临界区内 Cancel 即可命中（避免预检期间无法取消）
+	relID := upload.NewID()
+	ctx, cancel := context.WithCancel(context.Background())
+	run := &activeRun{releaseID: relID, cancel: cancel}
+
 	e.mu.Lock()
 	if r, ok := e.running[app.ID]; ok {
 		e.mu.Unlock()
+		cancel()
 		return nil, fmt.Errorf("应用 %s 正在发布中 (%s)，请稍候", app.Name, r.releaseID)
 	}
-	run := &activeRun{}
 	e.running[app.ID] = run
 	e.mu.Unlock()
 
 	ok := false
 	defer func() {
 		if !ok {
+			cancel()
 			e.mu.Lock()
 			delete(e.running, app.ID)
 			e.mu.Unlock()
 		}
 	}()
 
-	pctx, pcancel := context.WithTimeout(context.Background(), 20*time.Second)
+	// 预检的超时比远端操作宽松，且可被用户取消
+	pctx, pcancel := context.WithTimeout(ctx, 60*time.Second)
 	pre, err := e.Precheck(pctx, app, req.Tag)
 	pcancel()
 	if err != nil {
@@ -258,7 +280,11 @@ func (e *Engine) StartDeploy(req StartRequest) (*store.Release, error) {
 		return nil, errors.New("请选择本地产物文件或开启本地一键编译")
 	}
 
-	relID := upload.NewID()
+	// 文件名会被拼入远程 cp 命令，统一校验（上传接口已校验，这里兜底本地产物场景）
+	if err := upload.ValidateFileName(fileName); err != nil {
+		return nil, err
+	}
+
 	stages = append(stages,
 		store.Stage{Name: "validate", Title: "校验本地产物", Status: store.StatusPending},
 		store.Stage{Name: "upload", Title: "SFTP 上传至产物目录", Status: store.StatusPending},
@@ -296,12 +322,9 @@ func (e *Engine) StartDeploy(req StartRequest) (*store.Release, error) {
 	}
 	ok = true
 
-	ctx, cancel := context.WithCancel(context.Background())
 	hub := newHub(e.LogPath(rel.ID))
 
 	e.mu.Lock()
-	run.releaseID = rel.ID
-	run.cancel = cancel
 	e.hubs[rel.ID] = hub
 	e.mu.Unlock()
 
@@ -327,6 +350,7 @@ func (e *Engine) StartDeploy(req StartRequest) (*store.Release, error) {
 		err := runner.run()
 		runner.finish(err)
 		hub.Close()
+		e.dropHub(rel.ID)
 	}()
 
 	return rel, nil
@@ -352,25 +376,29 @@ func (e *Engine) StartRollback(req RollbackRequest) (*store.Release, error) {
 		return nil, fmt.Errorf("未找到服务器配置: %s", app.ServerID)
 	}
 
+	relID := upload.NewID()
+	ctx, cancel := context.WithCancel(context.Background())
+	run := &activeRun{releaseID: relID, cancel: cancel}
+
 	e.mu.Lock()
 	if r, ok := e.running[app.ID]; ok {
 		e.mu.Unlock()
+		cancel()
 		return nil, fmt.Errorf("应用 %s 正在发布中 (%s)，请稍候", app.Name, r.releaseID)
 	}
-	run := &activeRun{}
 	e.running[app.ID] = run
 	e.mu.Unlock()
 
 	ok := false
 	defer func() {
 		if !ok {
+			cancel()
 			e.mu.Lock()
 			delete(e.running, app.ID)
 			e.mu.Unlock()
 		}
 	}()
 
-	relID := upload.NewID()
 	stages := []store.Stage{
 		{Name: "deploy", Title: "执行 K8s 镜像更新", Status: store.StatusPending},
 		{Name: "rollout", Title: "等待 Pod 滚动就绪", Status: store.StatusPending},
@@ -404,12 +432,9 @@ func (e *Engine) StartRollback(req RollbackRequest) (*store.Release, error) {
 	}
 	ok = true
 
-	ctx, cancel := context.WithCancel(context.Background())
 	hub := newHub(e.LogPath(rel.ID))
 
 	e.mu.Lock()
-	run.releaseID = rel.ID
-	run.cancel = cancel
 	e.hubs[rel.ID] = hub
 	e.mu.Unlock()
 
@@ -432,6 +457,7 @@ func (e *Engine) StartRollback(req RollbackRequest) (*store.Release, error) {
 		err := runner.runRollback()
 		runner.finish(err)
 		hub.Close()
+		e.dropHub(rel.ID)
 	}()
 
 	return rel, nil
@@ -509,41 +535,69 @@ func (r *pipelineRunner) k8sYamlFilePath() string {
 	return yamlPath
 }
 
-// replaceYamlImage 在 K8s YAML 内容中精准替换目标容器的 image 字段值，保留原有缩进与注释
+// splitImagePrefix 把 "image:   值  # 注释" 拆成前缀（含冒号后原有空白）、值与行尾注释
+func splitImagePrefix(line string) (prefix, value, suffix string, ok bool) {
+	trimmed := strings.TrimSpace(line)
+	if strings.HasPrefix(trimmed, "#") {
+		return "", "", "", false
+	}
+	if !strings.HasPrefix(trimmed, "image:") && !strings.HasPrefix(trimmed, "- image:") {
+		return "", "", "", false
+	}
+	idx := strings.Index(line, "image:")
+	after := idx + len("image:")
+	rest := line[after:]
+	// 只剥掉左侧空白，写回时用原始空白拼接，保证缩进不变
+	lead := len(rest) - len(strings.TrimLeft(rest, " \t"))
+	rest = rest[lead:]
+	// 保留行尾注释（值后至少两个空格开始的 #）
+	if c := strings.Index(rest, " #"); c >= 0 {
+		suffix = rest[c:]
+		rest = rest[:c]
+	}
+	value = strings.Trim(strings.TrimSpace(rest), `"'`)
+	return line[:after] + strings.Repeat(" ", lead), value, suffix, true
+}
+
+// imageRepoOf 去掉 tag / digest 得到镜像仓库名
+func imageRepoOf(ref string) string {
+	if i := strings.Index(ref, "@"); i >= 0 {
+		ref = ref[:i]
+	}
+	if i := strings.LastIndex(ref, ":"); i > strings.LastIndex(ref, "/") {
+		ref = ref[:i]
+	}
+	return ref
+}
+
+// replaceYamlImage 在 K8s YAML 内容中精准替换目标容器的 image 字段值，保留原有缩进与注释。
+// 只做完整镜像引用匹配，避免把 "harbor/app/gateway-sts" 这类同前缀的 sidecar 镜像误改。
 func replaceYamlImage(content, imageRepo, targetImage string) (string, bool) {
 	lines := strings.Split(content, "\n")
 	replaced := false
 
-	// 第一轮：优先精确匹配包含当前应用镜像名 (imageRepo) 的 image: 行
+	// 第一轮：精确匹配同一镜像仓库的引用
 	if imageRepo != "" {
 		for i, line := range lines {
-			trimmed := strings.TrimSpace(line)
-			if strings.HasPrefix(trimmed, "#") {
+			prefix, value, suffix, ok := splitImagePrefix(line)
+			if !ok || imageRepoOf(value) != imageRepo {
 				continue
 			}
-			if (strings.HasPrefix(trimmed, "image:") || strings.HasPrefix(trimmed, "- image:")) && strings.Contains(trimmed, imageRepo) {
-				idx := strings.Index(line, "image:")
-				prefix := line[:idx+len("image:")]
-				lines[i] = prefix + " " + targetImage
-				replaced = true
-			}
+			lines[i] = prefix + " " + targetImage + suffix
+			replaced = true
 		}
 	}
 
 	// 第二轮：如果 YAML 中原本写的是其他旧镜像名，则替换第一个非注释的 image: 行
 	if !replaced {
 		for i, line := range lines {
-			trimmed := strings.TrimSpace(line)
-			if strings.HasPrefix(trimmed, "#") {
+			prefix, _, suffix, ok := splitImagePrefix(line)
+			if !ok {
 				continue
 			}
-			if strings.HasPrefix(trimmed, "image:") || strings.HasPrefix(trimmed, "- image:") {
-				idx := strings.Index(line, "image:")
-				prefix := line[:idx+len("image:")]
-				lines[i] = prefix + " " + targetImage
-				replaced = true
-				break
-			}
+			lines[i] = prefix + " " + targetImage + suffix
+			replaced = true
+			break
 		}
 	}
 
@@ -553,7 +607,7 @@ func replaceYamlImage(content, imageRepo, targetImage string) (string, bool) {
 // updateRemoteK8sYamlImage 通过 SFTP 读取远程服务器上的独立 K8s YAML 文件，将其中的 image 修改为新构建的镜像:Tag 并持久化写回
 func (r *pipelineRunner) updateRemoteK8sYamlImage(w io.Writer, targetImage string) error {
 	yamlPath := r.k8sYamlFilePath()
-	if yamlPath == "" || (!strings.HasSuffix(strings.ToLower(yamlPath), ".yaml") && !strings.HasSuffix(strings.ToLower(yamlPath), ".yml")) {
+	if yamlPath == "" || !isYamlPath(yamlPath) {
 		return nil
 	}
 
@@ -679,6 +733,10 @@ func (r *pipelineRunner) run() error {
 			r.rel.FileName = name
 			r.rel.FileSize = sz
 			r.rel.FileSHA256 = sum
+			// 编译产物的文件名直接决定远程路径，统一套用与上传一致的白名单
+			if err := upload.ValidateFileName(name); err != nil {
+				return err
+			}
 			fmt.Fprintf(w, "✔ 本地编译成功! 产物: %s (%d bytes, SHA256: %s)\n", name, sz, sum[:12])
 			return nil
 		}); err != nil {
@@ -721,7 +779,11 @@ func (r *pipelineRunner) run() error {
 	// 3. 准备构建上下文（将产物从 ArtifactDir 拷贝到 BuildDir）
 	if err := r.stage("sync", func(w io.Writer) error {
 		targetName := templates.ArtifactName(r.app.Type)
-		syncCmd := fmt.Sprintf("mkdir -p %s && cp -f %s %s/%s", r.app.BuildDir, remoteArtifactPath, r.app.BuildDir, targetName)
+		syncCmd := fmt.Sprintf("mkdir -p %s && cp -f %s %s/%s", shellQuote(r.app.BuildDir), shellQuote(remoteArtifactPath), shellQuote(r.app.BuildDir), shellQuote(targetName))
+		// go 二进制补齐可执行权限，避免用户 Dockerfile 只写 COPY 时镜像内无法启动
+		if r.app.Type == "go" || r.app.Type == "binary" {
+			syncCmd += fmt.Sprintf(" && chmod +x %s", shellQuote(r.app.BuildDir+"/"+targetName))
+		}
 		if r.engine.Cfg.Server.DryRun {
 			fmt.Fprintf(w, "[dry-run] $ %s\n", syncCmd)
 			return nil
@@ -780,6 +842,8 @@ func (r *pipelineRunner) run() error {
 		}
 		return r.engine.SSH.RunCommand(r.ctx, r.srv, cmd, w)
 	}); err != nil {
+		// 部署命令本身失败时，YAML 已持久化为新版本，同样需要回退，避免下次 apply 把坏版本推上去
+		r.tryAutoRollback(err, "部署命令执行失败")
 		return err
 	}
 
@@ -787,22 +851,65 @@ func (r *pipelineRunner) run() error {
 	if err := r.stage("rollout", func(w io.Writer) error {
 		return r.engine.Kube.RolloutStatus(r.ctx, w, r.srv, r.app.Namespace, r.app.Deployment, r.app.RolloutTimeout)
 	}); err != nil {
-		// 自动回滚逻辑：同时回退远程 YAML 文件中的镜像版本并重新 apply，保证 YAML 文件与线上一致
-		if r.app.AutoRollback && r.rel.PrevImage != "" && r.rel.PrevImage != r.rel.Image {
-			r.hub.Logf(fmt.Sprintf("\n[警告] 服务部署未就绪，触发自动回滚到上一版本: %s", r.rel.PrevImage))
-			_ = r.updateRemoteK8sYamlImage(r.hub, r.rel.PrevImage)
-			if yamlPath := r.k8sYamlFilePath(); yamlPath != "" && (strings.HasSuffix(yamlPath, ".yaml") || strings.HasSuffix(yamlPath, ".yml")) {
-				rbCmd := fmt.Sprintf("kubectl apply -f %s", yamlPath)
-				_ = r.engine.SSH.RunCommand(context.Background(), r.srv, rbCmd, r.hub)
-			} else {
-				rbCmd := fmt.Sprintf("kubectl -n %s set image deployment/%s %s=%s", r.app.Namespace, r.app.Deployment, r.app.Container, r.rel.PrevImage)
-				_ = r.engine.SSH.RunCommand(context.Background(), r.srv, rbCmd, r.hub)
-			}
-		}
+		r.tryAutoRollback(err, "服务部署未就绪")
 		return err
 	}
 
 	return nil
+}
+
+// tryAutoRollback 自动回滚：同时回退远程 YAML 文件中的镜像版本并重新 apply，保证 YAML 文件与线上一致。
+// 用户主动取消时不回滚（尊重取消意图）；首次发布没有上一版本时仅提示，YAML 按下一阶段处理。
+func (r *pipelineRunner) tryAutoRollback(cause error, reason string) {
+	if !r.app.AutoRollback || r.rel.PrevImage == "" || r.rel.PrevImage == r.rel.Image {
+		return
+	}
+	if !imageRefRe.MatchString(r.rel.PrevImage) {
+		r.hub.Logf(fmt.Sprintf("\n[警告] 上一版本镜像引用不合法，跳过自动回滚: %q", r.rel.PrevImage))
+		return
+	}
+	if r.ctx.Err() != nil || errors.Is(cause, context.Canceled) {
+		r.hub.Logf("\n[警告] 发布已被取消，跳过自动回滚（YAML 与线上可能保留新版本，请确认）")
+		return
+	}
+
+	r.hub.Logf(fmt.Sprintf("\n[警告] %s，触发自动回滚到上一版本: %s", reason, r.rel.PrevImage))
+	// 回滚使用独立 ctx，不受已失败流程的取消状态影响
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	var lastErr error
+	if yamlPath := r.k8sYamlFilePath(); isYamlPath(yamlPath) {
+		if err := r.updateRemoteK8sYamlImage(r.hub, r.rel.PrevImage); err != nil {
+			lastErr = err
+			r.hub.Logf("[错误] 回退远程 YAML 镜像版本失败: " + err.Error())
+		}
+		// 回滚 apply 必须带命名空间，与 DeployCmd 语义保持一致
+		rbCmd := fmt.Sprintf("kubectl -n %s apply -f %s", shellQuote(r.app.Namespace), shellQuote(yamlPath))
+		if r.engine.Cfg.Server.DryRun {
+			r.hub.Logf("[dry-run] $ " + rbCmd)
+		} else if err := r.engine.SSH.RunCommand(ctx, r.srv, rbCmd, r.hub); err != nil {
+			lastErr = err
+			r.hub.Logf("[错误] 回滚 apply 失败: " + err.Error())
+		}
+	} else {
+		rbCmd := fmt.Sprintf("kubectl -n %s set image deployment/%s %s=%s", shellQuote(r.app.Namespace), shellQuote(r.app.Deployment), shellQuote(r.app.Container), shellQuote(r.rel.PrevImage))
+		if r.engine.Cfg.Server.DryRun {
+			r.hub.Logf("[dry-run] $ " + rbCmd)
+		} else if err := r.engine.SSH.RunCommand(ctx, r.srv, rbCmd, r.hub); err != nil {
+			lastErr = err
+			r.hub.Logf("[错误] 回滚 set image 失败: " + err.Error())
+		}
+	}
+
+	if lastErr == nil {
+		r.update(func(rel *store.Release) {
+			rel.Status = store.StatusRolledBack
+		})
+		r.hub.Logf("✔ 已自动回滚至上一版本，配置与线上保持一致")
+	} else {
+		r.hub.Logf("[错误] 自动回滚未能完成，请手动确认线上版本与 YAML 文件")
+	}
 }
 
 func (r *pipelineRunner) runRollback() error {
@@ -851,7 +958,10 @@ func (r *pipelineRunner) finish(err error) {
 		}
 	}
 	r.update(func(rel *store.Release) {
-		rel.Status = status
+		// 若回滚阶段已把状态标为 rolledback，则保留该终态
+		if rel.Status != store.StatusRolledBack || err == nil {
+			rel.Status = status
+		}
 		rel.FinishedAt = &now
 		if err != nil {
 			rel.Error = err.Error()
@@ -874,23 +984,28 @@ func (r *pipelineRunner) cleanup() {
 	r.hub.Logf("\n==> 阶段 [cleanup]: 自动清理历史版本产物与回收镜像缓存")
 	keepCount := 5 // 默认保留最近 5 个产物版本
 	if r.app.ArtifactDir != "" {
-		cleanCmd := fmt.Sprintf("cd %s && ls -t 2>/dev/null | tail -n +%d | xargs -r rm -f", r.app.ArtifactDir, keepCount+1)
-		if r.engine.Cfg.Server.DryRun {
-			r.hub.Logf(fmt.Sprintf("[dry-run] 模拟清理远程产物: $ %s", cleanCmd))
-		} else {
-			_ = r.engine.SSH.RunCommand(context.Background(), r.srv, cleanCmd, io.Discard)
-			r.hub.Logf(fmt.Sprintf("✔ 已清理远程产物目录 %s，保留最近 %d 个版本包", r.app.ArtifactDir, keepCount))
+		// 只清理本应用历次上传的产物文件，避免误删目录内手工放置的 Dockerfile、配置等
+		artifactNames := []string{}
+		for _, rel := range r.engine.Store.List(r.app.ID, 0) {
+			if rel.FileName != "" && upload.ValidFileName(rel.FileName) {
+				artifactNames = append(artifactNames, shellQuote(r.app.ArtifactDir+"/"+rel.FileName))
+			}
+		}
+		if len(artifactNames) > keepCount {
+			cleanCmd := fmt.Sprintf("ls -t %s 2>/dev/null | tail -n +%d | xargs -r rm -f --", strings.Join(artifactNames, " "), keepCount+1)
+			if r.engine.Cfg.Server.DryRun {
+				r.hub.Logf(fmt.Sprintf("[dry-run] 模拟清理远程产物: $ %s", cleanCmd))
+			} else {
+				_ = r.engine.SSH.RunCommand(context.Background(), r.srv, cleanCmd, io.Discard)
+				r.hub.Logf(fmt.Sprintf("✔ 已清理远程产物目录 %s，保留最近 %d 个版本包", r.app.ArtifactDir, keepCount))
+			}
 		}
 	}
 
-	// 清理本地过期 uploads 目录下的 .part 文件
-	allReleases := r.engine.Store.List(r.app.ID, 0)
-	if len(allReleases) > keepCount {
-		for _, oldRel := range allReleases[keepCount:] {
-			if oldRel.ID != "" {
-				_ = os.Remove(filepath.Join(r.engine.DataDir, "uploads", oldRel.ID+".part"))
-			}
-		}
+	// 清理本次上传产生的本地 .part 副本（上传目录只是缓存）
+	uploadsDir := filepath.Join(r.engine.DataDir, "uploads") + string(os.PathSeparator)
+	if strings.HasPrefix(r.artifact, uploadsDir) {
+		_ = os.Remove(r.artifact)
 	}
 
 	// 自动回收 Docker 悬空镜像 (dangling images)
@@ -906,11 +1021,21 @@ func (e *Engine) Hub(id string) *Hub {
 	return e.hubs[id]
 }
 
+// dropHub 发布结束后移除 Hub 引用；已在途的 SSE 订阅持有自己的指针，不受影响
+func (e *Engine) dropHub(id string) {
+	e.mu.Lock()
+	delete(e.hubs, id)
+	e.mu.Unlock()
+}
+
 func (e *Engine) Cancel(id string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	for _, r := range e.running {
 		if r.releaseID == id {
+			if r.cancel == nil {
+				return errors.New("该发布尚未开始执行，请稍候")
+			}
 			r.cancel()
 			return nil
 		}

@@ -6,15 +6,19 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"runtime"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"build-to-deploy/internal/config"
 	"build-to-deploy/internal/k8s"
@@ -24,6 +28,12 @@ import (
 )
 
 const maxChunkSize = 64 << 20
+
+// maskedValue 密码脱敏占位符；前端回传该值表示"不修改密码"
+const maskedValue = "******"
+
+// maxListLimit 发布记录列表最大返回条数
+const maxListLimit = 500
 
 type Server struct {
 	cfg    *config.Config
@@ -88,7 +98,57 @@ func (s *Server) Handler() http.Handler {
 	// 前端页面托管（无需账号密码，直接本地访问）
 	mux.Handle("/", http.FileServer(http.FS(s.static)))
 
-	return logRequests(mux)
+	return logRequests(guard(mux))
+}
+
+// maskServer 返回脱敏后的服务器配置：接口不回传 SSH 密码/口令
+func maskServer(srv *sshpool.ServerConfig) *sshpool.ServerConfig {
+	cp := *srv
+	if cp.Password != "" {
+		cp.Password = maskedValue
+	}
+	if cp.Passphrase != "" {
+		cp.Passphrase = maskedValue
+	}
+	return &cp
+}
+
+// guard 本服务无登录认证，且能力等价于远程 root shell，必须保证只有本机页面能调用：
+// 1) Host 头限定为本机地址，防止恶意网页通过 DNS rebinding 访问
+// 2) 写操作要求 Origin 为空（curl/脚本）或同源，防止任意网页 CSRF 触发发布
+func guard(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !isLocalHost(r.Host) {
+			writeErr(w, http.StatusForbidden, "仅允许通过 localhost 访问本服务: "+r.Host)
+			return
+		}
+		if r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions {
+			if origin := r.Header.Get("Origin"); origin != "" && !sameOrigin(origin, r.Host) {
+				writeErr(w, http.StatusForbidden, "跨站请求已被拒绝 (Origin 不匹配)")
+				return
+			}
+		}
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		next.ServeHTTP(w, r)
+	})
+}
+
+func isLocalHost(hostport string) bool {
+	host := hostport
+	if h, _, err := net.SplitHostPort(hostport); err == nil {
+		host = h
+	}
+	host = strings.Trim(host, "[]")
+	return host == "localhost" || host == "127.0.0.1" || host == "::1"
+}
+
+func sameOrigin(origin, host string) bool {
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(u.Host, host)
 }
 
 func logRequests(h http.Handler) http.Handler {
@@ -122,7 +182,12 @@ func readJSON(r *http.Request, v any) error {
 // ---------- 服务器 SSH 管理 ----------
 
 func (s *Server) listServers(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, s.cfg.SSHServers)
+	list := s.cfg.ListServers()
+	out := make([]*sshpool.ServerConfig, 0, len(list))
+	for _, srv := range list {
+		out = append(out, maskServer(srv))
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (s *Server) saveServer(w http.ResponseWriter, r *http.Request) {
@@ -141,11 +206,20 @@ func (s *Server) saveServer(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "主机地址和用户名不能为空")
 		return
 	}
+	// 编辑时前端回填的是脱敏占位符（或留空），收到时保留原凭据，避免把真实密码覆盖成 ******/空
+	if old := s.cfg.FindServer(srv.ID); old != nil && old.ID == srv.ID {
+		if (srv.Password == maskedValue || srv.Password == "") && old.Password != "" {
+			srv.Password = old.Password
+		}
+		if srv.Passphrase == maskedValue && old.Passphrase != "" {
+			srv.Passphrase = old.Passphrase
+		}
+	}
 	if err := s.cfg.UpdateServer(&srv); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, srv)
+	writeJSON(w, http.StatusOK, maskServer(&srv))
 }
 
 func (s *Server) deleteServer(w http.ResponseWriter, r *http.Request) {
@@ -226,7 +300,7 @@ func (s *Server) activeConnections(w http.ResponseWriter, r *http.Request) {
 // ---------- 应用配置管理 ----------
 
 func (s *Server) listApps(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, s.cfg.Apps)
+	writeJSON(w, http.StatusOK, s.cfg.ListApps())
 }
 
 func (s *Server) saveApp(w http.ResponseWriter, r *http.Request) {
@@ -240,6 +314,11 @@ func (s *Server) saveApp(w http.ResponseWriter, r *http.Request) {
 	}
 	if app.Name == "" {
 		writeErr(w, http.StatusBadRequest, "应用名称不能为空")
+		return
+	}
+	// 校验不通过属用户输入问题，返回 400 而非 500
+	if err := config.ValidateApp(&app); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if err := s.cfg.UpdateApp(&app); err != nil {
@@ -498,7 +577,11 @@ func (s *Server) writeChunk(w http.ResponseWriter, r *http.Request) {
 	body := http.MaxBytesReader(w, r.Body, maxChunkSize)
 	received, err := s.engine.Uploads.WriteChunk(r.PathValue("id"), offset, body)
 	if err != nil {
-		writeJSON(w, http.StatusConflict, map[string]any{"error": err.Error(), "received": received})
+		code := http.StatusConflict
+		if errors.Is(err, upload.ErrNotFound) {
+			code = http.StatusNotFound
+		}
+		writeJSON(w, code, map[string]any{"error": err.Error(), "received": received})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"received": received})
@@ -519,6 +602,9 @@ func (s *Server) listReleases(w http.ResponseWriter, r *http.Request) {
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	if limit <= 0 {
 		limit = 50
+	}
+	if limit > maxListLimit {
+		limit = maxListLimit
 	}
 	writeJSON(w, http.StatusOK, s.engine.Store.List(r.URL.Query().Get("app"), limit))
 }
@@ -543,6 +629,11 @@ func (s *Server) startRelease(w http.ResponseWriter, r *http.Request) {
 		if app := s.cfg.FindApp(req.AppID); app != nil {
 			cp := *app
 			cp.LocalArtifactPath = strings.TrimSpace(req.LocalArtifactPath)
+			// 产物路径决定将被上传到远程的文件，拒绝包含控制字符的异常输入
+			if strings.ContainsFunc(cp.LocalArtifactPath, unicode.IsControl) {
+				writeErr(w, http.StatusBadRequest, "本地产物路径包含非法字符")
+				return
+			}
 			_ = s.cfg.UpdateApp(&cp)
 		}
 	}
@@ -632,9 +723,21 @@ func (s *Server) releaseEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("X-Accel-Buffering", "no")
 
-	send := func(event string, data any) {
+	send := func(event string, data any) error {
 		b, _ := json.Marshal(data)
-		fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, b)
+		_, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, b)
+		return err
+	}
+
+	// 每次写入前设置写截止时间：客户端半开/卡死时不会让 goroutine 与订阅无限挂起
+	rc := http.NewResponseController(w)
+	write := func(text string) error {
+		_ = rc.SetWriteDeadline(time.Now().Add(30 * time.Second))
+		_, err := io.WriteString(w, text)
+		if err == nil {
+			flusher.Flush()
+		}
+		return err
 	}
 
 	var history []string
@@ -644,18 +747,27 @@ func (s *Server) releaseEvents(w http.ResponseWriter, r *http.Request) {
 		if ch != nil {
 			defer hub.Unsubscribe(ch)
 		}
-		rel, _ = s.engine.Store.Get(id)
+		// 订阅与 Hub 关闭之间存在空窗：ch 为 nil 时补取最新终态，避免前端停留在 running
+		if latest, err := s.engine.Store.Get(id); err == nil {
+			rel = latest
+		}
 	} else {
 		history = readLines(s.engine.LogPath(id))
 	}
-	send("release", rel)
-	for _, l := range history {
-		send("log", l)
+	if err := send("release", rel); err != nil {
+		return
 	}
-	flusher.Flush()
+	for _, l := range history {
+		if err := send("log", l); err != nil {
+			return
+		}
+	}
+	if err := write(""); err != nil {
+		return
+	}
 	if ch == nil {
-		send("end", struct{}{})
-		flusher.Flush()
+		_ = send("end", struct{}{})
+		_ = write("")
 		return
 	}
 
@@ -666,26 +778,33 @@ func (s *Server) releaseEvents(w http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			return
 		case <-keepalive.C:
-			fmt.Fprint(w, ": ping\n\n")
-			flusher.Flush()
+			if err := write(": ping\n\n"); err != nil {
+				return
+			}
 		case ev, ok := <-ch:
 			if !ok {
-				if latest, err := s.engine.Store.Get(id); err == nil && latest.Done() {
-					send("release", latest)
-					send("end", struct{}{})
+				if latest, err := s.engine.Store.Get(id); err == nil {
+					_ = send("release", latest)
 				}
-				flusher.Flush()
+				_ = send("end", struct{}{})
+				_ = write("")
 				return
 			}
-			send(ev.Type, ev.Data)
+			if err := send(ev.Type, ev.Data); err != nil {
+				return
+			}
+			if err := write(""); err != nil {
+				return
+			}
 			if ev.Type == "end" {
-				flusher.Flush()
 				return
 			}
-			flusher.Flush()
 		}
 	}
 }
+
+// maxReadLines 回放已完成发布日志时只读最后 N 行（与 Hub 历史上限一致）
+const maxReadLines = 5000
 
 func readLines(path string) []string {
 	f, err := os.Open(path)
@@ -695,8 +814,12 @@ func readLines(path string) []string {
 	defer f.Close()
 	var lines []string
 	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 64*1024), 1<<20)
 	for sc.Scan() {
 		lines = append(lines, sc.Text())
+		if len(lines) > maxReadLines {
+			lines = lines[len(lines)-maxReadLines:]
+		}
 	}
 	return lines
 }

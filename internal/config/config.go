@@ -57,7 +57,47 @@ type AppConfig struct {
 	AutoRollback   bool   `yaml:"autoRollback" json:"autoRollback"`     // 失败是否自动回滚
 }
 
-var TagRe = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$`)
+var (
+	TagRe = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$`)
+	// IDRe 服务器/应用 ID：会出现在日志文件名与前端模板中，限制为安全字符
+	IDRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
+	// ImageRe 镜像名（不含 Tag）：拒绝空格、分号、$、引号等可进入 shell 的字符
+	ImageRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/:@-]*$`)
+	// RemotePathRe 远程绝对路径：只允许常见安全字符
+	RemotePathRe = regexp.MustCompile(`^/[A-Za-z0-9._/-]*$`)
+	// K8sYamlFileRe K8s YAML 文件名：不得包含目录分隔符或 ..
+	K8sYamlFileRe = regexp.MustCompile(`^[A-Za-z0-9._-]+\.ya?ml$`)
+	// k8sNameRe K8s 资源名（RFC 1123 label）
+	k8sNameRe = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$`)
+)
+
+// ValidateApp 校验会拼入远程 shell 命令或决定远程写入位置的字段，防止命令注入与任意文件写
+func ValidateApp(a *AppConfig) error {
+	if !IDRe.MatchString(a.ID) {
+		return fmt.Errorf("应用 ID 只能包含字母、数字、. _ -，且以字母或数字开头 (当前: %q)", a.ID)
+	}
+	if a.Namespace != "" && !k8sNameRe.MatchString(a.Namespace) {
+		return fmt.Errorf("命名空间不合法 (当前: %q)", a.Namespace)
+	}
+	if a.Deployment != "" && !k8sNameRe.MatchString(a.Deployment) {
+		return fmt.Errorf("Deployment 名称不合法 (当前: %q)", a.Deployment)
+	}
+	if a.Container != "" && !k8sNameRe.MatchString(a.Container) {
+		return fmt.Errorf("容器名称不合法 (当前: %q)", a.Container)
+	}
+	if strings.TrimSpace(a.Image) != "" && !ImageRe.MatchString(a.Image) {
+		return fmt.Errorf("镜像名不合法 (当前: %q)", a.Image)
+	}
+	for label, p := range map[string]string{"产物目录": a.ArtifactDir, "构建目录": a.BuildDir, "K8s 目录": a.K8sYamlDir} {
+		if strings.TrimSpace(p) != "" && !RemotePathRe.MatchString(p) {
+			return fmt.Errorf("%s必须是绝对路径且不能包含空格、; $ & | 引号等字符 (当前: %q)", label, p)
+		}
+	}
+	if strings.TrimSpace(a.K8sYamlFile) != "" && !K8sYamlFileRe.MatchString(a.K8sYamlFile) {
+		return fmt.Errorf("K8s YAML 文件名不合法，只能是如 order-service.yaml (当前: %q)", a.K8sYamlFile)
+	}
+	return nil
+}
 
 func Load(path string) (*Config, error) {
 	b, err := os.ReadFile(path)
@@ -82,7 +122,7 @@ func Load(path string) (*Config, error) {
 func Default() *Config {
 	return &Config{
 		Server: ServerSettings{
-			Listen:      ":8080",
+			Listen:      "127.0.0.1:8080",
 			DataDir:     "./data",
 			MaxUploadMB: 2048,
 			DryRun:      false,
@@ -125,7 +165,8 @@ func Default() *Config {
 
 func (c *Config) normalize() {
 	if c.Server.Listen == "" {
-		c.Server.Listen = ":8080"
+		// 默认只监听本机回环地址：服务无认证，不应暴露到局域网
+		c.Server.Listen = "127.0.0.1:8080"
 	}
 	if c.Server.DataDir == "" {
 		c.Server.DataDir = "./data"
@@ -162,11 +203,23 @@ func (c *Config) normalize() {
 		if app.RolloutTimeout <= 0 {
 			app.RolloutTimeout = 300
 		}
-		// 规范化路径统一为 linux 斜杠
-		app.ArtifactDir = strings.TrimRight(filepath.ToSlash(app.ArtifactDir), "/")
-		app.BuildDir = strings.TrimRight(filepath.ToSlash(app.BuildDir), "/")
-		app.K8sYamlDir = strings.TrimRight(filepath.ToSlash(app.K8sYamlDir), "/")
+		// 规范化路径统一为 linux 斜杠（保留根路径 "/"，避免 "cp -f x /" 之类命令被改写）
+		app.ArtifactDir = trimRemoteSlash(app.ArtifactDir)
+		app.BuildDir = trimRemoteSlash(app.BuildDir)
+		app.K8sYamlDir = trimRemoteSlash(app.K8sYamlDir)
+		// YAML 文件名只允许纯文件名（拒绝 ../ 目录穿越）
+		if app.K8sYamlFile != "" && strings.ContainsAny(app.K8sYamlFile, "/\\") {
+			app.K8sYamlFile = filepath.Base(app.K8sYamlFile)
+		}
 	}
+}
+
+func trimRemoteSlash(p string) string {
+	p = filepath.ToSlash(p)
+	if p == "/" {
+		return p
+	}
+	return strings.TrimRight(p, "/")
 }
 
 func (c *Config) Save() error {
@@ -175,44 +228,85 @@ func (c *Config) Save() error {
 	return c.saveUnlocked()
 }
 
+// FindApp 返回应用的副本：配置可在网页上随时被替换，直接返回内部指针会让调用方读到半更新数据
 func (c *Config) FindApp(idOrName string) *AppConfig {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	for _, a := range c.Apps {
 		if a.ID == idOrName || a.Name == idOrName {
-			return a
+			cp := *a
+			return &cp
 		}
 	}
 	return nil
 }
 
+// FindServer 返回服务器配置的副本（原因同 FindApp）
 func (c *Config) FindServer(id string) *sshpool.ServerConfig {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	for _, s := range c.SSHServers {
 		if s.ID == id {
-			return s
+			cp := *s
+			return &cp
 		}
 	}
 	if len(c.SSHServers) > 0 {
-		return c.SSHServers[0]
+		cp := *c.SSHServers[0]
+		return &cp
 	}
 	return nil
 }
 
+// ListServers 返回服务器配置的快照，供 API 层序列化
+func (c *Config) ListServers() []*sshpool.ServerConfig {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make([]*sshpool.ServerConfig, 0, len(c.SSHServers))
+	for _, s := range c.SSHServers {
+		cp := *s
+		out = append(out, &cp)
+	}
+	return out
+}
+
+// ListApps 返回应用配置的快照，供 API 层序列化
+func (c *Config) ListApps() []*AppConfig {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make([]*AppConfig, 0, len(c.Apps))
+	for _, a := range c.Apps {
+		cp := *a
+		out = append(out, &cp)
+	}
+	return out
+}
+
+// ServerSettingsSnapshot 返回 server 段配置的只读快照
+func (c *Config) ServerSettingsSnapshot() ServerSettings {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.Server
+}
+
 func (c *Config) UpdateServer(s *sshpool.ServerConfig) error {
+	if s == nil || !IDRe.MatchString(s.ID) {
+		return fmt.Errorf("服务器 ID 不合法，只能包含字母、数字、. _ -")
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	found := false
 	for i, old := range c.SSHServers {
 		if old.ID == s.ID {
-			c.SSHServers[i] = s
+			cp := *s
+			c.SSHServers[i] = &cp
 			found = true
 			break
 		}
 	}
 	if !found {
-		c.SSHServers = append(c.SSHServers, s)
+		cp := *s
+		c.SSHServers = append(c.SSHServers, &cp)
 	}
 	return c.saveUnlocked()
 }
@@ -231,18 +325,26 @@ func (c *Config) DeleteServer(id string) error {
 }
 
 func (c *Config) UpdateApp(app *AppConfig) error {
+	if app == nil {
+		return fmt.Errorf("应用配置不能为空")
+	}
+	if err := ValidateApp(app); err != nil {
+		return err
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	found := false
 	for i, old := range c.Apps {
 		if old.ID == app.ID {
-			c.Apps[i] = app
+			cp := *app
+			c.Apps[i] = &cp
 			found = true
 			break
 		}
 	}
 	if !found {
-		c.Apps = append(c.Apps, app)
+		cp := *app
+		c.Apps = append(c.Apps, &cp)
 	}
 	return c.saveUnlocked()
 }
@@ -266,9 +368,19 @@ func (c *Config) saveUnlocked() error {
 		return err
 	}
 	if c.path == "" {
-		c.path = "config.yaml"
+		c.path = "configs/config.yaml"
 	}
-	return os.WriteFile(c.path, b, 0644)
+	// 原子写入：避免进程中断留下截断的配置文件；权限收紧到 0600（含 SSH 明文密码）
+	if dir := filepath.Dir(c.path); dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+	}
+	tmp := c.path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, c.path)
 }
 
 func expandHome(p string) string {
@@ -292,9 +404,9 @@ func (a *AppConfig) ResolveLocalArtifactPath() string {
 	if p == "" {
 		return ""
 	}
+	// 先展开 ~ 再判断绝对路径，避免 "~/x" 被当成相对路径拼到项目目录下
 	if !filepath.IsAbs(p) && strings.TrimSpace(a.LocalProjectDir) != "" {
 		return filepath.Join(a.ResolveLocalProjectDir(), p)
 	}
 	return p
 }
-

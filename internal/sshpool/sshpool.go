@@ -85,26 +85,25 @@ func (c *cachedConn) close() {
 	}
 }
 
-// GetClient 获取或复用持久化 SSH 连接
+// GetClient 获取或复用持久化 SSH 连接。
+// 探测与拨号都在锁外进行：某台服务器不可达时不会阻塞其它服务器的请求与连接清理。
 func (p *Pool) GetClient(cfg *ServerConfig) (*ssh.Client, *sftp.Client, error) {
+	key := connKey(cfg)
+
 	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	key := cfg.ID
-	if key == "" {
-		key = fmt.Sprintf("%s@%s:%d", cfg.User, cfg.Host, cfg.Port)
-	}
-
 	if c, ok := p.conns[key]; ok && c.sshClient != nil {
 		// 探测连接是否可用
 		if _, _, err := c.sshClient.SendRequest("keepalive@buildtodeploy", true, nil); err == nil {
 			c.lastUsed = time.Now()
-			return c.sshClient, c.sftpClient, nil
+			client, sftpCli := c.sshClient, c.sftpClient
+			p.mu.Unlock()
+			return client, sftpCli, nil
 		}
 		// 连接已断开，关闭旧连接重新连接
 		c.close()
 		delete(p.conns, key)
 	}
+	p.mu.Unlock()
 
 	client, err := dialSSH(cfg)
 	if err != nil {
@@ -124,6 +123,20 @@ func (p *Pool) GetClient(cfg *ServerConfig) (*ssh.Client, *sftp.Client, error) {
 		lastUsed:   time.Now(),
 		stopKeep:   stopCh,
 	}
+
+	p.mu.Lock()
+	// 并发拨号时可能已有其它 goroutine 先建立连接：复用它，关闭本次新建的连接
+	if old, ok := p.conns[key]; ok && old.sshClient != nil {
+		old.lastUsed = time.Now()
+		existingClient, existingSFTP := old.sshClient, old.sftpClient
+		p.mu.Unlock()
+		_ = sftpCli.Close()
+		_ = client.Close()
+		close(stopCh)
+		return existingClient, existingSFTP, nil
+	}
+	p.conns[key] = cached
+	p.mu.Unlock()
 
 	// 开启心跳协程，每 25 秒探测一次，保持长连接避免由于空闲被防火墙或 sshd 踢掉
 	go func(connKey string, cli *ssh.Client, stop chan struct{}) {
@@ -155,8 +168,15 @@ func (p *Pool) GetClient(cfg *ServerConfig) (*ssh.Client, *sftp.Client, error) {
 		}
 	}(key, client, stopCh)
 
-	p.conns[key] = cached
 	return client, sftpCli, nil
+}
+
+// connKey 连接池键：优先使用服务器 ID
+func connKey(cfg *ServerConfig) string {
+	if cfg.ID != "" {
+		return cfg.ID
+	}
+	return fmt.Sprintf("%s@%s:%d", cfg.User, cfg.Host, cfg.Port)
 }
 
 // Invalidate 主动清理并断开指定服务器的缓存连接
@@ -233,11 +253,18 @@ func dialSSH(cfg *ServerConfig) (*ssh.Client, error) {
 
 	var authMethods []ssh.AuthMethod
 
-	// 1. 尝试连接本地 SSH Agent（若存在 SSH_AUTH_SOCK）
-	if sock := os.Getenv("SSH_AUTH_SOCK"); sock != "" {
+	// 1. 仅在显式选择 agent 认证时使用本地 SSH Agent，避免把本机密钥交给任意新添加的服务器
+	useAgent := cfg.AuthType == "agent" || (cfg.AuthType == "" && cfg.Password == "" && cfg.KeyPath == "")
+	if sock := os.Getenv("SSH_AUTH_SOCK"); useAgent && sock != "" {
 		if agentConn, err := net.Dial("unix", sock); err == nil {
 			agentCli := agent.NewClient(agentConn)
-			authMethods = append(authMethods, ssh.PublicKeysCallback(agentCli.Signers))
+			var once sync.Once
+			authMethods = append(authMethods, ssh.PublicKeysCallback(func() ([]ssh.Signer, error) {
+				signers, err := agentCli.Signers()
+				// 认证阶段结束后关闭 agent 连接，避免每次重连泄漏文件描述符
+				once.Do(func() { _ = agentConn.Close() })
+				return signers, err
+			}))
 		}
 	}
 
@@ -468,6 +495,9 @@ func (p *Pool) UploadFile(ctx context.Context, cfg *ServerConfig, localPath stri
 	return nil
 }
 
+// maxRemoteRead 读取远程文本文件的大小上限（K8s YAML 等），防止误指向大文件时耗尽内存
+const maxRemoteRead = 8 << 20
+
 // ReadRemoteFile 通过 SFTP 读取远程服务器上的文本文件内容
 func (p *Pool) ReadRemoteFile(cfg *ServerConfig, remotePath string) (string, error) {
 	_, sftpCli, err := p.GetClient(cfg)
@@ -480,27 +510,49 @@ func (p *Pool) ReadRemoteFile(cfg *ServerConfig, remotePath string) (string, err
 		return "", fmt.Errorf("打开远程文件 %s 失败: %w", remotePath, err)
 	}
 	defer f.Close()
-	b, err := io.ReadAll(f)
+	b, err := io.ReadAll(io.LimitReader(f, maxRemoteRead+1))
 	if err != nil {
 		return "", fmt.Errorf("读取远程文件 %s 失败: %w", remotePath, err)
+	}
+	if int64(len(b)) > maxRemoteRead {
+		return "", fmt.Errorf("远程文件 %s 超过 %d MB 上限，拒绝读取", remotePath, maxRemoteRead>>20)
 	}
 	return string(b), nil
 }
 
-// WriteRemoteFile 通过 SFTP 将修改后的文本内容写回远程服务器文件
+// WriteRemoteFile 通过 SFTP 将修改后的文本内容写回远程服务器文件。
+// 先写临时文件再重命名，避免写入中途断开导致原文件被截断。
 func (p *Pool) WriteRemoteFile(cfg *ServerConfig, remotePath string, content string) error {
 	_, sftpCli, err := p.GetClient(cfg)
 	if err != nil {
 		return err
 	}
 	remotePath = filepath.ToSlash(remotePath)
-	f, err := sftpCli.Create(remotePath)
-	if err != nil {
-		return fmt.Errorf("打开远程文件 %s 写入失败: %w", remotePath, err)
+	mode := os.FileMode(0o644)
+	if st, err := sftpCli.Stat(remotePath); err == nil {
+		mode = st.Mode().Perm()
 	}
-	defer f.Close()
+	tmpPath := remotePath + ".tmp"
+	f, err := sftpCli.Create(tmpPath)
+	if err != nil {
+		return fmt.Errorf("打开远程文件 %s 写入失败: %w", tmpPath, err)
+	}
 	if _, err := f.Write([]byte(content)); err != nil {
-		return fmt.Errorf("写入远程文件 %s 失败: %w", remotePath, err)
+		_ = f.Close()
+		_ = sftpCli.Remove(tmpPath)
+		return fmt.Errorf("写入远程文件 %s 失败: %w", tmpPath, err)
+	}
+	if err := f.Close(); err != nil {
+		_ = sftpCli.Remove(tmpPath)
+		return fmt.Errorf("关闭远程文件 %s 失败: %w", tmpPath, err)
+	}
+	_ = sftpCli.Chmod(tmpPath, mode)
+	// 优先使用 posix-rename@openssh.com 扩展（可原子覆盖），不支持时回退普通 rename
+	if err := sftpCli.PosixRename(tmpPath, remotePath); err != nil {
+		if err := sftpCli.Rename(tmpPath, remotePath); err != nil {
+			_ = sftpCli.Remove(tmpPath)
+			return fmt.Errorf("替换远程文件 %s 失败: %w", remotePath, err)
+		}
 	}
 	return nil
 }

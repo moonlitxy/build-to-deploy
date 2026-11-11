@@ -34,7 +34,9 @@
 
 在项目根目录下直接运行（自动探测并加载配置文件）：
 ```bash
-go run .
+go run .            # 在项目根目录直接启动（演练模式配置），或 make dev
+make linux          # 交叉编译 Linux 部署包到 bin/
+make windows        # 交叉编译 Windows 可执行文件
 ```
 
 打开本地浏览器访问：
