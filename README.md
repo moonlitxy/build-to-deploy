@@ -34,10 +34,12 @@
 
 在项目根目录下直接运行（自动探测并加载配置文件）：
 ```bash
-go run .            # 在项目根目录直接启动（演练模式配置），或 make dev
+make dev            # 首次运行会基于 config.example.yaml 生成演练配置 configs/config.dev.yaml，随后启动
 make linux          # 交叉编译 Linux 部署包到 bin/
 make windows        # 交叉编译 Windows 可执行文件
 ```
+
+没有配置时会按 `configs/config.dev.yaml` → `configs/config.yaml` → 根目录 `config.yaml` 的顺序自动探测（演练优先，避免误连真实服务器）；生产环境建议用 `-config configs/config.yaml` 显式指定。首次部署把 `configs/config.example.yaml` 复制为 `configs/config.yaml` 后按注释修改即可。
 
 打开本地浏览器访问：
 👉 **http://localhost:8080** (无需输入任何登录密码)

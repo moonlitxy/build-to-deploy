@@ -27,13 +27,13 @@ import (
 var version = "2.0-local"
 
 func main() {
-	cfgPath := flag.String("config", "", "配置文件路径 (默认依次探测 config.yaml、configs/config.yaml、configs/config.dev.yaml)")
+	cfgPath := flag.String("config", "", "配置文件路径 (默认依次探测 configs/config.dev.yaml、configs/config.yaml、config.yaml)")
 	flag.Parse()
 
 	targetCfg := *cfgPath
 	if targetCfg == "" {
-		// 生产配置优先于演练配置；模板放在 configs/ 下，同时兼容旧版放在根目录的 config.yaml
-		for _, candidate := range []string{"config.yaml", "configs/config.yaml", "configs/config.dev.yaml"} {
+		// 优先演练配置：直接 go run . 时绝不会误连真实服务器；生产配置可用 -config 显式指定
+		for _, candidate := range []string{"configs/config.dev.yaml", "configs/config.yaml", "config.yaml"} {
 			if _, err := os.Stat(candidate); err == nil {
 				targetCfg = candidate
 				break

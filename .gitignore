@@ -8,6 +8,7 @@ logs/
 *.part
 config.yaml
 configs/config.yaml
+configs/config.dev.yaml
 *.exe
 .DS_Store
 CLAUDE.md
