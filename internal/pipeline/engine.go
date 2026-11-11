@@ -202,6 +202,10 @@ func (e *Engine) StartDeploy(req StartRequest) (*store.Release, error) {
 	if app == nil {
 		return nil, fmt.Errorf("应用 %s 不存在", req.AppID)
 	}
+	// 模板变量会被直接渲染进远程 shell 命令：保存时校验过，这里兜底手改 YAML / 旧配置的绕过
+	if err := validateAppForPipeline(app); err != nil {
+		return nil, err
+	}
 
 	srv := e.Cfg.FindServer(app.ServerID)
 	if srv == nil {
@@ -267,6 +271,10 @@ func (e *Engine) StartDeploy(req StartRequest) (*store.Release, error) {
 		up, err := e.Uploads.Get(req.UploadID)
 		if err != nil {
 			return nil, err
+		}
+		// 分片未上传完成时禁止发布：否则远端落的是残缺包，且 SHA256 为空
+		if !up.Done {
+			return nil, fmt.Errorf("上传任务 %s 尚未完成（已接收 %d/%d），请等待分片上传完成后再发布", req.UploadID, up.Received, up.Size)
 		}
 		fileName = up.FileName
 		fileSize = up.Size
@@ -412,8 +420,12 @@ func (e *Engine) StartRollback(req RollbackRequest) (*store.Release, error) {
 	}()
 
 	// 发布记录会被回滚流水线再次使用，其中的镜像引用会进入远程命令，必须与表单输入同样校验
-	if !config.ImageRe.MatchString(app.Image) {
-		return nil, fmt.Errorf("应用镜像名不合法 (当前: %q)", app.Image)
+	if err := validateAppForPipeline(app); err != nil {
+		return nil, err
+	}
+	// 历史记录的镜像引用会被直接写回远程 YAML，非法值会损坏配置文件
+	if !imageRefRe.MatchString(target.Image) {
+		return nil, fmt.Errorf("历史记录镜像引用不合法 (%q)，无法回滚", target.Image)
 	}
 
 	stages := []store.Stage{
@@ -1071,6 +1083,18 @@ func (e *Engine) Cancel(id string) error {
 		}
 	}
 	return errors.New("该发布未在运行")
+}
+
+// validateAppForPipeline 发布与回滚共用的配置校验：
+// 模板变量会直接渲染进远程 shell 命令，手改 YAML 或旧配置可能绕过保存时的校验
+func validateAppForPipeline(app *config.AppConfig) error {
+	if err := config.ValidateApp(app); err != nil {
+		return fmt.Errorf("应用配置不合法: %w", err)
+	}
+	if strings.TrimSpace(app.Image) == "" {
+		return errors.New("应用未配置镜像名称 (Image)")
+	}
+	return nil
 }
 
 // validateK8sTarget 校验 set image 回滚所需的命名空间/Deployment/容器是否齐全且合法

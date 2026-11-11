@@ -270,6 +270,18 @@
         </div>
         <div class="app-cards-grid" id="appCardsList"></div>
       </div>
+
+      <!-- 配置备份与回滚：每次保存自动备份，改错可一键恢复 -->
+      <div class="card config-section-card">
+        <div class="card-header">
+          <div>
+            <h3>🕘 配置备份与回滚</h3>
+            <p class="config-sub-hint">每次保存服务器或应用配置都会自动备份最近 20 份，恢复时当前版本也会再备份一次，可反复回滚。</p>
+          </div>
+          <button id="refreshBackupsBtn" class="btn btn-secondary">刷新</button>
+        </div>
+        <div id="configBackupsList"></div>
+      </div>
     </div>
   </section>
 

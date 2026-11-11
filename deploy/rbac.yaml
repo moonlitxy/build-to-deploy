@@ -21,6 +21,33 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch"]
+  # 查看 Pod 日志（kubectl logs）需要 pods/log 子资源权限
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+---
+# 命名空间列表是集群级资源，Role 授权不到：需要只读 ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: build-to-deploy-namespaces
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: build-to-deploy-namespaces
+subjects:
+  - kind: ServiceAccount
+    name: build-to-deploy
+    namespace: prod
+roleRef:
+  kind: ClusterRole
+  name: build-to-deploy-namespaces
+  apiGroup: rbac.authorization.k8s.io
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

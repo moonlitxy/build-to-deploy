@@ -427,8 +427,12 @@ func (p *Pool) ExecuteOutput(ctx context.Context, cfg *ServerConfig, cmd string)
 	select {
 	case <-ctx.Done():
 		_ = session.Signal(ssh.SIGKILL)
-		// 必须等会话真正结束才能返回：否则调用方读到被并发追加的 buffer 构成数据竞争
-		<-done
+		// 等会话真正结束再返回，避免读到被并发追加的 buffer；但远端不响应信号时不能无限等
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			_ = session.Close()
+		}
 		return "", ctx.Err()
 	case err := <-done:
 		if err != nil {

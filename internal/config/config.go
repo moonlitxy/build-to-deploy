@@ -5,8 +5,10 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"build-to-deploy/internal/sshpool"
 	"gopkg.in/yaml.v3"
@@ -89,7 +91,17 @@ func ValidateApp(a *AppConfig) error {
 		return fmt.Errorf("镜像名不合法 (当前: %q)", a.Image)
 	}
 	for label, p := range map[string]string{"产物目录": a.ArtifactDir, "构建目录": a.BuildDir, "K8s 目录": a.K8sYamlDir} {
-		if strings.TrimSpace(p) != "" && !RemotePathRe.MatchString(p) {
+		if strings.TrimSpace(p) == "" {
+			continue
+		}
+		// 根目录与 .. 会导致清理或构建命令越界到系统目录，必须拒绝
+		if p == "/" {
+			return fmt.Errorf("%s不能为根目录 / (当前: %q)", label, p)
+		}
+		if strings.Contains(p, "..") {
+			return fmt.Errorf("%s不能包含 .. (当前: %q)", label, p)
+		}
+		if !RemotePathRe.MatchString(p) {
 			return fmt.Errorf("%s必须是绝对路径且不能包含空格、; $ & | 引号等字符 (当前: %q)", label, p)
 		}
 	}
@@ -245,7 +257,8 @@ func (c *Config) FindApp(idOrName string) *AppConfig {
 	return nil
 }
 
-// FindServer 返回服务器配置的副本（原因同 FindApp）
+// FindServer 按 ID 精确查找服务器配置，找不到返回 nil。
+// 禁止兜底返回第一台：调用方会据此操作远程主机，兜底会静默连错机器
 func (c *Config) FindServer(id string) *sshpool.ServerConfig {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -254,10 +267,6 @@ func (c *Config) FindServer(id string) *sshpool.ServerConfig {
 			cp := *s
 			return &cp
 		}
-	}
-	if len(c.SSHServers) > 0 {
-		cp := *c.SSHServers[0]
-		return &cp
 	}
 	return nil
 }
@@ -372,7 +381,7 @@ func (c *Config) UpdateLocalArtifactPath(appID, path string) error {
 			return c.saveUnlocked()
 		}
 	}
-	return nil
+	return fmt.Errorf("应用 %s 不存在", appID)
 }
 
 func (c *Config) DeleteApp(id string) error {
@@ -396,6 +405,11 @@ func (c *Config) saveUnlocked() error {
 	if c.path == "" {
 		c.path = "configs/config.yaml"
 	}
+	// 写入前备份上一版：配置页每次保存都留档，改错可一键恢复。
+	// 备份失败（磁盘满、目录只读）不能让保存本身失败，否则用户无法修改配置
+	if _, statErr := os.Stat(c.path); statErr == nil {
+		_ = c.backupLocked()
+	}
 	// 原子写入：避免进程中断留下截断的配置文件；权限收紧到 0600（含 SSH 明文密码）
 	if dir := filepath.Dir(c.path); dir != "." {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -407,6 +421,118 @@ func (c *Config) saveUnlocked() error {
 		return err
 	}
 	return os.Rename(tmp, c.path)
+}
+
+// maxConfigBackups 配置备份保留份数
+const maxConfigBackups = 20
+
+// backupNameRe 备份文件名格式：恢复时严格校验，防止路径穿越
+var backupNameRe = regexp.MustCompile(`^\d{8}-\d{6}\.\d+\.ya?ml$`)
+
+// ConfigBackup 备份文件信息
+type ConfigBackup struct {
+	Name string `json:"name"`
+	Size int64  `json:"size"`
+}
+
+func (c *Config) backupDir() string {
+	return filepath.Join(filepath.Dir(c.path), ".backups")
+}
+
+// backupEntries 返回备份目录中的合法备份文件（按字典序，即时间序）。目录不存在时返回 nil。
+func (c *Config) backupEntries() ([]os.DirEntry, error) {
+	entries, err := os.ReadDir(c.backupDir())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var out []os.DirEntry
+	for _, e := range entries {
+		if !e.IsDir() && backupNameRe.MatchString(e.Name()) {
+			out = append(out, e)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name() < out[j].Name() })
+	return out, nil
+}
+
+// backupLocked 复制当前配置文件到备份目录，仅保留最近份
+func (c *Config) backupLocked() error {
+	dir := c.backupDir()
+	// 备份含 SSH 明文密码：目录收紧到 0700，文件 0600
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	b, err := os.ReadFile(c.path)
+	if err != nil {
+		return err
+	}
+	name := time.Now().Format("20060102-150405.000000000") + ".yaml"
+	if err := os.WriteFile(filepath.Join(dir, name), b, 0o600); err != nil {
+		return err
+	}
+	entries, err := c.backupEntries()
+	if err != nil {
+		return err
+	}
+	// 文件名即时间戳，字典序即时间序，删掉最旧的
+	for _, old := range entries[:max(0, len(entries)-maxConfigBackups)] {
+		_ = os.Remove(filepath.Join(dir, old.Name()))
+	}
+	return nil
+}
+
+// Backups 列出可恢复的配置备份（按时间倒序）
+func (c *Config) Backups() ([]ConfigBackup, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	entries, err := c.backupEntries()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ConfigBackup, 0, len(entries))
+	for i := len(entries) - 1; i >= 0; i-- {
+		var size int64
+		if info, err := entries[i].Info(); err == nil {
+			size = info.Size()
+		}
+		out = append(out, ConfigBackup{Name: entries[i].Name(), Size: size})
+	}
+	return out, nil
+}
+
+// Restore 恢复指定备份：先备份当前版本，再用备份覆盖并重载，支持反复回滚
+func (c *Config) Restore(name string) error {
+	if !backupNameRe.MatchString(name) {
+		return fmt.Errorf("备份名称不合法: %q", name)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	// 恢复前同样尽量备份当前版本，备份失败不阻断恢复
+	_ = c.backupLocked()
+	b, err := os.ReadFile(filepath.Join(c.backupDir(), name))
+	if err != nil {
+		return fmt.Errorf("读取备份失败: %w", err)
+	}
+	fresh := &Config{}
+	if err := yaml.Unmarshal(b, fresh); err != nil {
+		return fmt.Errorf("备份文件损坏: %w", err)
+	}
+	fresh.path = c.path
+	fresh.normalize()
+	tmp := c.path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, c.path); err != nil {
+		return err
+	}
+	c.Server = fresh.Server
+	c.SSHServers = fresh.SSHServers
+	c.Apps = fresh.Apps
+	return nil
 }
 
 // ExpandHome 展开开头的 ~ 为当前用户主目录

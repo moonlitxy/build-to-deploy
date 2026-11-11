@@ -34,6 +34,7 @@ type Manager struct {
 	maxSize int64
 	mu      sync.Mutex
 	m       map[string]*Upload
+	pending int // 未完成上传数：由 mu 保护，避免在 m.mu 内读 u.Done（与 u.mu→m.mu 的既有顺序相反）
 }
 
 func NewManager(dir string, maxSize int64) (*Manager, error) {
@@ -83,13 +84,7 @@ func (m *Manager) Create(fileName string, size int64, owner string) (*Upload, er
 		return nil, err
 	}
 	m.mu.Lock()
-	pending := 0
-	for _, u := range m.m {
-		if !u.Done {
-			pending++
-		}
-	}
-	if pending >= maxPending {
+	if m.pending >= maxPending {
 		m.mu.Unlock()
 		return nil, errors.New("未完成的上传任务过多，请稍后重试")
 	}
@@ -103,6 +98,7 @@ func (m *Manager) Create(fileName string, size int64, owner string) (*Upload, er
 	f.Close()
 	// 占位与计数在同一临界区完成，避免并发创建突破 maxPending
 	m.m[u.ID] = u
+	m.pending++
 	m.mu.Unlock()
 	return u, nil
 }
@@ -170,11 +166,14 @@ func (m *Manager) WriteChunk(id string, offset int64, r io.Reader) (int64, error
 	return u.Received, nil
 }
 
-// forget 从任务表移除已被清理的上传（仅在仍指向同一对象时）
+// forget 从任务表移除已被清理的上传（仅在仍指向同一对象时）。调用方必须持有 u.mu
 func (m *Manager) forget(id string, u *Upload) {
 	m.mu.Lock()
 	if cur, ok := m.m[id]; ok && cur == u {
 		delete(m.m, id)
+		if !u.Done {
+			m.pending--
+		}
 	}
 	m.mu.Unlock()
 }
@@ -203,28 +202,9 @@ func (m *Manager) Complete(id string) (*Upload, error) {
 	}
 	u.SHA256 = hex.EncodeToString(h.Sum(nil))
 	u.Done = true
-	return u, nil
-}
-
-// Take 取走已完成的上传文件，移动到 dst，并移除上传任务。
-func (m *Manager) Take(id, dst string) (*Upload, error) {
-	u, err := m.Get(id)
-	if err != nil {
-		return nil, err
-	}
-	u.mu.Lock()
-	defer u.mu.Unlock()
-	if !u.Done {
-		return nil, errors.New("文件尚未上传完成")
-	}
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		return nil, err
-	}
-	if err := os.Rename(u.Path, dst); err != nil {
-		return nil, err
-	}
+	// 完成后释放 pending 名额（持 u.mu 再取 m.mu，与 forget 的锁顺序一致）
 	m.mu.Lock()
-	delete(m.m, id)
+	m.pending--
 	m.mu.Unlock()
 	return u, nil
 }

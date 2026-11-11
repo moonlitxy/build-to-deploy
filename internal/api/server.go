@@ -73,6 +73,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/apps/{id}/local-artifact", s.inspectLocalArtifact)
 	mux.HandleFunc("POST /api/local/pick-path", s.pickLocalPath)
 
+	// 配置备份与回滚（每次保存自动备份，改错可恢复）
+	mux.HandleFunc("GET /api/config/backups", s.listConfigBackups)
+	mux.HandleFunc("POST /api/config/restore", s.restoreConfig)
+
 	// 预检版本冲突（满足需求 2）
 	mux.HandleFunc("POST /api/precheck", s.precheck)
 
@@ -209,6 +213,15 @@ func releaseID(w http.ResponseWriter, r *http.Request) (string, bool) {
 	return id, true
 }
 
+// checkK8sName 校验 K8s 资源名格式：用户输入问题返回 400，避免落到 k8s 层变成 500
+func checkK8sName(w http.ResponseWriter, kind, v string) bool {
+	if err := k8s.CheckName(kind, v); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return false
+	}
+	return true
+}
+
 func readJSON(r *http.Request, v any) error {
 	dec := json.NewDecoder(http.MaxBytesReader(nil, r.Body, 2<<20))
 	if err := dec.Decode(v); err != nil {
@@ -274,15 +287,23 @@ func (s *Server) saveServer(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// 连接池按服务器 ID 缓存：host / 端口 / 凭据变更后必须失效旧长连接，否则继续复用 stale 连接
+	s.pool.Invalidate(&srv)
 	writeJSON(w, http.StatusOK, maskServer(&srv))
 }
 
 func (s *Server) deleteServer(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	if err := checkID(id); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	if err := s.cfg.DeleteServer(id); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// 删除配置的同时断开其长连接，避免残留连接继续占用远端会话
+	s.pool.Disconnect(id)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -297,7 +318,8 @@ func (s *Server) testServer(w http.ResponseWriter, r *http.Request) {
 			srv = *existing
 		}
 	}
-	if s.cfg.Server.DryRun {
+	// 通过快照读取：直接访问 cfg.Server 会绕过读写锁，与配置保存并发时构成数据竞争
+	if s.cfg.ServerSettingsSnapshot().DryRun {
 		s.pool.MarkSimulated(&srv)
 		writeJSON(w, http.StatusOK, map[string]string{"message": fmt.Sprintf("SSH 长连接已建立 [%s@%s] (演练模式)", srv.User, srv.Host)})
 		return
@@ -385,10 +407,45 @@ func (s *Server) saveApp(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) deleteApp(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	if err := checkID(id); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	if err := s.cfg.DeleteApp(id); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// ---------- 配置备份与回滚 ----------
+
+func (s *Server) listConfigBackups(w http.ResponseWriter, r *http.Request) {
+	backups, err := s.cfg.Backups()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if backups == nil {
+		backups = []config.ConfigBackup{}
+	}
+	writeJSON(w, http.StatusOK, backups)
+}
+
+func (s *Server) restoreConfig(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := readJSON(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := s.cfg.Restore(req.Name); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// 服务器配置可能已回退到旧凭据，断开全部长连接，下次使用时重建
+	s.pool.Disconnect("all")
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -536,6 +593,10 @@ func (s *Server) getPods(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "未指定或找不到 SSH 服务器")
 		return
 	}
+	// 空命名空间由 k8s 层默认填充为 default，仅校验显式传入的值
+	if ns != "" && !checkK8sName(w, "命名空间", ns) {
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 	defer cancel()
 
@@ -557,6 +618,15 @@ func (s *Server) getPodLogs(w http.ResponseWriter, r *http.Request) {
 	srv := s.cfg.FindServer(serverId)
 	if srv == nil {
 		writeErr(w, http.StatusBadRequest, "未指定或找不到 SSH 服务器")
+		return
+	}
+	if ns != "" && !checkK8sName(w, "命名空间", ns) {
+		return
+	}
+	if !checkK8sName(w, "Pod", pod) {
+		return
+	}
+	if container != "" && !checkK8sName(w, "容器", container) {
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
@@ -587,6 +657,12 @@ func (s *Server) restartDeployment(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Deployment == "" {
 		writeErr(w, http.StatusBadRequest, "Deployment 名称不能为空")
+		return
+	}
+	if !checkK8sName(w, "Deployment", req.Deployment) {
+		return
+	}
+	if req.Namespace != "" && !checkK8sName(w, "命名空间", req.Namespace) {
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
@@ -820,14 +896,14 @@ func (s *Server) releaseEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("X-Accel-Buffering", "no")
 
+	rc := http.NewResponseController(w)
+	// 每次写入前设置写截止时间：客户端半开/卡死时不会让 goroutine 与订阅无限挂起
 	send := func(event string, data any) error {
 		b, _ := json.Marshal(data)
+		_ = rc.SetWriteDeadline(time.Now().Add(30 * time.Second))
 		_, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, b)
 		return err
 	}
-
-	// 每次写入前设置写截止时间：客户端半开/卡死时不会让 goroutine 与订阅无限挂起
-	rc := http.NewResponseController(w)
 	write := func(text string) error {
 		_ = rc.SetWriteDeadline(time.Now().Add(30 * time.Second))
 		_, err := io.WriteString(w, text)
@@ -909,19 +985,22 @@ func readLines(path string) []string {
 		return nil
 	}
 	defer f.Close()
-	var lines []string
+	// 环形缓冲：下标取模写入，最后按顺序拼接，避免逐行搬运整个窗口
+	ring := make([]string, maxReadLines)
+	total := 0
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 64*1024), 1<<20)
-	// 环回写入：日志文件可能有数十万行，逐行 append+切片会反复搬运整个窗口
 	for sc.Scan() {
-		if len(lines) < maxReadLines {
-			lines = append(lines, sc.Text())
-			continue
-		}
-		copy(lines, lines[1:])
-		lines[len(lines)-1] = sc.Text()
+		ring[total%maxReadLines] = sc.Text()
+		total++
 	}
-	return lines
+	if total <= maxReadLines {
+		return append([]string(nil), ring[:total]...)
+	}
+	out := make([]string, 0, maxReadLines)
+	start := total % maxReadLines
+	out = append(out, ring[start:]...)
+	return append(out, ring[:start]...)
 }
 
 // sanitizePrompt 用户输入会被拼进 AppleScript 字符串或作为 zenity 参数，剔除引号、反斜杠与控制字符

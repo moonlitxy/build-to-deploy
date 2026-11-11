@@ -52,7 +52,10 @@ func main() {
 	// 本服务无登录认证，能力等价于远程 root shell：仅允许监听本机回环地址，避免局域网任意主机操控发布
 	if h, port, err := net.SplitHostPort(cfg.Server.Listen); err != nil || port == "" {
 		log.Fatalf("安全限制：listen 必须形如 127.0.0.1:8080，当前配置为 %q", cfg.Server.Listen)
-	} else if h != "" && h != "localhost" {
+	} else if h == "" {
+		// 空主机名会绑定所有网卡：无鉴权的发布能力将暴露给局域网，必须显式配置回环地址
+		log.Fatalf("安全限制：listen 主机为空会监听所有网卡，仅允许本机回环地址 (如 127.0.0.1:8080)，当前配置为 %q", cfg.Server.Listen)
+	} else if h != "localhost" {
 		// "localhost" 可能被 hosts 解析到内网地址，必须逐个校验其解析结果。
 		// 使用解析器（不走 HTTP_PROXY/SOCKS 代理）以免环境变量干扰判断，
 		// 但解析失败时直接退出，保留原有的严格校验
@@ -101,7 +104,8 @@ func main() {
 	}()
 
 	pool := sshpool.GlobalPool
-	kubeCli := k8s.NewClient(pool, cfg.Server.DryRun)
+	// 与 pipeline.Engine 一样实时读取配置：网页切换演练模式后无需重启即可全局生效
+	kubeCli := k8s.NewClient(pool, func() bool { return cfg.ServerSettingsSnapshot().DryRun })
 
 	engine := pipeline.NewEngine(cfg, st, ups, pool, kubeCli, cfg.Server.DataDir)
 

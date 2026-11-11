@@ -152,6 +152,7 @@ async function refreshConfigs() {
   renderServerCards();
   renderAppCards();
   updatePathPreview();
+  await loadConfigBackups();
 }
 
 function renderAppSelects() {
@@ -459,6 +460,7 @@ function setupButtons() {
   $('closeServerModalBtn').addEventListener('click', () => $('serverModal').classList.add('hidden'));
   $('saveServerBtn').addEventListener('click', saveServer);
   $('testServerConnBtn').addEventListener('click', testServerConnection);
+  if ($('refreshBackupsBtn')) $('refreshBackupsBtn').addEventListener('click', loadConfigBackups);
   $('editServerAuthType').addEventListener('change', (e) => {
     $('pwdGroup').classList.toggle('hidden', e.target.value === 'key');
     $('keyGroup').classList.toggle('hidden', e.target.value !== 'key');
@@ -622,34 +624,83 @@ async function startDeployPipeline(appId, tag, remark, force, isLocalBuild, useD
 }
 
 // ---------------- 分片上传 ----------------
+// 断点续传：同名、同大小、同修改时间的本地文件视为同一任务，
+// 中断（网络失败、刷新页面、发布重试）后从服务端 received 处继续，不必从头传。
+const UPLOAD_TASK_KEY = 'btd_upload_task';
+
+async function putChunkWithRetry(uploadId, offset, chunk, tries = 3) {
+  let lastErr = null;
+  for (let i = 0; i < tries; i++) {
+    try {
+      return await fetch(`/api/uploads/${encodeURIComponent(uploadId)}?offset=${offset}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/octet-stream' },
+        body: chunk,
+      });
+    } catch (e) {
+      lastErr = e;
+      await new Promise((r) => setTimeout(r, 500 * (i + 1)));
+    }
+  }
+  throw lastErr;
+}
+
 async function uploadFileChunks(file) {
   $('uploadProgressContainer').classList.remove('hidden');
   $('uploadProgressBar').style.width = '0%';
 
-  const createRes = await api('POST', '/api/uploads', {
-    fileName: file.name,
-    size: file.size,
-  });
-  if (!createRes.ok) throw new Error(createRes.data.error || '初始化上传任务失败');
-
-  const uploadId = createRes.data.id;
+  const fp = `${file.name}|${file.size}|${file.lastModified}`;
+  let uploadId = '';
   let offset = 0;
+  try {
+    const saved = JSON.parse(localStorage.getItem(UPLOAD_TASK_KEY) || 'null');
+    if (saved && saved.fp === fp && saved.uploadId) {
+      const st = await api('GET', `/api/uploads/${encodeURIComponent(saved.uploadId)}`);
+      if (st.ok && st.data.fileName === file.name && st.data.received <= file.size) {
+        uploadId = saved.uploadId;
+        offset = st.data.received || 0;
+        if (offset > 0) appendLog(`[续传] 检测到未完成的分片任务，从 ${fmtSize(offset)} 处继续上传...`);
+      }
+    }
+  } catch (_) { /* 续传查询失败则全新上传 */ }
+
+  if (!uploadId) {
+    const createRes = await api('POST', '/api/uploads', {
+      fileName: file.name,
+      size: file.size,
+    });
+    if (!createRes.ok) throw new Error(createRes.data.error || '初始化上传任务失败');
+    uploadId = createRes.data.id;
+    try {
+      localStorage.setItem(UPLOAD_TASK_KEY, JSON.stringify({ fp, uploadId }));
+    } catch (_) {}
+  }
+
   const startTime = Date.now();
+  let stall = 0;
 
   while (offset < file.size) {
     const chunk = file.slice(offset, offset + CHUNK_SIZE);
-    const chunkRes = await fetch(`/api/uploads/${uploadId}?offset=${offset}`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/octet-stream' },
-      body: chunk,
-    });
+    const chunkRes = await putChunkWithRetry(uploadId, offset, chunk);
 
     if (!chunkRes.ok) {
       const errJson = await chunkRes.json().catch(() => ({}));
+      // 409 表示服务端已接收更多（此前超时的分片实际已落地）：同步进度后继续
+      if (chunkRes.status === 409 && typeof errJson.received === 'number') {
+        offset = errJson.received;
+        stall = 0;
+        continue;
+      }
       throw new Error(errJson.error || `分片上传失败 HTTP ${chunkRes.status}`);
     }
 
     const resData = await chunkRes.json();
+    if (typeof resData.received !== 'number' || resData.received <= offset) {
+      if (++stall >= 5) throw new Error('上传长时间无进展，已中止（重试可从断点继续）');
+      await new Promise((r) => setTimeout(r, 500));
+      continue;
+    }
+    stall = 0;
     offset = resData.received;
 
     const pct = Math.min(100, Math.round((offset / file.size) * 100));
@@ -660,17 +711,25 @@ async function uploadFileChunks(file) {
     $('uploadSpeedInfo').textContent = `${fmtSize(speed)}/s`;
   }
 
-  const completeRes = await api('POST', `/api/uploads/${uploadId}/complete`);
+  const completeRes = await api('POST', `/api/uploads/${encodeURIComponent(uploadId)}/complete`);
   if (!completeRes.ok) throw new Error(completeRes.data.error || '完成上传校验失败');
 
+  try {
+    localStorage.removeItem(UPLOAD_TASK_KEY);
+  } catch (_) {}
   appendLog(`✔ 本地分片上传完毕，SHA256: ${completeRes.data.sha256}`);
   return uploadId;
 }
 
 // ---------------- SSE 实时日志与阶段跟踪 ----------------
-function listenReleaseEvents(releaseId) {
+function listenReleaseEvents(releaseId, isReconnect = false) {
   if (state.eventSource) {
     state.eventSource.close();
+  }
+  // 重连时后端会重放最多 5000 行历史日志，必须先清空面板，否则日志会整段重复
+  if (isReconnect) {
+    $('logConsole').textContent = '';
+    appendLog('[系统] 连接已恢复，正在回放本次发布日志...');
   }
 
   const es = new EventSource(`/api/releases/${releaseId}/events`);
@@ -685,6 +744,10 @@ function listenReleaseEvents(releaseId) {
       $('startDeployBtn').disabled = false;
     } else if (rel.status === 'failed' || rel.status === 'canceled') {
       updateStatus('failed', rel.status === 'canceled' ? '已中止' : '发布失败');
+      state.isDeploying = false;
+      $('startDeployBtn').disabled = false;
+    } else if (rel.status === 'rolledback') {
+      updateStatus('failed', '已自动回滚');
       state.isDeploying = false;
       $('startDeployBtn').disabled = false;
     }
@@ -704,8 +767,14 @@ function listenReleaseEvents(releaseId) {
     updatePathPreview();
   });
 
+  es.onopen = () => { state.esRetry = 0; };
   es.onerror = () => {
     es.close();
+    // 网络抖动导致断开时指数退避重连：后端支持历史回放，不会丢失日志
+    if (!state.isDeploying || !state.releaseId || state.releaseId !== releaseId) return;
+    const retry = state.esRetry || 0;
+    state.esRetry = retry + 1;
+    setTimeout(() => listenReleaseEvents(releaseId, true), Math.min(30000, 1000 * 2 ** retry));
   };
 }
 
@@ -768,6 +837,38 @@ function updateStatus(status, text) {
   const badge = $('currentStatusBadge');
   badge.className = `status-pill status-${status}`;
   badge.textContent = text;
+}
+
+// ---------------- 配置备份与回滚 ----------------
+async function loadConfigBackups() {
+  const box = $('configBackupsList');
+  if (!box) return;
+  const res = await api('GET', '/api/config/backups');
+  if (!res.ok) {
+    box.innerHTML = '<div class="td-empty">备份列表加载失败</div>';
+    return;
+  }
+  const list = res.data || [];
+  if (list.length === 0) {
+    box.innerHTML = '<div class="td-empty">暂无备份（保存一次配置后自动产生）</div>';
+    return;
+  }
+  box.innerHTML = list.map((b) => `<div style="display:flex;align-items:center;gap:12px;padding:8px 4px;border-bottom:1px solid var(--border);">
+      <span style="font-family:monospace;">${escapeHtml(b.name)}</span>
+      <span style="color:var(--muted);">${fmtSize(b.size)}</span>
+      <button class="btn btn-secondary btn-sm" onclick="restoreConfigBackup('${escapeHtml(b.name)}')">恢复此版本</button>
+    </div>`).join('');
+}
+
+async function restoreConfigBackup(name) {
+  if (!confirm(`确定恢复到备份 ${name} 吗？当前配置会自动再备份一次，可再次恢复回来。`)) return;
+  const res = await api('POST', '/api/config/restore', { name });
+  if (!res.ok) {
+    alert(`恢复失败: ${res.data.error || '未知错误'}`);
+    return;
+  }
+  await refreshConfigs();
+  alert('配置已恢复');
 }
 
 // ---------------- K8s Pod 监控 (需求 3) ----------------
@@ -930,15 +1031,19 @@ window.restartPodDeployment = async function (podName) {
   const srvId = $('podServerSelect').value;
   const ns = $('podNamespaceSelect').value;
 
-  // 推断 Deployment 名称：匹配 app 中的 deployment 或者按 pod 名称切分
+  // 推断 Deployment 名称：优先匹配应用配置，必须带 "-" 边界，
+  // 否则 deployment "order" 会误匹配 pod "order-service-xxx"，重启到别的服务
   let deployName = '';
-  const matchedApp = state.apps.find((a) => a.deployment && podName.startsWith(a.deployment));
+  const matchedApp = state.apps.find((a) => a.deployment && podName.startsWith(a.deployment + '-'));
   if (matchedApp) {
     deployName = matchedApp.deployment;
   } else {
     const parts = podName.split('-');
+    // Deployment pod 名形如 name-replicaSetHash-suffix；StatefulSet 为 name-序号
     if (parts.length >= 3) {
       deployName = parts.slice(0, parts.length - 2).join('-');
+    } else if (parts.length === 2) {
+      deployName = parts[0];
     } else {
       deployName = podName;
     }
@@ -994,12 +1099,13 @@ function renderServerCards() {
 async function connectCurrentServer() {
   const appId = $('deployAppSelect').value;
   const app = state.apps.find((a) => a.id === appId);
-  let srv = app ? state.servers.find((s) => s.id === app.serverId) : null;
-  if (!srv && state.servers.length > 0) {
-    srv = state.servers[0];
+  const srv = app ? state.servers.find((s) => s.id === app.serverId) : null;
+  if (!app) {
+    return alert('请先选择目标应用');
   }
   if (!srv) {
-    return alert('尚未配置 SSH 服务器，请先在“服务器与目录配置”中添加');
+    // 不能兜底连第一台：应用绑定的服务器已被删除或 ID 不匹配时，会静默连错机器
+    return alert(`应用 ${app.name} 绑定的服务器不存在，请先在“服务器与目录配置”中检查并重新绑定`);
   }
   const btn = $('connectSrvBtn');
   const origText = btn.textContent;

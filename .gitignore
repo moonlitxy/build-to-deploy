@@ -9,6 +9,9 @@ logs/
 config.yaml
 configs/config.yaml
 configs/config.dev.yaml
+# 配置自动备份含 SSH 明文密码，禁止入库
+.backups/
 *.exe
 .DS_Store
+.idea/
 CLAUDE.md
