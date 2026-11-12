@@ -20,6 +20,10 @@ type Config struct {
 	Server     ServerSettings          `yaml:"server" json:"server"`
 	SSHServers []*sshpool.ServerConfig `yaml:"sshServers" json:"sshServers"`
 	Apps       []*AppConfig            `yaml:"apps" json:"apps"`
+
+	// LatestTagFunc 返回某服务最近一次发布使用的镜像 Tag，用于按服务备份的文件名（服务名_版本号_时间）。
+	// 由 main 注入发布记录查询，避免 config 包反向依赖 store。
+	LatestTagFunc func(appID string) string `yaml:"-" json:"-"`
 }
 
 type ServerSettings struct {
@@ -120,8 +124,9 @@ var (
 	IDRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
 	// ImageRe 镜像名（不含 Tag）：拒绝空格、分号、$、引号等可进入 shell 的字符
 	ImageRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/:@-]*$`)
-	// RemotePathRe 远程绝对路径：只允许常见安全字符
-	RemotePathRe = regexp.MustCompile(`^/[A-Za-z0-9._/-]*$`)
+	// RemotePathRe 远程绝对路径：只允许常见安全字符。
+	// 同时接受 Windows 盘符路径（C:/...），便于在 Windows 本机测试与本地目录映射场景复用同一套校验。
+	RemotePathRe = regexp.MustCompile(`^(/[A-Za-z0-9._~/-]*|[A-Za-z]:/[A-Za-z0-9._~/-]*)$`)
 	// K8sYamlFileRe K8s YAML 文件名：不得包含目录分隔符或 ..
 	K8sYamlFileRe = regexp.MustCompile(`^[A-Za-z0-9._-]+\.ya?ml$`)
 	// k8sNameRe K8s 资源名（RFC 1123 label）
@@ -252,55 +257,63 @@ func (c *Config) normalize() {
 	}
 
 	for _, app := range c.Apps {
-		if app.ID == "" {
-			app.ID = app.Name
+		normalizeApp(app)
+	}
+}
+
+// normalizeApp 补齐单个应用的默认值（配置加载与按服务恢复备份共用同一规则）
+func normalizeApp(app *AppConfig) {
+	if app == nil {
+		return
+	}
+	if app.ID == "" {
+		app.ID = app.Name
+	}
+	if app.DeployMode == "" {
+		app.DeployMode = DeployModeK8s
+	}
+	if app.DeployMode == DeployModeDocker && app.DockerContainer == "" {
+		// 容器名默认与 Deployment 同名，兼容"同一应用两种形态切换"
+		app.DockerContainer = app.Deployment
+		if app.DockerContainer == "" {
+			app.DockerContainer = app.Name
 		}
-		if app.DeployMode == "" {
-			app.DeployMode = DeployModeK8s
+	}
+	if app.BuildCmd == "" {
+		app.BuildCmd = "cd {{.BuildDir}} && docker build -t {{.Image}}:{{.Tag}} ."
+	}
+	if app.DeployCmd == "" && app.DeployMode == DeployModeDocker {
+		// Docker 形态不依赖 K8s YAML：由流水线直接 docker rm/run 容器
+		app.DeployCmd = "docker run -d --name {{.Container}} {{.Image}}:{{.Tag}}"
+	}
+	if app.DeployCmd == "" {
+		if app.K8sYamlFile != "" {
+			app.DeployCmd = "kubectl apply -f {{.K8sYamlPath}}"
+		} else if app.K8sYamlDir != "" {
+			app.DeployCmd = "kubectl apply -f {{.K8sYamlDir}}"
+		} else {
+			app.DeployCmd = "kubectl -n {{.Namespace}} set image deployment/{{.Deployment}} {{.Container}}={{.Image}}:{{.Tag}}"
 		}
-		if app.DeployMode == DeployModeDocker && app.DockerContainer == "" {
-			// 容器名默认与 Deployment 同名，兼容"同一应用两种形态切换"
-			app.DockerContainer = app.Deployment
-			if app.DockerContainer == "" {
-				app.DockerContainer = app.Name
-			}
-		}
-		if app.BuildCmd == "" {
-			app.BuildCmd = "cd {{.BuildDir}} && docker build -t {{.Image}}:{{.Tag}} ."
-		}
-		if app.DeployCmd == "" && app.DeployMode == DeployModeDocker {
-			// Docker 形态不依赖 K8s YAML：由流水线直接 docker rm/run 容器
-			app.DeployCmd = "docker run -d --name {{.Container}} {{.Image}}:{{.Tag}}"
-		}
-		if app.DeployCmd == "" {
-			if app.K8sYamlFile != "" {
-				app.DeployCmd = "kubectl apply -f {{.K8sYamlPath}}"
-			} else if app.K8sYamlDir != "" {
-				app.DeployCmd = "kubectl apply -f {{.K8sYamlDir}}"
-			} else {
-				app.DeployCmd = "kubectl -n {{.Namespace}} set image deployment/{{.Deployment}} {{.Container}}={{.Image}}:{{.Tag}}"
-			}
-		}
-		if app.Namespace == "" {
-			app.Namespace = "default"
-		}
-		if app.Deployment == "" {
-			app.Deployment = app.Name
-		}
-		if app.Container == "" {
-			app.Container = app.Deployment
-		}
-		if app.RolloutTimeout <= 0 {
-			app.RolloutTimeout = 300
-		}
-		// 规范化路径统一为 linux 斜杠（保留根路径 "/"，避免 "cp -f x /" 之类命令被改写）
-		app.ArtifactDir = trimRemoteSlash(app.ArtifactDir)
-		app.BuildDir = trimRemoteSlash(app.BuildDir)
-		app.K8sYamlDir = trimRemoteSlash(app.K8sYamlDir)
-		// YAML 文件名只允许纯文件名（拒绝 ../ 目录穿越）
-		if app.K8sYamlFile != "" && strings.ContainsAny(app.K8sYamlFile, "/\\") {
-			app.K8sYamlFile = filepath.Base(app.K8sYamlFile)
-		}
+	}
+	if app.Namespace == "" {
+		app.Namespace = "default"
+	}
+	if app.Deployment == "" {
+		app.Deployment = app.Name
+	}
+	if app.Container == "" {
+		app.Container = app.Deployment
+	}
+	if app.RolloutTimeout <= 0 {
+		app.RolloutTimeout = 300
+	}
+	// 规范化路径统一为 linux 斜杠（保留根路径 "/"，避免 "cp -f x /" 之类命令被改写）
+	app.ArtifactDir = trimRemoteSlash(app.ArtifactDir)
+	app.BuildDir = trimRemoteSlash(app.BuildDir)
+	app.K8sYamlDir = trimRemoteSlash(app.K8sYamlDir)
+	// YAML 文件名只允许纯文件名（拒绝 ../ 目录穿越）
+	if app.K8sYamlFile != "" && strings.ContainsAny(app.K8sYamlFile, "/\\") {
+		app.K8sYamlFile = filepath.Base(app.K8sYamlFile)
 	}
 }
 
@@ -426,6 +439,8 @@ func (c *Config) UpdateApp(app *AppConfig) error {
 	found := false
 	for i, old := range c.Apps {
 		if old.ID == app.ID {
+			// 保存前把该服务的旧配置存档：文件名带服务名与最近一次发布的版本号，可单独回滚该服务
+			c.backupAppLocked(old)
 			cp := *app
 			c.Apps[i] = &cp
 			found = true
@@ -465,6 +480,9 @@ func (c *Config) DeleteApp(id string) error {
 	for _, a := range c.Apps {
 		if a.ID != id {
 			updated = append(updated, a)
+		} else {
+			// 删除前留档：误删后可按服务恢复
+			c.backupAppLocked(a)
 		}
 	}
 	c.Apps = updated
@@ -607,6 +625,212 @@ func (c *Config) Restore(name string) error {
 	c.SSHServers = fresh.SSHServers
 	c.Apps = fresh.Apps
 	return nil
+}
+
+// ---------- 按服务的配置备份与恢复 ----------
+//
+// 整份配置的备份（上面）不知道变更属于哪个服务；这里额外把每次应用配置变更存档到
+// .backups/apps/，文件名包含服务名、最近一次发布版本号与时间，恢复时只替换该服务。
+
+// AppBackup 单个服务的配置备份信息
+type AppBackup struct {
+	Name      string    `json:"name"` // 备份文件名（恢复时回传）
+	AppID     string    `json:"appId"`
+	AppName   string    `json:"appName"`
+	Image     string    `json:"image"`
+	Tag       string    `json:"tag"` // 备份时该服务最近一次发布的版本号，未发布过为 no-tag
+	Size      int64     `json:"size"`
+	CreatedAt time.Time `json:"createdAt"`
+}
+
+// appBackupFile 备份文件内容：元信息 + 该服务当时的完整配置
+type appBackupFile struct {
+	AppID     string     `yaml:"appId"`
+	AppName   string     `yaml:"appName"`
+	Image     string     `yaml:"image"`
+	Tag       string     `yaml:"tag"`
+	CreatedAt time.Time  `yaml:"createdAt"`
+	App       *AppConfig `yaml:"app"`
+}
+
+// maxAppBackupsPerApp 每个服务保留的配置备份份数
+const maxAppBackupsPerApp = 20
+
+func (c *Config) appBackupDir() string {
+	return filepath.Join(c.backupDir(), "apps")
+}
+
+// sanitizeBackupPart 备份文件名片段：只允许字母、数字、. _ -，其余替换为 -
+func sanitizeBackupPart(s string) string {
+	s = strings.TrimSpace(s)
+	var b strings.Builder
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '.' || r == '_' || r == '-' {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('-')
+		}
+	}
+	out := strings.Trim(b.String(), ".-")
+	if out == "" {
+		return "no-tag"
+	}
+	return out
+}
+
+// backupAppLocked 把某个服务的当前配置存档；失败不阻断保存（磁盘满/目录只读时仍应允许改配置）
+func (c *Config) backupAppLocked(app *AppConfig) {
+	if app == nil || app.ID == "" {
+		return
+	}
+	dir := c.appBackupDir()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return
+	}
+	tag := ""
+	if c.LatestTagFunc != nil {
+		tag = c.LatestTagFunc(app.ID)
+	}
+	tag = sanitizeBackupPart(tag)
+	now := time.Now()
+	payload := appBackupFile{
+		AppID:     app.ID,
+		AppName:   app.Name,
+		Image:     app.Image,
+		Tag:       tag,
+		CreatedAt: now,
+		App:       app,
+	}
+	b, err := yaml.Marshal(payload)
+	if err != nil {
+		return
+	}
+	name := fmt.Sprintf("%s_%s_%s.yaml", sanitizeBackupPart(app.ID), tag, now.Format("20060102-150405.000000000"))
+	if err := os.WriteFile(filepath.Join(dir, name), b, 0o600); err != nil {
+		return
+	}
+	// 只保留该服务最近的 N 份：按文件名里的时间戳排序（字典序即时间序）
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	prefix := sanitizeBackupPart(app.ID) + "_"
+	var mine []string
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".yaml") || !strings.HasPrefix(e.Name(), prefix) {
+			continue
+		}
+		mine = append(mine, e.Name())
+	}
+	sort.Strings(mine)
+	for _, oldName := range mine[:max(0, len(mine)-maxAppBackupsPerApp)] {
+		_ = os.Remove(filepath.Join(dir, oldName))
+	}
+}
+
+// AppBackups 列出可按服务恢复的配置备份（按时间倒序）
+func (c *Config) AppBackups() ([]AppBackup, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	entries, err := os.ReadDir(c.appBackupDir())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	out := make([]AppBackup, 0, len(entries))
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".yaml") {
+			continue
+		}
+		b, err := os.ReadFile(filepath.Join(c.appBackupDir(), e.Name()))
+		if err != nil {
+			continue
+		}
+		var payload appBackupFile
+		if err := yaml.Unmarshal(b, &payload); err != nil || payload.App == nil {
+			continue
+		}
+		var size int64
+		if info, err := e.Info(); err == nil {
+			size = info.Size()
+		}
+		out = append(out, AppBackup{
+			Name:      e.Name(),
+			AppID:     payload.AppID,
+			AppName:   payload.AppName,
+			Image:     payload.Image,
+			Tag:       payload.Tag,
+			Size:      size,
+			CreatedAt: payload.CreatedAt,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].Name > out[j].Name
+		}
+		return out[i].CreatedAt.After(out[j].CreatedAt)
+	})
+	return out, nil
+}
+
+// findAppBackupPath 在备份目录中按文件名精确查找，避免用户传入路径穿越
+func (c *Config) findAppBackupPath(name string) (string, error) {
+	if name == "" || name != filepath.Base(name) || !strings.HasSuffix(name, ".yaml") {
+		return "", fmt.Errorf("备份名称不合法: %q", name)
+	}
+	entries, err := os.ReadDir(c.appBackupDir())
+	if err != nil {
+		return "", fmt.Errorf("读取备份目录失败: %w", err)
+	}
+	for _, e := range entries {
+		if !e.IsDir() && e.Name() == name {
+			return filepath.Join(c.appBackupDir(), name), nil
+		}
+	}
+	return "", fmt.Errorf("备份不存在: %s", name)
+}
+
+// RestoreApp 只恢复某个服务的配置：恢复前把当前版本再存档一次，可反复回滚
+func (c *Config) RestoreApp(name string) (*AppConfig, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	p, err := c.findAppBackupPath(name)
+	if err != nil {
+		return nil, err
+	}
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return nil, fmt.Errorf("读取备份失败: %w", err)
+	}
+	var payload appBackupFile
+	if err := yaml.Unmarshal(b, &payload); err != nil {
+		return nil, fmt.Errorf("备份文件损坏: %w", err)
+	}
+	if payload.App == nil || payload.App.ID == "" {
+		return nil, fmt.Errorf("备份文件缺少应用配置")
+	}
+	cp := *payload.App
+	normalizeApp(&cp)
+
+	replaced := false
+	for i, old := range c.Apps {
+		if old.ID == cp.ID {
+			c.backupAppLocked(old)
+			c.Apps[i] = &cp
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		// 服务已被删除：恢复等同于重新添加回来
+		c.Apps = append(c.Apps, &cp)
+	}
+	if err := c.saveUnlocked(); err != nil {
+		return nil, err
+	}
+	return &cp, nil
 }
 
 // ExpandHome 展开开头的 ~ 为当前用户主目录

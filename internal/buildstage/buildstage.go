@@ -97,14 +97,14 @@ func Parse(cmd string) *Spec {
 		return nil
 	}
 	var cwd string
-	if !strings.HasPrefix(spec.Dir, "/") {
+	if !isAbsPath(spec.Dir) {
 		cwd = cwdHint
 		if cwd == "" {
 			return nil
 		}
 	}
 	join := func(base, p string) string {
-		if p == "" || strings.HasPrefix(p, "/") {
+		if p == "" || isAbsPath(p) {
 			return p
 		}
 		if base == "" || base == "." {
@@ -317,7 +317,7 @@ func dockerfileInputs(path, dir string) (inputsOut []string, skipped int, ok boo
 			if p == "" {
 				continue
 			}
-			if strings.HasPrefix(p, "/") {
+			if isAbsPath(p) {
 				// 绝对路径位于构建上下文之外，不参与指纹
 				markSkipped()
 				continue
@@ -400,10 +400,16 @@ func (s *Spec) ctxDir() string {
 
 // BaseDir 返回构建上下文目录的绝对路径；无法确定时返回空串
 func (s *Spec) BaseDir() string {
-	if strings.HasPrefix(s.baseDir, "/") {
+	if isAbsPath(s.baseDir) {
 		return s.baseDir
 	}
 	return ""
+}
+
+// isAbsPath 同时接受 Linux 远程绝对路径（/data/...）与本地 Windows 绝对路径（C:/...）。
+// 远程命令一律使用 Linux 路径，但本地测试与 Windows 开发环境可能出现盘符路径。
+func isAbsPath(p string) bool {
+	return strings.HasPrefix(p, "/") || filepath.IsAbs(p)
 }
 
 // expandInputs 把通配符来源展开成实际文件列表；目录来源按目录下全部普通文件计算

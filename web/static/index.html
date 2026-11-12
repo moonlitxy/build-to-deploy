@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Build-to-Deploy 本地一键发布平台</title>
+  <title>DeployOne 一键上线 · 本地构建发布平台</title>
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
@@ -17,8 +17,8 @@
 <header class="topbar">
   <div class="brand">
     <span class="logo-icon">🚀</span>
-    <span class="brand-text">Build-to-Deploy</span>
-    <span class="sub-text">本地构建产物 → 远程服务器构建 & K8s 部署</span>
+    <span class="brand-text">DeployOne</span>
+    <span class="sub-text">一键上线 · 本地构建产物 → 远程服务器构建 & K8s 部署</span>
   </div>
   <div style="display:flex;align-items:center;gap:14px;">
     <nav class="nav-tabs">
@@ -202,19 +202,16 @@
             <select id="podServerSelect"></select>
           </div>
           <div class="filter-item">
-            <label>环境 (应用):</label>
-            <select id="podEnvSelect"></select>
-          </div>
-          <div class="filter-item">
             <label>命名空间 (Namespace):</label>
             <select id="podNamespaceSelect">
               <option value="">正在加载命名空间...</option>
             </select>
           </div>
           <button id="refreshPodsBtn" class="btn btn-secondary">
-            <span class="btn-icon">🔄</span> 刷新 Pod 列表
+            <span id="refreshPodsIcon" class="btn-icon">🔄</span> 刷新 Pod 列表
           </button>
           <span id="podLoading" class="loading-spinner hidden"></span>
+          <span id="podAutoHint" class="auto-refresh-hint">状态自动刷新中</span>
         </div>
         <div class="search-box">
           <input type="text" id="podSearchInput" placeholder="按 Pod 名称过滤...">
@@ -249,24 +246,32 @@
   <!-- TAB 3: 服务器与应用目录配置 -->
   <section id="tab-config" class="tab-pane">
     <div class="config-layout">
-      <!-- 上方：SSH 服务器连接配置 (横向多列卡片) -->
+      <!-- 上方：SSH 服务器连接配置 (下拉选择单个服务器，只展示该服务器的配置) -->
       <div class="card config-section-card">
         <div class="card-header">
           <div>
-            <h3>🖥️ SSH 部署服务器配置</h3>
-            <p class="config-sub-hint">后台内置 SSH 长连接池与心跳保活，连接建立后可持续复用，也可随时手动断开释放连接。</p>
+            <h3>🖥️ SSH 部署服务器</h3>
+            <p class="config-sub-hint">先选择一个服务器，下面只展示该服务器的连接信息与应用配置，其他服务器暂不显示。</p>
           </div>
           <button id="addServerBtn" class="btn btn-primary">+ 添加服务器</button>
         </div>
-        <div class="server-cards-grid" id="serverCardsList"></div>
+        <div class="server-picker-row">
+          <label for="configServerSelect">选择服务器</label>
+          <select id="configServerSelect"></select>
+          <button id="configConnectBtn" class="btn btn-secondary btn-sm">⚡ 连接</button>
+          <button id="configDisconnectBtn" class="btn btn-secondary btn-sm hidden">🔌 断开</button>
+          <button id="configEditServerBtn" class="btn btn-secondary btn-sm">编辑</button>
+          <button id="configDeleteServerBtn" class="btn btn-danger btn-sm">删除</button>
+        </div>
+        <div id="serverDetailPanel" class="server-detail-panel"></div>
       </div>
 
-      <!-- 下方：应用与独立目录配置 (全宽多列响应式网格，应用再多也不拥挤) -->
+      <!-- 下方：当前服务器的应用与独立目录配置 -->
       <div class="card config-section-card">
         <div class="card-header">
           <div>
             <h3>📂 应用服务与目录配置 <span id="appCountBadge" class="tag-badge" style="margin-left:8px;">0 个服务</span></h3>
-            <p class="config-sub-hint">多个服务共用同一个 K8s YAML 目录（按各自独立的 YAML 文件名区分），每个服务拥有各自独立的镜像构建目录、产物目录与镜像名称。</p>
+            <p class="config-sub-hint" id="appListHint">只列出当前所选服务器下的服务；多个服务共用同一个 K8s YAML 目录（按各自独立的 YAML 文件名区分）。</p>
           </div>
           <div style="display:flex;align-items:center;gap:12px;">
             <input type="text" id="appConfigSearchInput" placeholder="搜索应用名称或镜像..." style="width:240px;">
@@ -276,16 +281,16 @@
         <div class="app-cards-grid" id="appCardsList"></div>
       </div>
 
-      <!-- 配置备份与回滚：每次保存自动备份，改错可一键恢复 -->
+      <!-- 配置备份与回滚：按服务备份，文件名带服务名与版本号 -->
       <div class="card config-section-card">
         <div class="card-header">
           <div>
-            <h3>🕘 配置备份与回滚</h3>
-            <p class="config-sub-hint">每次保存服务器或应用配置都会自动备份最近 20 份，恢复时当前版本也会再备份一次，可反复回滚。</p>
+            <h3>🕘 配置备份与回滚（按服务）</h3>
+            <p class="config-sub-hint">每次保存/删除应用都会为该服务单独备份，文件名包含服务名、最近发布版本号与时间；恢复只影响该服务，可反复回滚。</p>
           </div>
           <button id="refreshBackupsBtn" class="btn btn-secondary">刷新</button>
         </div>
-        <div id="configBackupsList"></div>
+        <div id="appBackupsList"></div>
       </div>
     </div>
   </section>
@@ -378,7 +383,7 @@
   <div class="modal-card modal-warn">
     <div class="modal-header">
       <div class="modal-icon-badge">⚠️</div>
-      <h3 class="modal-title">发现版本冲突 - 需二次确认</h3>
+      <h3 class="modal-title" id="conflictModalTitle">发现版本冲突 - 需二次确认</h3>
     </div>
     <div class="modal-body">
       <p class="warn-text">检测到目标服务器或线上环境已存在与当前完全相同的镜像 Tag 版本：</p>
@@ -387,6 +392,7 @@
     </div>
     <div class="modal-footer">
       <button id="conflictCancelBtn" class="btn btn-secondary">取消发布</button>
+      <button id="conflictRebuildBtn" class="btn btn-secondary hidden">仍然重新构建镜像</button>
       <button id="conflictConfirmBtn" class="btn btn-danger">确认覆盖并继续发布</button>
     </div>
   </div>
@@ -399,20 +405,21 @@
       <h3 class="modal-title" id="podLogTitle">Pod 容器日志</h3>
       <button id="closePodLogBtn" class="close-btn">&times;</button>
     </div>
-    <div class="modal-body">
+    <div class="modal-body log-modal-body">
       <div class="log-modal-tools">
         <div style="display:flex;align-items:center;gap:10px;">
-          <span>显示最新 200 行日志</span>
+          <span id="podLogMeta">显示最新 200 行日志</span>
           <div id="podLogContainerWrap" class="hidden" style="display:inline-flex;align-items:center;gap:6px;">
             <label style="font-size:12px;color:#64748b;">容器:</label>
-            <select id="podLogContainerSelect" style="padding:3px 8px;font-size:12px;border:1px solid #cbd5e1;border-radius:4px;background:#fff;"></select>
+            <select id="podLogContainerSelect" class="select-sm"></select>
           </div>
         </div>
         <div style="display:flex;align-items:center;gap:12px;">
           <label style="display:inline-flex;align-items:center;gap:5px;font-size:12px;color:#475569;cursor:pointer;">
             <input type="checkbox" id="autoFollowPodLog"> ⚡ 实时跟随 (2s刷新)
           </label>
-          <button id="refreshLogBtn" class="btn btn-secondary btn-sm">刷新日志</button>
+          <button id="refreshLogBtn" class="btn btn-secondary btn-sm"><span id="refreshLogIcon" class="btn-icon">🔄</span> 刷新日志</button>
+          <button id="downloadPodLogBtn" class="btn btn-secondary btn-sm">⬇️ 下载日志</button>
         </div>
       </div>
       <pre id="podLogContent" class="terminal-body pod-log-pre">加载中...</pre>
@@ -689,7 +696,7 @@
       </div>
       <button id="closeReleaseLogBtn" class="close-btn">&times;</button>
     </div>
-    <div class="modal-body">
+    <div class="modal-body log-modal-body">
       <div class="log-modal-tools">
         <span id="releaseLogMeta">完整日志输出</span>
         <div class="log-actions">

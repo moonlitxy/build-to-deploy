@@ -26,7 +26,8 @@ func writeCtx(t *testing.T, dockerfile string, files map[string]string) string {
 	if err := os.WriteFile(filepath.Join(dir, "Dockerfile"), []byte(dockerfile), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	return dir
+	// 构建目录会拼进 shell 命令：统一成正斜杠，保证 Windows 下与 Linux 远程命令保持一致
+	return filepath.ToSlash(dir)
 }
 
 func TestBuildStageParseContextDirAndDockerfile(t *testing.T) {

@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -149,14 +150,16 @@ apps:
 	st, _ := store.Open(filepath.Join(dir, "releases.json"))
 	ups, _ := upload.NewManager(filepath.Join(dir, "uploads"), 1<<20)
 	fake := &scriptedRunner{files: map[string]string{
-		filepath.Join(yamlDir, "demo.yaml"): "kind: Deployment\nspec:\n  containers:\n  - image: app/demo:v0.9.0  # 注释保留\n",
+		// 远程路径统一正斜杠，与 app.K8sYamlDir 的写法保持一致
+		filepath.ToSlash(filepath.Join(yamlDir, "demo.yaml")): "kind: Deployment\nspec:\n  containers:\n  - image: app/demo:v0.9.0  # 注释保留\n",
 	}}
 	eng := pipeline.NewEngine(cfg, st, ups, nil, k8s.NewClient(fake), cfg.Server.DataDir)
 	eng.SSH = fake
 	return eng, cfg, st, fake, cfg.Apps[0]
 }
 
-func quoteYAML(s string) string { return "\"" + s + "\"" }
+// quoteYAML 用 Go 转义规则生成 YAML 双引号字符串：Windows 盘符路径里的反斜杠必须转义
+func quoteYAML(s string) string { return strconv.Quote(filepath.ToSlash(s)) }
 
 func waitDoneStrict(t *testing.T, st *store.Store, id string) *store.Release {
 	t.Helper()
@@ -410,8 +413,13 @@ func TestPEngineRunLocalCommandAndFileSHA(t *testing.T) {
 	if err := pipeline.RunLocalCommandForTest(context.Background(), "", "exit 3", &sb); err == nil {
 		t.Fatal("非零退出码应报错")
 	}
+	// Windows 的 echo 会输出 CRLF，按实际文件内容校验大小
+	content, _ := os.ReadFile(filepath.Join(dir, "out.txt"))
+	if strings.TrimSpace(string(content)) != "hi" {
+		t.Fatalf("本地命令输出 = %q", content)
+	}
 	name, size, sum, err := pipeline.FileStatAndSHA256ForTest(filepath.Join(dir, "out.txt"))
-	if err != nil || name != "out.txt" || size != 3 || len(sum) != 64 {
+	if err != nil || name != "out.txt" || size != int64(len(content)) || len(sum) != 64 {
 		t.Fatalf("fileStatAndSHA256 = %s %d %s %v", name, size, sum, err)
 	}
 	if _, _, _, err := pipeline.FileStatAndSHA256ForTest(dir); err == nil {

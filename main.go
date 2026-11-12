@@ -89,6 +89,14 @@ func main() {
 		log.Fatalf("打开发布记录失败: %v", err)
 	}
 
+	// 按服务的配置备份文件名需要"服务名_版本号_时间"：版本号取该服务最近一次发布的 Tag
+	cfg.LatestTagFunc = func(appID string) string {
+		if rels := st.List(appID, 1); len(rels) > 0 {
+			return rels[0].Tag
+		}
+		return ""
+	}
+
 	ups, err := upload.NewManager(filepath.Join(cfg.Server.DataDir, "uploads"), cfg.Server.MaxUploadMB<<20)
 	if err != nil {
 		log.Fatal(err)
@@ -134,7 +142,7 @@ func main() {
 		_ = srv.Shutdown(shutdownCtx)
 	}()
 
-	log.Printf("🚀 Build-to-Deploy 本地发布平台启动成功 [%s]", version)
+	log.Printf("🚀 DeployOne 一键上线平台启动成功 [%s]", version)
 	log.Printf("📄 当前使用配置: %s", targetCfg)
 	log.Printf("👉 浏览器直接访问: http://%s (无需登录密码)", displayAddr(cfg.Server.Listen))
 

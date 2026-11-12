@@ -24,8 +24,8 @@ const state = {
     useDefaultArtifactByApp: {},
     lastTagByApp: {},
     podServerId: '',
-    podEnvId: '',
     podNamespace: '',
+    configServerId: '',
   },
 };
 
@@ -40,8 +40,8 @@ function loadPrefs() {
         useDefaultArtifactByApp: parsed.useDefaultArtifactByApp || {},
         lastTagByApp: parsed.lastTagByApp || {},
         podServerId: parsed.podServerId || '',
-        podEnvId: parsed.podEnvId || '',
         podNamespace: parsed.podNamespace || '',
+        configServerId: parsed.configServerId || '',
       };
     }
   } catch (_) {}
@@ -173,8 +173,13 @@ function setupTabs() {
       $(tabId).classList.add('active');
 
       if (btn.dataset.tab === 'pods') {
+        // 进入监控页：刷新一次命名空间与 Pod，随后交给后台定时静默刷新
         loadNamespacesAndPods();
-      } else if (btn.dataset.tab === 'history') {
+        startPodAutoRefresh();
+      } else {
+        stopPodAutoRefresh();
+      }
+      if (btn.dataset.tab === 'history') {
         loadHistory();
       }
     });
@@ -191,10 +196,10 @@ async function refreshConfigs() {
   state.servers = srvRes.data || [];
 
   renderAppSelects();
-  renderServerCards();
+  renderServerPicker();
   renderAppCards();
   updatePathPreview();
-  await loadConfigBackups();
+  await loadAppBackups();
 }
 
 function renderAppSelects() {
@@ -208,9 +213,8 @@ function renderAppSelects() {
   renderPodSelects();
 }
 
-// Pod 页面服务器 / 环境下拉
+// Pod 页面服务器下拉：Pod 状态由后台定时静默刷新，服务器/命名空间才是筛选条件
 function renderPodSelects() {
-  // Pod 页面服务器下拉：优先恢复上次查看的服务器
   const srvOpts = state.servers.map((s) => `<option value="${escapeHtml(s.id)}">${escapeHtml(s.name)} (${escapeHtml(s.host)})</option>`).join('');
   $('podServerSelect').innerHTML = srvOpts || '<option value="">暂无服务器</option>';
   const savedSrv = state.prefs.podServerId;
@@ -218,15 +222,6 @@ function renderPodSelects() {
     $('podServerSelect').value = savedSrv;
   } else if (state.servers.length > 0) {
     $('podServerSelect').value = state.servers[0].id;
-  }
-
-  // Pod 页面环境下拉：应用即环境（每个应用对应一套命名空间/工作负载），选中后自动带出其命名空间
-  const k8sApps = state.apps.filter((a) => a.deployMode !== 'docker');
-  $('podEnvSelect').innerHTML = k8sApps.map((a) => `<option value="${escapeHtml(a.id)}">${escapeHtml(a.name)}</option>`).join('') || '<option value="">暂无 K8s 应用</option>';
-  if (state.prefs.podEnvId && k8sApps.some((a) => a.id === state.prefs.podEnvId)) {
-    $('podEnvSelect').value = state.prefs.podEnvId;
-  } else if (k8sApps.length > 0) {
-    $('podEnvSelect').value = k8sApps[0].id;
   }
 }
 
@@ -366,6 +361,12 @@ function switchDeployMode(mode, persist = true) {
   }
 }
 
+// 本地产物路径直传与手动选择文件是互斥的：勾选直传后拖拽/点击选择不再生效
+function defaultArtifactInUse() {
+  const chk = $('useDefaultArtifactCheck');
+  return !!(chk && chk.checked && state.localArtifactInfo && state.localArtifactInfo.exists);
+}
+
 function updateDropZoneVisual() {
   const dropZone = $('dropZone');
   const useDefault = $('useDefaultArtifactCheck') && $('useDefaultArtifactCheck').checked;
@@ -376,7 +377,7 @@ function updateDropZoneVisual() {
   } else if (useDefault && state.localArtifactInfo && state.localArtifactInfo.exists) {
     dropZone.classList.remove('has-file');
     dropZone.classList.add('disabled-zone');
-    $('dropText').textContent = '当前已勾选使用上方本地默认产物 (也可点击此处重选其他文件)';
+    $('dropText').textContent = '已勾选「使用本地产物路径直传」，光标/拖拽已禁用；如需手动选择文件请先取消上方勾选';
   } else {
     dropZone.classList.remove('has-file');
     dropZone.classList.remove('disabled-zone');
@@ -391,7 +392,11 @@ function setupDropZone() {
   const dropZone = $('dropZone');
   const fileInput = $('fileInput');
 
-  dropZone.addEventListener('click', () => fileInput.click());
+  dropZone.addEventListener('click', () => {
+    // 互斥：已勾选本地产物路径直传时，不允许再手动选文件
+    if (defaultArtifactInUse()) return;
+    fileInput.click();
+  });
   fileInput.addEventListener('change', (e) => {
     if (e.target.files.length > 0) {
       handleSelectedFile(e.target.files[0]);
@@ -400,12 +405,14 @@ function setupDropZone() {
 
   dropZone.addEventListener('dragover', (e) => {
     e.preventDefault();
+    if (defaultArtifactInUse()) return;
     dropZone.classList.add('dragover');
   });
   dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
   dropZone.addEventListener('drop', (e) => {
     e.preventDefault();
     dropZone.classList.remove('dragover');
+    if (defaultArtifactInUse()) return;
     if (e.dataTransfer.files.length > 0) {
       handleSelectedFile(e.dataTransfer.files[0]);
     }
@@ -433,25 +440,15 @@ function handleSelectedFile(file) {
 function setupButtons() {
   $('startDeployBtn').addEventListener('click', onStartDeployClick);
   $('conflictConfirmBtn').addEventListener('click', onConfirmConflictDeploy);
+  $('conflictRebuildBtn').addEventListener('click', onRebuildInsteadOfReuse);
   $('conflictCancelBtn').addEventListener('click', () => $('conflictModal').classList.add('hidden'));
   $('clearLogBtn').addEventListener('click', () => { $('logConsole').textContent = ''; });
-  $('refreshPodsBtn').addEventListener('click', loadNamespacesAndPods);
+  $('refreshPodsBtn').addEventListener('click', refreshPodsManually);
   $('podServerSelect').addEventListener('change', () => {
-    // 记住 Pod 监控页最后查看的服务器
+    // 记住 Pod 监控页最后查看的服务器；切换服务器需要重新拉取命名空间
     state.prefs.podServerId = $('podServerSelect').value;
     savePrefs();
-    loadNamespacesAndPods();
-  });
-  $('podEnvSelect').addEventListener('change', () => {
-    // 环境（应用）变化：记住选择，并把该应用的命名空间设为当前命名空间
-    state.prefs.podEnvId = $('podEnvSelect').value;
-    savePrefs();
-    const ns = podEnvNamespace();
-    if (ns) {
-      state.prefs.podNamespace = ns;
-      savePrefs();
-    }
-    loadNamespacesAndPods();
+    loadNamespacesAndPods(true);
   });
   $('podNamespaceSelect').addEventListener('change', () => {
     // 记住最后查看的命名空间
@@ -567,13 +564,45 @@ function setupButtons() {
     });
   }
 
+  // 配置页：服务器下拉与操作按钮（只展示所选服务器的配置）
+  if ($('configServerSelect')) {
+    $('configServerSelect').addEventListener('change', () => {
+      state.prefs.configServerId = $('configServerSelect').value;
+      savePrefs();
+      renderServerPicker();
+      renderAppCards();
+    });
+  }
+  if ($('configEditServerBtn')) {
+    $('configEditServerBtn').addEventListener('click', () => {
+      if ($('configServerSelect').value) window.editServer($('configServerSelect').value);
+    });
+  }
+  if ($('configDeleteServerBtn')) {
+    $('configDeleteServerBtn').addEventListener('click', () => {
+      if ($('configServerSelect').value) window.deleteServer($('configServerSelect').value);
+    });
+  }
+  if ($('configConnectBtn')) {
+    $('configConnectBtn').addEventListener('click', () => {
+      const id = $('configServerSelect').value;
+      if (id) window.testOneServer(id);
+    });
+  }
+  if ($('configDisconnectBtn')) {
+    $('configDisconnectBtn').addEventListener('click', () => {
+      const id = $('configServerSelect').value;
+      if (id) window.disconnectOneServer(id);
+    });
+  }
+
   // 配置相关模态框事件
   $('addServerBtn').addEventListener('click', () => openServerModal());
   $('closeServerModalBtn').addEventListener('click', () => $('serverModal').classList.add('hidden'));
   $('saveServerBtn').addEventListener('click', saveServer);
   $('testServerConnBtn').addEventListener('click', testServerConnection);
   bindServerPasswordToggle();
-  if ($('refreshBackupsBtn')) $('refreshBackupsBtn').addEventListener('click', loadConfigBackups);
+  if ($('refreshBackupsBtn')) $('refreshBackupsBtn').addEventListener('click', loadAppBackups);
   $('editServerAuthType').addEventListener('change', (e) => {
     $('pwdGroup').classList.toggle('hidden', e.target.value === 'key');
     $('keyGroup').classList.toggle('hidden', e.target.value !== 'key');
@@ -664,38 +693,43 @@ async function onStartDeployClick() {
   appendLog(`\n[本地] 准备发布应用: ${appId}, Tag: ${tag} (${isLocalBuild ? '本地一键编译并上传' : '直接上传已有产物'})`);
   appendLog('[本地] 正在向服务器执行版本预检 (Precheck)...');
 
-  // 1. 构建输入指纹预检：产物内容 + 构建上下文与历史版本都相同时，换 Tag 也只会得到同一个镜像
-  appendLog('[本地] 正在比对产物内容与构建上下文是否与历史版本相同...');
-  const draft = state.appDrafts && state.appDrafts[appId];
-  const fpRes = await api('POST', '/api/artifacts/inspect', {
-    appId,
-    tag,
-    uploadId: state.uploadId || '',
-    useLocalArtifact: !!useDefaultArtifact,
-    buildDir: (draft && draft.buildDir) || '',
-    buildCmd: (draft && draft.buildCmd) || '',
-  });
-  if (fpRes.ok && fpRes.data && fpRes.data.fingerprint) {
-    const prev = fpRes.data.previous;
-    if (prev || fpRes.data.tagFree) {
-      appendLog(`[警告] 本次产物与构建上下文和${prev ? '已验证版本 ' + prev.tag : '历史版本'}完全相同，换 Tag 只会构建出内容相同的镜像`);
-      showImageDupModal({
-        tag,
-        image: app.image,
-        prevTag: prev ? prev.tag : '',
-        prevImage: prev ? prev.image : '',
-        createdAt: prev ? prev.createdAt : '',
-        tagFree: !!fpRes.data.tagFree,
-        sha256: fpRes.data.sha256 || '',
-      });
-      state.pendingReleaseParams = { appId, tag, remark, isLocalBuild, useDefaultArtifact };
-      return;
+  // 1. 构建输入指纹预检：产物内容 + 构建上下文与历史版本都相同时，换 Tag 也只会得到同一个镜像。
+  // 手动选择的文件此时还没上传、浏览器拿不到真实路径，因此等上传完成后再按分片摘要校验（见 startDeployPipeline）
+  if (!state.selectedFile) {
+    appendLog('[本地] 正在比对产物内容与构建上下文是否与历史版本相同...');
+    const draft = state.appDrafts && state.appDrafts[appId];
+    const fpRes = await api('POST', '/api/artifacts/inspect', {
+      appId,
+      tag,
+      uploadId: state.uploadId || '',
+      useLocalArtifact: !!useDefaultArtifact,
+      buildDir: (draft && draft.buildDir) || '',
+      buildCmd: (draft && draft.buildCmd) || '',
+    });
+    if (fpRes.ok && fpRes.data && fpRes.data.fingerprint) {
+      const prev = fpRes.data.previous;
+      if (prev || fpRes.data.tagFree) {
+        appendLog(`[警告] 本次产物与构建上下文和${prev ? '已验证版本 ' + prev.tag : '历史版本'}完全相同，换 Tag 只会构建出内容相同的镜像`);
+        showImageDupModal({
+          tag,
+          image: app.image,
+          prevTag: prev ? prev.tag : '',
+          prevImage: prev ? prev.image : '',
+          createdAt: prev ? prev.createdAt : '',
+          tagFree: !!fpRes.data.tagFree,
+          sha256: fpRes.data.sha256 || '',
+        });
+        state.pendingReleaseParams = { appId, tag, remark, isLocalBuild, useDefaultArtifact, uploadId: '' };
+        return;
+      }
+      appendLog(`[本地] 构建输入指纹: ${fpRes.data.fingerprint.slice(0, 12)}，与历史版本均不相同`);
+    } else if (fpRes.ok === false) {
+      appendLog(`[提示] 构建输入指纹比对跳过: ${fpRes.data.error || '无法读取产物'}`);
+    } else {
+      appendLog(`[提示] 已跳过发布前镜像内容检测: ${fpRes.data.reason || '构建命令无法静态解析'}（构建完成后仍会比对实际镜像摘要）`);
     }
-    appendLog(`[本地] 构建输入指纹: ${fpRes.data.fingerprint.slice(0, 12)}，与历史版本均不相同`);
-  } else if (fpRes.ok === false) {
-    appendLog(`[提示] 构建输入指纹比对跳过: ${fpRes.data.error || '无法读取产物'}`);
   } else {
-    appendLog(`[提示] 已跳过发布前镜像内容检测: ${fpRes.data.reason || '构建命令无法静态解析'}（构建完成后仍会比对实际镜像摘要）`);
+    appendLog('[本地] 产物尚未上传：上传完成后将用产物 SHA256 与构建上下文做镜像内容校验');
   }
 
   // 2. 版本冲突预检 (需求 2 核心要求)
@@ -709,7 +743,7 @@ async function onStartDeployClick() {
   const conflicts = preRes.data.conflicts || [];
   if (conflicts.length > 0) {
     // 发现同版本 Tag 或线上/已部署过的同内容镜像，弹出确认弹窗
-    state.pendingReleaseParams = { appId, tag, remark, isLocalBuild, useDefaultArtifact };
+    state.pendingReleaseParams = { appId, tag, remark, isLocalBuild, useDefaultArtifact, uploadId: '' };
     showConflictModal(conflicts, tag);
     return;
   }
@@ -729,33 +763,72 @@ function showConflictModal(conflicts, tag) {
       ? '继续发布将<strong>直接复用内容相同的已有镜像</strong>（只追加新 Tag），不会重新构建，线上镜像内容不会变化。'
       : '继续发布将<strong>覆盖构建该镜像</strong>并执行 K8s 滚动更新。请确认是否强制覆盖？';
   }
+  setConflictActions({
+    title: imageOnly ? '检测到镜像内容重复' : '发现版本冲突 - 需二次确认',
+    confirmText: imageOnly ? '复用已有镜像并添加新 Tag' : '确认覆盖并继续发布',
+    showRebuild: imageOnly,
+  });
   // 服务端真实模式下会直接拒绝同指纹发布；前端在覆盖确认后仍以 force=true 提交，由服务端决定是否放行
   $('conflictModal').classList.remove('hidden');
 }
 
-// 上传前的"同镜像不同 Tag"提醒：构建输入与历史版本相同，换 Tag 不会得到新镜像
+// setConflictActions 统一控制冲突弹窗的标题与按钮（需求的"是否把新 Tag 指向已有镜像"）
+function setConflictActions(opts) {
+  const title = $('conflictModalTitle');
+  if (title && opts.title) title.textContent = opts.title;
+  const confirmBtn = $('conflictConfirmBtn');
+  if (confirmBtn) confirmBtn.textContent = opts.confirmText || '确认覆盖并继续发布';
+  const rebuildBtn = $('conflictRebuildBtn');
+  if (rebuildBtn) rebuildBtn.classList.toggle('hidden', !opts.showRebuild);
+}
+
+// 上传前的"同镜像不同 Tag"提醒：产物哈希与历史版本相同，换 Tag 不会得到新镜像。
+// 明确给出哈希校验结果，并让用户决定"复用已有镜像"还是"仍然重新构建"。
 function showImageDupModal(info) {
   const img = (t) => (info.image ? `${escapeHtml(info.image)}:${escapeHtml(t)}` : escapeHtml(t));
+  const sha = info.sha256 ? escapeHtml(info.sha256) : '';
   $('conflictItems').innerHTML = `
+    <div class="conflict-item">🔎 产物 SHA256 校验：<code>${sha ? sha.slice(0, 24) + '…' : '未计算出摘要'}</code>（${sha ? '完整摘要与前次一致' : '无法比对'}）</div>
     <div class="conflict-item">⚠️ [fingerprint] 本次产物内容与构建上下文（Dockerfile 等）和${info.prevTag ? '已验证版本 ' + escapeHtml(info.prevTag) : '历史版本'}完全相同</div>
     <div class="conflict-item">🏷️ 将要创建的版本：${img(info.tag)}${info.prevTag ? '（与 ' + img(info.prevTag) + (info.createdAt ? '，' + fmtTime(info.createdAt) : '') + ' 内容一致）' : ''}</div>
-    <div class="conflict-item">🧩 构建命令${info.tagFree ? '不引用 Tag' : '中产物与上下文均未变化'}，重建只会得到同一个镜像${info.sha256 ? '（产物 SHA256: ' + escapeHtml(info.sha256.slice(0, 12)) + '）' : ''}</div>`;
+    <div class="conflict-item">🧩 构建命令${info.tagFree ? '不引用 Tag' : '中产物与上下文均未变化'}，重建只会得到同一个镜像</div>`;
   const foot = $('conflictFoot');
   if (foot) {
-    foot.innerHTML = '这通常意味着产物没有重新编译，或只是改了个文件名/换了 Tag。若确认就是同一份产物，可继续；发布时<strong>会复用已有镜像，不会重新构建</strong>。';
+    foot.innerHTML = '这通常意味着产物没有重新编译，或只是改了个文件名/换了 Tag。请选择：<strong>复用已有镜像</strong>（只把新 Tag 指向它，最快）或<strong>仍然重新构建</strong>（构建出的内容仍会相同）。';
   }
+  setConflictActions({
+    title: '镜像内容重复 - 选择如何处理新 Tag',
+    confirmText: '复用已有镜像并添加新 Tag',
+    showRebuild: true,
+  });
   $('conflictModal').classList.remove('hidden');
 }
 
 async function onConfirmConflictDeploy() {
   $('conflictModal').classList.add('hidden');
   if (!state.pendingReleaseParams) return;
-  const { appId, tag, remark, isLocalBuild, useDefaultArtifact } = state.pendingReleaseParams;
-  appendLog(`[确认覆盖] 用户确认强制覆盖同名镜像版本: ${tag}`);
-  startDeployPipeline(appId, tag, remark, true, isLocalBuild, useDefaultArtifact);
+  const { appId, tag, remark, isLocalBuild, useDefaultArtifact, uploadId } = state.pendingReleaseParams;
+  appendLog(`[确认覆盖] 用户确认：复用内容相同的已有镜像，仅把新 Tag [${tag}] 指向它`);
+  startDeployPipeline(appId, tag, remark, true, isLocalBuild, useDefaultArtifact, false, uploadId || '', true);
 }
 
-async function startDeployPipeline(appId, tag, remark, force, isLocalBuild, useDefaultArtifact) {
+// 用户选择"仍然重新构建"：不复用已有镜像，强制执行 docker build（内容相同的提示仍会保留在日志里）
+async function onRebuildInsteadOfReuse() {
+  $('conflictModal').classList.add('hidden');
+  if (!state.pendingReleaseParams) return;
+  const { appId, tag, remark, isLocalBuild, useDefaultArtifact, uploadId } = state.pendingReleaseParams;
+  appendLog(`[确认覆盖] 用户选择重新构建镜像（不复用已有镜像），版本: ${tag}`);
+  startDeployPipeline(appId, tag, remark, true, isLocalBuild, useDefaultArtifact, true, uploadId || '', true);
+}
+
+// resetDeployUi 让发布按钮恢复可点击（预检/校验弹窗返回或异常时）
+function resetDeployUi() {
+  state.isDeploying = false;
+  $('startDeployBtn').disabled = false;
+  $('cancelReleaseBtn').classList.add('hidden');
+}
+
+async function startDeployPipeline(appId, tag, remark, force, isLocalBuild, useDefaultArtifact, noReuse = false, existingUploadId = '', skipDupCheck = false) {
   const draft = state.appDrafts && state.appDrafts[appId];
   state.isDeploying = true;
   $('startDeployBtn').disabled = true;
@@ -763,12 +836,39 @@ async function startDeployPipeline(appId, tag, remark, force, isLocalBuild, useD
   updateStatus('running', isLocalBuild ? '正在执行本地编译...' : '正在准备产物...');
 
   try {
-    let upId = '';
-    if (!isLocalBuild && state.selectedFile) {
+    let upId = existingUploadId || '';
+    if (!isLocalBuild && !upId && state.selectedFile) {
       // 2. 手动选择的本地文件分片上传至本地暂存区
       updateStatus('running', '正在上传产物...');
       upId = await uploadFileChunks(state.selectedFile);
-      state.uploadId = upId;
+    }
+    state.uploadId = upId;
+
+    // 2.5 上传完成后再做一次产物哈希/构建输入指纹校验（手动选择的文件此前拿不到路径）。
+    // 与历史版本完全相同时提示用户：是复用已有镜像（新 Tag 指向它），还是仍然重新构建。
+    if (upId && !isLocalBuild && !skipDupCheck) {
+      const app = state.apps.find((a) => a.id === appId);
+      const dupRes = await api('POST', '/api/artifacts/inspect', { appId, tag, uploadId: upId });
+      if (dupRes.ok && dupRes.data && dupRes.data.previous) {
+        const prev = dupRes.data.previous;
+        appendLog(`[警告] 产物 SHA256 ${String(dupRes.data.sha256 || '').slice(0, 12)} 与已验证版本 ${prev.tag} 完全相同，镜像内容不会变化`);
+        showImageDupModal({
+          tag,
+          image: app ? app.image : '',
+          prevTag: prev.tag,
+          prevImage: prev.image,
+          createdAt: prev.createdAt,
+          tagFree: !!dupRes.data.tagFree,
+          sha256: dupRes.data.sha256 || '',
+        });
+        state.pendingReleaseParams = { appId, tag, remark, isLocalBuild, useDefaultArtifact, uploadId: upId };
+        resetDeployUi();
+        updateStatus('idle', '等待确认');
+        return;
+      }
+      if (dupRes.ok && dupRes.data && dupRes.data.sha256 && !dupRes.data.fingerprint) {
+        appendLog(`[本地] 产物 SHA256: ${dupRes.data.sha256.slice(0, 16)}（构建命令无法静态解析，跳过构建输入比对）`);
+      }
     }
 
     // 3. 发起发布任务
@@ -782,6 +882,7 @@ async function startDeployPipeline(appId, tag, remark, force, isLocalBuild, useD
       runLocalBuild: !!isLocalBuild,
       useLocalArtifact: !!useDefaultArtifact,
       force,
+      noReuse: !!noReuse,
       remark,
       buildDir: (draft && draft.buildDir) || '',
       buildCmd: (draft && draft.buildCmd) || '',
@@ -802,9 +903,7 @@ async function startDeployPipeline(appId, tag, remark, force, isLocalBuild, useD
   } catch (err) {
     appendLog(`[错误] ${err.message}`);
     updateStatus('failed', '发布失败');
-    state.isDeploying = false;
-    $('startDeployBtn').disabled = false;
-    $('cancelReleaseBtn').classList.add('hidden');
+    resetDeployUi();
   }
 }
 
@@ -1025,51 +1124,90 @@ function updateStatus(status, text) {
   badge.textContent = text;
 }
 
-// ---------------- 配置备份与回滚 ----------------
-async function loadConfigBackups() {
-  const box = $('configBackupsList');
+// ---------------- 配置备份与回滚（按服务） ----------------
+// 备份文件名形如 order-service_v1.2.0_20261112-201500.000000000.yaml：
+// 一眼能看出是哪个服务、哪个版本、什么时候的配置；恢复只替换该服务。
+async function loadAppBackups() {
+  const box = $('appBackupsList');
   if (!box) return;
-  const res = await api('GET', '/api/config/backups');
+  const res = await api('GET', '/api/config/app-backups');
   if (!res.ok) {
     box.innerHTML = '<div class="td-empty">备份列表加载失败</div>';
     return;
   }
   const list = res.data || [];
   if (list.length === 0) {
-    box.innerHTML = '<div class="td-empty">暂无备份（保存一次配置后自动产生）</div>';
+    box.innerHTML = '<div class="td-empty">暂无按服务的备份（保存或删除应用配置后自动产生）</div>';
     return;
   }
-  box.innerHTML = list.map((b) => `<div style="display:flex;align-items:center;gap:12px;padding:8px 4px;border-bottom:1px solid var(--border);">
-      <span style="font-family:monospace;">${escapeHtml(b.name)}</span>
-      <span style="color:var(--muted);">${fmtSize(b.size)}</span>
-      <button class="btn btn-secondary btn-sm" onclick="restoreConfigBackup('${escapeHtml(b.name)}')">恢复此版本</button>
-    </div>`).join('');
+  // 按服务分组展示
+  const groups = new Map();
+  list.forEach((b) => {
+    const key = b.appId || b.appName || 'unknown';
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(b);
+  });
+  box.innerHTML = Array.from(groups.values()).map((items) => {
+    const head = items[0];
+    const rows = items.map((b) => `
+      <div class="backup-row">
+        <span class="backup-name" title="${escapeHtml(b.name)}">${escapeHtml(b.name)}</span>
+        <span class="backup-tag">版本 ${escapeHtml(b.tag || 'no-tag')}</span>
+        <span class="backup-time">${fmtTime(b.createdAt)}</span>
+        <span class="backup-size">${fmtSize(b.size)}</span>
+        <button class="btn btn-secondary btn-sm" onclick="restoreAppBackup('${escapeHtml(b.name)}')">恢复此版本</button>
+      </div>`).join('');
+    return `<div class="backup-group">
+      <div class="backup-group-head">
+        <strong>${escapeHtml(head.appName || head.appId)}</strong>
+        <code>${escapeHtml(head.image || '-')}</code>
+        <span class="mini-badge">${items.length} 份备份</span>
+      </div>
+      ${rows}
+    </div>`;
+  }).join('');
 }
 
-async function restoreConfigBackup(name) {
-  if (!confirm(`确定恢复到备份 ${name} 吗？当前配置会自动再备份一次，可再次恢复回来。`)) return;
-  const res = await api('POST', '/api/config/restore', { name });
+window.restoreAppBackup = async function (name) {
+  if (!confirm(`确定恢复备份 ${name} 吗？只会替换该服务的配置，当前版本会自动再备份一次，可再次恢复回来。`)) return;
+  const res = await api('POST', '/api/config/app-backups/restore', { name });
   if (!res.ok) {
     alert(`恢复失败: ${res.data.error || '未知错误'}`);
     return;
   }
   await refreshConfigs();
-  alert('配置已恢复');
-}
+  alert('该服务配置已恢复');
+};
 
 // ---------------- K8s Pod 监控 (需求 3) ----------------
 let currentPods = [];
 
 const ALL_NS = '*';
 
-// 当前所选环境下标的命名空间（应用配置里的 namespace；未配置返回空）
-function podEnvNamespace() {
-  const envId = $('podEnvSelect').value;
-  const app = state.apps.find((a) => a.id === envId);
-  return (app && (app.namespace || '').trim()) || '';
+// Pod 列表后台静默刷新：状态自己更新，只有切换服务器/命名空间或手动刷新才需要等待
+let podAutoTimer = null;
+let podFetching = false;
+let namespaceLoadedFor = ''; // 已拉取过命名空间列表的服务器，避免每次刷新都跑一遍 kubectl get ns
+
+function startPodAutoRefresh() {
+  stopPodAutoRefresh();
+  podAutoTimer = setInterval(() => {
+    if (document.hidden || !$('tab-pods').classList.contains('active')) return;
+    // 正在查看某个 Pod 的日志时不打断弹窗
+    const logModal = $('podLogModal');
+    if (logModal && !logModal.classList.contains('hidden')) return;
+    loadPods(true);
+  }, 8000);
 }
 
-// 拉取命名空间列表并回填下拉，保持当前选中的命名空间（不存在时回退到环境命名空间 / 第一个）
+function stopPodAutoRefresh() {
+  if (podAutoTimer) {
+    clearInterval(podAutoTimer);
+    podAutoTimer = null;
+  }
+}
+
+// 拉取命名空间列表并回填下拉，保持当前选中的命名空间（不存在时回退到上次记住的 / 第一个）
 async function loadNamespaceOptions(srvId, keep) {
   const sel = $('podNamespaceSelect');
   const res = await api('GET', `/api/k8s/namespaces?serverId=${encodeURIComponent(srvId)}`);
@@ -1080,49 +1218,83 @@ async function loadNamespaceOptions(srvId, keep) {
   const list = res.data.slice().sort();
   sel.innerHTML = `<option value="${escapeHtml(ALL_NS)}">全部命名空间</option>` +
     list.map((ns) => `<option value="${escapeHtml(ns)}">${escapeHtml(ns)}</option>`).join('');
-  const candidates = [keep, podEnvNamespace(), state.prefs.podNamespace];
+  const candidates = [keep, state.prefs.podNamespace];
   const hit = candidates.find((v) => v && list.includes(v) && v !== ALL_NS);
   sel.value = hit || list[0] || 'default';
 }
 
-// 刷新按钮 / 切换服务器 / 切换环境：命名空间与 Pod 列表一次刷新到位
-async function loadNamespacesAndPods() {
+// 进入监控页 / 切换服务器：需要时才重新拉取命名空间，然后刷新 Pod
+async function loadNamespacesAndPods(reloadNamespaces = true) {
   const srvId = $('podServerSelect').value;
   if (!srvId) return;
 
-  $('podLoading').classList.remove('hidden');
-  await loadNamespaceOptions(srvId, $('podNamespaceSelect').value);
+  if (reloadNamespaces || namespaceLoadedFor !== srvId) {
+    $('podLoading').classList.remove('hidden');
+    await loadNamespaceOptions(srvId, $('podNamespaceSelect').value);
+    namespaceLoadedFor = srvId;
+  }
   await loadPods();
   $('podLoading').classList.add('hidden');
 }
 
-async function loadPods() {
+// 手动刷新：按钮转圈给出明确反馈，只刷新 Pod 列表本身（命名空间已在进入页面时加载）
+async function refreshPodsManually() {
+  const btn = $('refreshPodsBtn');
+  const icon = $('refreshPodsIcon');
+  if (btn.disabled) return;
+  btn.disabled = true;
+  if (icon) icon.classList.add('spin');
+  $('podLoading').classList.remove('hidden');
+  try {
+    const srvId = $('podServerSelect').value;
+    if (srvId && namespaceLoadedFor !== srvId) {
+      await loadNamespaceOptions(srvId, $('podNamespaceSelect').value);
+      namespaceLoadedFor = srvId;
+    }
+    await loadPods();
+  } finally {
+    btn.disabled = false;
+    if (icon) icon.classList.remove('spin');
+    $('podLoading').classList.add('hidden');
+  }
+}
+
+// silent=true 用于后台定时刷新：不清空表格、不显示加载提示，避免页面闪烁
+async function loadPods(silent = false) {
   const srvId = $('podServerSelect').value;
   const ns = $('podNamespaceSelect').value || 'default';
-  if (!srvId) return;
+  if (!srvId || podFetching) return;
   // 记录当前命名空间，切换服务器自动回退到第一个时也能被记住（「全部命名空间」不入偏好）
   if (ns !== ALL_NS && state.prefs.podNamespace !== ns) {
     state.prefs.podNamespace = ns;
     savePrefs();
   }
 
-  if ($('podLoading').classList.contains('hidden')) $('podLoading').classList.remove('hidden');
-  $('podsTableBody').innerHTML = '<tr><td colspan="10" class="td-empty">正在加载 Pod 状态...</td></tr>';
-
-  const res = await api('GET', `/api/k8s/pods?serverId=${encodeURIComponent(srvId)}&namespace=${encodeURIComponent(ns)}`);
-  $('podLoading').classList.add('hidden');
-
-  if (!res.ok) {
-    $('podsTableBody').innerHTML = `<tr><td colspan="10" class="td-empty" style="color:var(--danger)">加载失败: ${escapeHtml(res.data.error || '未知错误')}</td></tr>`;
-    return;
+  podFetching = true;
+  if (!silent) {
+    $('podLoading').classList.remove('hidden');
+    $('podsTableBody').innerHTML = '<tr><td colspan="10" class="td-empty">正在加载 Pod 状态...</td></tr>';
   }
 
-  currentPods = res.data || [];
-  // 全集群视图按命名空间分组排序，便于一眼看清各环境
-  if (ns === ALL_NS) {
-    currentPods.sort((a, b) => (a.namespace || '').localeCompare(b.namespace || '') || a.name.localeCompare(b.name));
+  try {
+    const res = await api('GET', `/api/k8s/pods?serverId=${encodeURIComponent(srvId)}&namespace=${encodeURIComponent(ns)}`);
+    if (!res.ok) {
+      if (!silent) {
+        $('podsTableBody').innerHTML = `<tr><td colspan="10" class="td-empty" style="color:var(--danger)">加载失败: ${escapeHtml(res.data.error || '未知错误')}</td></tr>`;
+      }
+      return;
+    }
+    currentPods = res.data || [];
+    // 全集群视图按命名空间分组排序，便于一眼看清各环境
+    if (ns === ALL_NS) {
+      currentPods.sort((a, b) => (a.namespace || '').localeCompare(b.namespace || '') || a.name.localeCompare(b.name));
+    }
+    // 保留搜索框的过滤结果，后台刷新不会把用户筛掉的 Pod 又显示回来
+    filterPodsTable();
+  } finally {
+    podFetching = false;
+    if (!silent) $('podLoading').classList.add('hidden');
   }
-  renderPodsTable(currentPods);
 }
 
 function renderPodsTable(pods) {
@@ -1179,6 +1351,14 @@ function stopPodLogFollow() {
   }
 }
 
+// 刷新日志按钮的加载反馈：禁用并让图标转圈
+function setPodLogBusy(busy) {
+  const btn = $('refreshLogBtn');
+  const icon = $('refreshLogIcon');
+  if (btn) btn.disabled = busy;
+  if (icon) icon.classList.toggle('spin', busy);
+}
+
 window.viewPodLog = async function (podName, containerName) {
   const srvId = $('podServerSelect').value;
   const ns = $('podNamespaceSelect').value;
@@ -1204,17 +1384,20 @@ window.viewPodLog = async function (podName, containerName) {
   }
 
   $('podLogTitle').textContent = `Pod 日志: ${podName}`;
+  $('podLogMeta').textContent = '显示最新 200 行日志';
   $('podLogContent').innerHTML = '<span class="log-debug">正在获取最新日志...</span>';
   $('podLogModal').classList.remove('hidden');
 
   $('refreshLogBtn').onclick = () => fetchPodLogContent(srvId, ns, currentViewingPod, currentViewingContainer);
+
+  $('downloadPodLogBtn').onclick = downloadPodLog;
 
   $('autoFollowPodLog').onchange = (e) => {
     stopPodLogFollow();
     if (e.target.checked) {
       podLogTimer = setInterval(() => {
         fetchPodLogContent(srvId, ns, currentViewingPod, currentViewingContainer, true);
-      }, 2500);
+      }, 2000);
     }
   };
 
@@ -1222,25 +1405,61 @@ window.viewPodLog = async function (podName, containerName) {
 };
 
 async function fetchPodLogContent(srvId, ns, podName, containerName, isAuto) {
-  const res = await api('GET', `/api/k8s/pod-logs?serverId=${encodeURIComponent(srvId)}&namespace=${encodeURIComponent(ns)}&pod=${encodeURIComponent(podName)}&container=${encodeURIComponent(containerName)}&tail=200`);
-  if (!res.ok) {
-    if (!isAuto) {
-      $('podLogContent').innerHTML = `<span class="log-err">获取日志失败: ${escapeHtml(res.data.error || '未知错误')}</span>`;
+  if (!isAuto) setPodLogBusy(true);
+  try {
+    const res = await api('GET', `/api/k8s/pod-logs?serverId=${encodeURIComponent(srvId)}&namespace=${encodeURIComponent(ns)}&pod=${encodeURIComponent(podName)}&container=${encodeURIComponent(containerName)}&tail=200`);
+    if (!res.ok) {
+      if (!isAuto) {
+        $('podLogContent').innerHTML = `<span class="log-err">获取日志失败: ${escapeHtml(res.data.error || '未知错误')}</span>`;
+      }
+      return;
     }
+    const raw = res.data.logs || '';
+    window._rawPodLog = raw;
+    $('podLogContent').innerHTML = colorizeLog(raw);
+    if (!isAuto) {
+      const now = new Date();
+      const pad = (n) => String(n).padStart(2, '0');
+      $('podLogMeta').textContent = `显示最新 200 行日志 · 最近刷新 ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
+    }
+    if ($('autoFollowPodLog').checked) {
+      const el = $('podLogContent');
+      el.scrollTop = el.scrollHeight;
+    }
+  } finally {
+    if (!isAuto) setPodLogBusy(false);
+  }
+}
+
+// 下载当前 Pod 日志：文件名带上 Pod 名（去掉随机后缀，保留服务名）、容器名与时间
+function downloadPodLog() {
+  const raw = window._rawPodLog || '';
+  if (!raw) {
+    alert('当前没有可下载的日志内容');
     return;
   }
-  const raw = res.data.logs || '';
-  window._rawPodLog = raw;
-  $('podLogContent').innerHTML = colorizeLog(raw);
-  if ($('autoFollowPodLog').checked) {
-    const el = $('podLogContent');
-    el.scrollTop = el.scrollHeight;
-  }
+  const parts = String(currentViewingPod || 'pod').split('-');
+  const svcName = parts.length >= 3 ? parts.slice(0, parts.length - 2).join('-') : parts.slice(0, 1).join('-');
+  const safe = (s) => String(s || '').replace(/[^\w.-]/g, '_');
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  const ts = `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+  const fileName = `${safe(svcName)}_${safe(currentViewingPod)}${currentViewingContainer ? '_' + safe(currentViewingContainer) : ''}_${ts}.log`;
+  const blob = new Blob([raw], { type: 'text/plain;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = fileName;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 $('closePodLogBtn').addEventListener('click', () => {
   stopPodLogFollow();
   $('autoFollowPodLog').checked = false;
+  setPodLogBusy(false);
   $('podLogModal').classList.add('hidden');
 });
 
@@ -1285,32 +1504,76 @@ window.restartPodDeployment = async function (podName) {
 };
 
 // ---------------- 服务器管理 (长连接池保持) ----------------
-function renderServerCards() {
+// 配置页只展示"当前选中的服务器"：下拉选择服务器，其余服务器暂不显示，页面不再堆满连接信息
+
+function currentConfigServer() {
+  const sel = $('configServerSelect');
+  if (!sel) return null;
+  const id = sel.value || state.prefs.configServerId;
+  return state.servers.find((s) => s.id === id) || state.servers[0] || null;
+}
+
+function renderServerPicker() {
+  const sel = $('configServerSelect');
+  if (!sel) return;
   if (state.servers.length === 0) {
-    $('serverCardsList').innerHTML = '<div class="config-hint">尚未配置服务器，请点击右上角添加。</div>';
+    sel.innerHTML = '<option value="">暂无服务器</option>';
+    sel.disabled = true;
+    ['configConnectBtn', 'configEditServerBtn', 'configDeleteServerBtn', 'configDisconnectBtn'].forEach((id) => {
+      const el = $(id);
+      if (el) el.disabled = true;
+    });
+    $('serverDetailPanel').innerHTML = '<div class="config-hint">尚未配置服务器，请点击右上角“+ 添加服务器”。</div>';
+    const disc = $('configDisconnectBtn');
+    if (disc) disc.classList.add('hidden');
     return;
   }
-  $('serverCardsList').innerHTML = state.servers.map((s) => {
-    const isConnected = state.activeServerIds.includes(s.id);
-    const statusBadge = isConnected
-      ? '<span class="pod-status-badge pod-status-running" style="margin-left:8px;">🟢 已建立长连接</span>'
-      : '<span class="pod-status-badge" style="margin-left:8px;background:#f1f5f9;color:#64748b;">⚪ 未连接</span>';
-    return `
-      <div class="item-card">
-        <div class="item-card-header">
-          <span class="item-card-title">${escapeHtml(s.name)}${statusBadge}</span>
-          <div style="display:flex;gap:6px;">
-            <button class="btn btn-secondary btn-sm" onclick="testOneServer('${escapeHtml(s.id)}')">${isConnected ? '🔄 重新检测' : '⚡ 建立连接'}</button>
-            ${isConnected ? `<button class="btn btn-secondary btn-sm" style="color:#ef4444;" onclick="disconnectOneServer('${escapeHtml(s.id)}')">🔌 断开连接</button>` : ''}
-            <button class="btn btn-secondary btn-sm" onclick="editServer('${escapeHtml(s.id)}')">编辑</button>
-            <button class="btn btn-danger btn-sm" onclick="deleteServer('${escapeHtml(s.id)}')">删除</button>
-          </div>
-        </div>
-        <div class="item-card-desc">连接信息: <code>${escapeHtml(s.user)}@${escapeHtml(s.host)}:${s.port || 22}</code> (认证: ${s.authType === 'key' ? '私钥' : '密码'})</div>
-        <div class="item-card-desc">连接池机制: 首次连接或发布时自动建立 SSH 长连接并保持心跳，仅在已连接状态下可手动断开释放句柄</div>
-      </div>
-    `;
-  }).join('');
+  sel.disabled = false;
+  ['configConnectBtn', 'configEditServerBtn', 'configDeleteServerBtn'].forEach((id) => {
+    const el = $(id);
+    if (el) el.disabled = false;
+  });
+
+  const prev = sel.value || state.prefs.configServerId;
+  sel.innerHTML = state.servers.map((s) => `<option value="${escapeHtml(s.id)}">${escapeHtml(s.name)} (${escapeHtml(s.host)})</option>`).join('');
+  sel.value = state.servers.some((s) => s.id === prev) ? prev : state.servers[0].id;
+  state.prefs.configServerId = sel.value;
+  savePrefs();
+  renderServerDetail();
+}
+
+function renderServerDetail() {
+  const panel = $('serverDetailPanel');
+  if (!panel) return;
+  const s = currentConfigServer();
+  if (!s) {
+    panel.innerHTML = '';
+    return;
+  }
+  const isConnected = state.activeServerIds.includes(s.id);
+  const statusBadge = isConnected
+    ? '<span class="pod-status-badge pod-status-running">🟢 已建立长连接</span>'
+    : '<span class="pod-status-badge pod-status-offline">⚪ 未连接</span>';
+  panel.innerHTML = `
+    <div class="server-detail-head">
+      <span class="server-detail-name">${escapeHtml(s.name)}</span>
+      ${statusBadge}
+    </div>
+    <div class="server-detail-grid">
+      <div class="server-detail-item"><span class="sd-label">主机地址</span><code>${escapeHtml(s.host)}</code></div>
+      <div class="server-detail-item"><span class="sd-label">SSH 端口</span><code>${s.port || 22}</code></div>
+      <div class="server-detail-item"><span class="sd-label">登录用户</span><code>${escapeHtml(s.user)}</code></div>
+      <div class="server-detail-item"><span class="sd-label">认证方式</span><code>${s.authType === 'key' ? '私钥认证' : (s.authType === 'agent' ? 'SSH Agent' : '密码认证')}</code></div>
+    </div>
+    <div class="server-detail-tip">首次连接或发布时自动建立 SSH 长连接并保持心跳；已连接状态下可手动断开释放句柄。</div>
+  `;
+  const discBtn = $('configDisconnectBtn');
+  if (discBtn) {
+    discBtn.classList.toggle('hidden', !isConnected);
+    discBtn.disabled = !isConnected;
+  }
+  const connBtn = $('configConnectBtn');
+  if (connBtn) connBtn.innerHTML = isConnected ? '🔄 重新检测' : '⚡ 连接';
 }
 
 async function connectCurrentServer() {
@@ -1380,7 +1643,7 @@ async function updateConnStatus() {
       if (connBtn) connBtn.classList.remove('hidden');
       if (discBtn) discBtn.classList.add('hidden');
     }
-    renderServerCards();
+    renderServerDetail();
   }
 }
 
@@ -1430,15 +1693,19 @@ function openServerModal(srv) {
   $('editServerHost').value = srv ? srv.host : '';
   $('editServerPort').value = srv ? srv.port : '22';
   $('editServerUser').value = srv ? srv.user : 'root';
-  $('editServerAuthType').value = srv ? (srv.authType || 'password') : 'password';
+  const authType = srv ? (srv.authType || 'password') : 'password';
+  $('editServerAuthType').value = authType;
   $('editServerPassword').value = srv ? (srv.password || '') : '';
   // 后端不再回传真实密码，仅返回 ****** 占位符：编辑时提示保留原密码
-  $('editServerPassword').placeholder = srv && srv.password === '******' ? '已保存（留空或保持 ****** 表示不修改）' : '';
+  $('editServerPassword').placeholder = srv && srv.password === '******' ? '已保存（留空或保持 ****** 表示不修改）' : '输入密码 (仅保存在本地配置)';
   $('editServerKeyPath').value = srv ? srv.keyPath : '';
   syncPwdToggle();
 
-  $('pwdGroup').classList.toggle('hidden', srv && srv.authType === 'key');
-  $('keyGroup').classList.toggle('hidden', !srv || srv.authType !== 'key');
+  // 必须传明确的布尔值：classList.toggle(token, undefined) 等价于单参数 toggle，
+  // 会把"新增服务器"时的密码输入框反而隐藏掉（之前的 bug）
+  const useKey = authType === 'key';
+  $('pwdGroup').classList.toggle('hidden', useKey);
+  $('keyGroup').classList.toggle('hidden', !useKey);
   $('serverModal').classList.remove('hidden');
 }
 
@@ -1448,9 +1715,13 @@ window.editServer = function (id) {
 };
 
 window.deleteServer = async function (id) {
-  if (!confirm('确定要删除此服务器配置吗？')) return;
+  if (!confirm('确定要删除此服务器配置吗？绑定该服务器的应用将无法发布。')) return;
   const res = await api('DELETE', `/api/servers/${encodeURIComponent(id)}`);
-  if (res.ok) await refreshConfigs();
+  if (res.ok) {
+    if (state.prefs.configServerId === id) state.prefs.configServerId = '';
+    savePrefs();
+    await refreshConfigs();
+  }
 };
 
 async function testServerConnection() {
@@ -1496,27 +1767,38 @@ async function saveServer() {
   if (!res.ok) return alert('保存失败: ' + res.data.error);
 
   $('serverModal').classList.add('hidden');
+  // 保存后直接选中这台服务器，配置页立刻展示它的详情
+  state.prefs.configServerId = srv.id;
+  savePrefs();
   await refreshConfigs();
 }
 
 // ---------------- 应用配置管理 (独立目录配置) ----------------
 function renderAppCards() {
+  // 只列出当前所选服务器下的服务（未绑定服务器的旧配置始终展示，避免"消失"）
+  const srv = currentConfigServer();
+  const serverApps = srv ? state.apps.filter((a) => !a.serverId || a.serverId === srv.id) : state.apps;
   if ($('appCountBadge')) {
-    $('appCountBadge').textContent = `${state.apps.length} 个服务`;
+    $('appCountBadge').textContent = `${serverApps.length} 个服务`;
   }
-  if (state.apps.length === 0) {
-    $('appCardsList').innerHTML = '<div class="config-hint">尚未配置应用，请点击右上角添加。</div>';
+  if ($('appListHint')) {
+    $('appListHint').textContent = srv
+      ? `当前服务器「${srv.name}」下的服务；其他服务器的配置暂不显示，可在上方切换服务器查看。`
+      : '多个服务共用同一个 K8s YAML 目录（按各自独立的 YAML 文件名区分）。';
+  }
+  if (serverApps.length === 0) {
+    $('appCardsList').innerHTML = `<div class="config-hint">当前服务器${srv ? '「' + escapeHtml(srv.name) + '」' : ''}下暂无应用，请点击右上角“+ 添加应用”。</div>`;
     return;
   }
   const kw = ($('appConfigSearchInput') ? $('appConfigSearchInput').value : '').trim().toLowerCase();
   const filtered = kw
-    ? state.apps.filter((a) =>
+    ? serverApps.filter((a) =>
         (a.name || '').toLowerCase().includes(kw) ||
         (a.image || '').toLowerCase().includes(kw) ||
         (a.k8sYamlFile || '').toLowerCase().includes(kw) ||
         (a.namespace || '').toLowerCase().includes(kw)
       )
-    : state.apps;
+    : serverApps;
 
   if (filtered.length === 0) {
     $('appCardsList').innerHTML = '<div class="config-hint">未找到匹配搜索关键词的服务配置。</div>';
@@ -1630,10 +1912,14 @@ function openAppModal(app) {
   $('editAppDockerHealthPath').value = app ? (app.dockerHealthPath || '') : '';
   toggleDockerConfigBox();
 
-  // 渲染绑定服务器选项
+  // 渲染绑定服务器选项：新建应用默认绑定配置页当前选中的服务器
+  const defaultSrv = currentConfigServer();
   $('editAppServerId').innerHTML = state.servers.map((s) => `
     <option value="${escapeHtml(s.id)}" ${app && app.serverId === s.id ? 'selected' : ''}>${escapeHtml(s.name)} (${escapeHtml(s.host)})</option>
   `).join('');
+  if (!app && defaultSrv) {
+    $('editAppServerId').value = defaultSrv.id;
+  }
 
   $('appModal').classList.remove('hidden');
 }

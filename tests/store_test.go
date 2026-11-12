@@ -18,18 +18,23 @@ func TestStoreStoreAddGetUpdateList(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// 时间戳显式指定：Windows 时钟粒度较粗，依赖 time.Now() 会让排序断言变得不确定
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.Local)
 	r1 := newStoreRelease("r1", "a", "v1")
+	r1.CreatedAt = base
 	if err := st.Add(r1); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(2 * time.Millisecond)
 	r2 := newStoreRelease("r2", "b", "v2")
 	r2.Status = store.StatusFailed
+	r2.CreatedAt = base.Add(time.Second)
 	if err := st.Add(r2); err != nil {
 		t.Fatal(err)
 	}
-	// 同一 ID 再次 Add 会覆盖历史（Add 不做去重，调用方用 Update 修改）
-	st.Add(newStoreRelease("r1", "a", "v1-dup"))
+	// 同一 ID 再次 Add 会追加一条新记录（Add 不做去重，调用方用 Update 修改）
+	dup := newStoreRelease("r1", "a", "v1-dup")
+	dup.CreatedAt = base.Add(2 * time.Second)
+	st.Add(dup)
 
 	got, err := st.Get("r1")
 	if err != nil || got.Tag != "v1" {

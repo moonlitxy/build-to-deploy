@@ -1,4 +1,4 @@
-# Build-to-Deploy 本地一键构建发布平台
+# DeployOne 一键上线 · 本地构建发布平台
 
 专为“**开发者本地可连接服务器 VPN 与 Git 独立 VPN，但远程服务器无法访问 Git、无法安装使用 Jenkins**”场景量身打造。
 

@@ -398,6 +398,8 @@ type StartRequest struct {
 	UseLocalArtifact bool
 	Force            bool
 	Remark           string
+	// NoReuse 用户选择"即使内容相同也重新构建"：跳过复用已有镜像，强制执行 docker build
+	NoReuse bool
 	// BuildDir / BuildCmd 前端未保存的构建配置草稿，非空时覆盖已保存配置
 	BuildDir string
 	BuildCmd string
@@ -610,6 +612,7 @@ func (e *Engine) startDeploy(parent context.Context, req StartRequest) (*store.R
 			hub:           hub,
 			artifact:      localArtifact,
 			runLocalBuild: req.RunLocalBuild,
+			noReuse:       req.NoReuse,
 			precheck:      pre,
 		}
 		err := runner.run()
@@ -753,6 +756,7 @@ type pipelineRunner struct {
 	hub           *Hub
 	artifact      string
 	runLocalBuild bool
+	noReuse       bool // 用户明确要求重新构建：不复用内容相同的已有镜像
 	precheck      *PrecheckResult
 }
 
@@ -1083,6 +1087,16 @@ func (r *pipelineRunner) run() error {
 
 	// 4. 执行镜像构建（或复用内容相同的已有镜像）
 	if err := r.stage("build", func(w io.Writer) error {
+		if r.noReuse {
+			fmt.Fprintln(w, "已选择重新构建：跳过复用已有镜像，直接执行 docker build")
+			if err := r.buildImage(w); err != nil {
+				return err
+			}
+			if err := r.labelImage(w); err != nil {
+				fmt.Fprintf(w, "[警告] 写入镜像指纹标签失败（不影响发布）: %v\n", err)
+			}
+			return r.checkBuiltImage(w)
+		}
 		reuse, full, err := r.findReusableImage(w)
 		if err != nil {
 			return err
@@ -1560,6 +1574,9 @@ func (r *pipelineRunner) runRollback() error {
 }
 
 func (r *pipelineRunner) finish(err error) {
+	// 先释放"该应用正在发布"的占位，再写入终态：否则调用方看到 done 后立刻发起回滚/重发，
+	// 会撞上尚未清理的 running 记录（表现为"应用正在发布中"，实际流水线已结束）
+	r.engine.releaseRunning(r.app.ID)
 	now := time.Now()
 	status := store.StatusSuccess
 	if err != nil {
@@ -1591,6 +1608,13 @@ func (r *pipelineRunner) finish(err error) {
 	} else {
 		r.hub.Logf(fmt.Sprintf("\n==> ❌ 发布终止: %v", err))
 	}
+}
+
+// releaseRunning 释放应用级发布占位（幂等，可由 finish 与收尾 goroutine 重复调用）
+func (e *Engine) releaseRunning(appID string) {
+	e.mu.Lock()
+	delete(e.running, appID)
+	e.mu.Unlock()
 }
 
 func (r *pipelineRunner) cleanup() {

@@ -29,6 +29,7 @@ import (
 	"build-to-deploy/internal/pipeline"
 	"build-to-deploy/internal/shellrun"
 	"build-to-deploy/internal/sshpool"
+	"build-to-deploy/internal/store"
 	"build-to-deploy/internal/upload"
 )
 
@@ -92,6 +93,9 @@ func (s *Server) Handler() http.Handler {
 	// 配置备份与回滚（每次保存自动备份，改错可恢复）
 	mux.HandleFunc("GET /api/config/backups", s.listConfigBackups)
 	mux.HandleFunc("POST /api/config/restore", s.restoreConfig)
+	// 按服务的配置备份：文件名带服务名与版本号，恢复只影响该服务
+	mux.HandleFunc("GET /api/config/app-backups", s.listAppBackups)
+	mux.HandleFunc("POST /api/config/app-backups/restore", s.restoreAppBackup)
 
 	// 预检版本冲突（满足需求 2）
 	mux.HandleFunc("POST /api/precheck", s.precheck)
@@ -479,6 +483,35 @@ func (s *Server) listConfigBackups(w http.ResponseWriter, r *http.Request) {
 		backups = []config.ConfigBackup{}
 	}
 	writeJSON(w, http.StatusOK, backups)
+}
+
+func (s *Server) listAppBackups(w http.ResponseWriter, r *http.Request) {
+	backups, err := s.cfg.AppBackups()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if backups == nil {
+		backups = []config.AppBackup{}
+	}
+	writeJSON(w, http.StatusOK, backups)
+}
+
+func (s *Server) restoreAppBackup(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := readJSON(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	app, err := s.cfg.RestoreApp(req.Name)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// 只恢复单个服务，服务器凭据未变：无需断开长连接
+	writeJSON(w, http.StatusOK, app)
 }
 
 func (s *Server) restoreConfig(w http.ResponseWriter, r *http.Request) {
@@ -936,6 +969,7 @@ func (s *Server) startRelease(w http.ResponseWriter, r *http.Request) {
 		BuildDir          string `json:"buildDir"`
 		BuildCmd          string `json:"buildCmd"`
 		Force             bool   `json:"force"`
+		NoReuse           bool   `json:"noReuse"`
 		Remark            string `json:"remark"`
 	}
 	if err := readJSON(r, &req); err != nil {
@@ -966,6 +1000,7 @@ func (s *Server) startRelease(w http.ResponseWriter, r *http.Request) {
 		RunLocalBuild:    req.RunLocalBuild,
 		UseLocalArtifact: req.UseLocalArtifact,
 		Force:            req.Force,
+		NoReuse:          req.NoReuse,
 		Remark:           req.Remark,
 		BuildDir:         req.BuildDir,
 		BuildCmd:         req.BuildCmd,
@@ -1036,13 +1071,39 @@ func (s *Server) releaseLog(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if _, err := s.engine.Store.Get(id); err != nil {
+	rel, err := s.engine.Store.Get(id)
+	if err != nil {
 		writeErr(w, http.StatusNotFound, err.Error())
 		return
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=%q", id+".log"))
+	// 下载文件名带上服务名、版本号与发布时间：浏览器以 Content-Disposition 为准，
+	// 前端 <a download> 的同名设置会被此头覆盖，所以必须由服务端给出有意义的文件名
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", releaseLogFileName(rel)))
 	http.ServeFile(w, r, s.engine.LogPath(id))
+}
+
+// releaseLogFileName 生成发布日志下载文件名：服务名_版本号_发布时间.log
+func releaseLogFileName(rel *store.Release) string {
+	safe := func(s string) string {
+		var b strings.Builder
+		for _, r := range s {
+			if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '.' || r == '_' || r == '-' {
+				b.WriteRune(r)
+			} else {
+				b.WriteByte('_')
+			}
+		}
+		if b.Len() == 0 {
+			return "release"
+		}
+		return b.String()
+	}
+	ts := rel.CreatedAt.Format("20060102-150405")
+	if rel.CreatedAt.IsZero() {
+		ts = rel.ID
+	}
+	return fmt.Sprintf("%s_%s_%s.log", safe(rel.App), safe(rel.Tag), ts)
 }
 
 func (s *Server) releaseEvents(w http.ResponseWriter, r *http.Request) {

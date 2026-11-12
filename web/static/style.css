@@ -340,6 +340,29 @@ input:focus, select:focus, textarea:focus {
   box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.15);
 }
 
+/* 统一替换浏览器原生的下拉箭头：原生箭头在 Windows 下又小又贴边，观感很差 */
+select {
+  appearance: none;
+  -webkit-appearance: none;
+  -moz-appearance: none;
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1.5 6 6.5 11 1.5' fill='none' stroke='%2364748b' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 12px center;
+  padding-right: 34px;
+  cursor: pointer;
+}
+select:disabled {
+  background-color: #f1f5f9;
+  color: #94a3b8;
+  cursor: not-allowed;
+}
+select.select-sm {
+  width: auto;
+  padding: 4px 28px 4px 8px;
+  font-size: 12px;
+  background-position: right 8px center;
+}
+
 .input-with-btn {
   display: flex;
   gap: 8px;
@@ -1043,6 +1066,111 @@ input:focus, select:focus, textarea:focus {
 .log-actions {
   display: flex;
   gap: 8px;
+}
+
+/* 日志弹窗：工具栏固定，日志区独占剩余高度并独立滚动。
+   原先 toolBar 用 sticky + 日志区固定高度，滚动时日志会从标题与工具栏之间穿出来 */
+.modal-card.modal-large { height: 86vh; }
+.log-modal-body {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  padding-bottom: 16px;
+}
+.log-modal-body .log-modal-tools {
+  position: static;
+  flex-shrink: 0;
+  margin-bottom: 10px;
+  padding: 0;
+  background: transparent;
+}
+.log-modal-body .pod-log-pre,
+.log-modal-body .history-log-pre {
+  flex: 1 1 auto;
+  height: auto;
+  min-height: 0;
+  max-height: none;
+  overflow: auto;
+}
+
+/* 刷新按钮的转圈反馈 */
+@keyframes btd-spin { to { transform: rotate(360deg); } }
+.spin { display: inline-block; animation: btd-spin 0.9s linear infinite; }
+
+/* 勾选本地产物直传后，拖拽区进入禁用态，明确表达"二选一" */
+.drop-zone.disabled-zone {
+  cursor: not-allowed;
+  opacity: 0.6;
+  pointer-events: none;
+}
+.auto-refresh-hint { font-size: 12px; color: var(--text-muted); }
+
+/* 配置页：服务器下拉 + 单服务器详情 */
+.server-picker-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 14px;
+}
+.server-picker-row label { margin: 0; white-space: nowrap; }
+.server-picker-row select { width: 340px; max-width: 100%; }
+.server-detail-panel {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px 16px;
+  background: #f8fafc;
+}
+.server-detail-head { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+.server-detail-name { font-weight: 700; font-size: 15px; color: #0f172a; }
+.server-detail-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}
+.server-detail-item { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.server-detail-item code { word-break: break-all; }
+.sd-label { font-size: 12px; color: var(--text-muted); }
+.server-detail-tip { margin-top: 12px; font-size: 12px; color: var(--text-muted); }
+.pod-status-offline { background: #f1f5f9; color: #64748b; }
+
+/* 按服务的配置备份列表 */
+.backup-group {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  margin-bottom: 12px;
+  overflow: hidden;
+}
+.backup-group-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  background: #f1f5f9;
+}
+.backup-group-head code { font-size: 12px; color: #334155; }
+.backup-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto auto auto;
+  gap: 12px;
+  align-items: center;
+  padding: 9px 14px;
+  border-top: 1px solid var(--border);
+}
+.backup-name {
+  font-family: Consolas, Monaco, monospace;
+  font-size: 12px;
+  color: #334155;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.backup-tag { font-size: 12px; color: #2563eb; font-weight: 600; }
+.backup-time, .backup-size { font-size: 12px; color: var(--text-muted); white-space: nowrap; }
+
+@media (max-width: 900px) {
+  .server-detail-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .backup-row { grid-template-columns: minmax(0, 1fr) auto; }
 }
 
 /* 控制台日志语法高亮色彩体系：高度交给 flex 填充，避免固定高度溢出卡片导致底部被裁 */

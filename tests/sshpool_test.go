@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -226,7 +227,8 @@ func TestSSHPoolSFTPTransfer(t *testing.T) {
 	if got, _ := os.ReadFile(root + "/remote/a.jar"); string(got) != "new-content" {
 		t.Fatalf("写入后内容 = %q", got)
 	}
-	if st, _ := os.Stat(root + "/remote/a.jar"); st.Mode().Perm() != 0o600 {
+	// Windows 文件系统不支持 POSIX 权限位，跳过权限断言
+	if st, _ := os.Stat(root + "/remote/a.jar"); runtime.GOOS != "windows" && st.Mode().Perm() != 0o600 {
 		t.Fatalf("写入应保留原权限: %v", st.Mode())
 	}
 

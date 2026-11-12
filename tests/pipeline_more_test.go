@@ -161,6 +161,48 @@ func TestPMoreReuseImageOnRebuild(t *testing.T) {
 	_ = cfg
 }
 
+// TestPMoreNoReuseForcesRebuild 用户明确选择"仍然重新构建"时不复用内容相同的已有镜像
+func TestPMoreNoReuseForcesRebuild(t *testing.T) {
+	eng, _, st, fake, app := newScriptedEnv(t, config.DeployModeDocker)
+	sum := "sha256:" + strings.Repeat("d", 64)
+	fake.addRules(
+		scriptRule{"docker images -q", ""},
+		scriptRule{"docker image inspect -f", sum + " []"},
+	)
+	first, err := eng.StartDeploy(pipeline.StartRequest{AppID: app.ID, Tag: "v2.0.0", UseLocalArtifact: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitDoneStrict(t, st, first.ID)
+
+	fake.cmds = nil
+	second, err := eng.StartDeploy(pipeline.StartRequest{
+		AppID:            app.ID,
+		Tag:              "v2.0.1",
+		UseLocalArtifact: true,
+		Force:            true,
+		NoReuse:          true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := waitDoneStrict(t, st, second.ID)
+	log := readLogFile(t, eng, second.ID)
+	if done.Status != store.StatusSuccess {
+		t.Fatalf("重新构建发布失败: %s\n%s", done.Error, log)
+	}
+	if !strings.Contains(log, "已选择重新构建") {
+		t.Fatalf("日志应说明用户选择了重新构建:\n%s", log)
+	}
+	if strings.Contains(log, "复用构建结果") {
+		t.Fatalf("选择重新构建时不应复用镜像:\n%s", log)
+	}
+	cmds := strings.Join(fake.snapshot(), "\n")
+	if !strings.Contains(cmds, "docker build -t") {
+		t.Fatalf("应执行 docker build:\n%s", cmds)
+	}
+}
+
 func TestPMoreRollbackErrorsAndTargets(t *testing.T) {
 	eng, _, st, _, app := newScriptedEnv(t, config.DeployModeK8s)
 	first, err := eng.StartDeploy(pipeline.StartRequest{AppID: app.ID, Tag: "v1.0.0", UseLocalArtifact: true})
