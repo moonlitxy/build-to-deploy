@@ -19,12 +19,15 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
 	"build-to-deploy/internal/config"
+	"build-to-deploy/internal/dockerrun"
 	"build-to-deploy/internal/k8s"
 	"build-to-deploy/internal/pipeline"
+	"build-to-deploy/internal/shellrun"
 	"build-to-deploy/internal/sshpool"
 	"build-to-deploy/internal/upload"
 )
@@ -42,7 +45,13 @@ type Server struct {
 	engine *pipeline.Engine
 	kube   *k8s.Client
 	pool   *sshpool.Pool
+	run    shellrun.Runner
 	static fs.FS
+
+	// pathPickerBusy 系统文件选择框的全局占用标记：GUI 里同时只会有一个模态对话框，
+	// 并发请求直接返回 409，避免排队中的请求在用户关掉一个后再弹出来
+	pathPickerMu   sync.Mutex
+	pathPickerBusy bool
 }
 
 func NewServer(cfg *config.Config, engine *pipeline.Engine, kube *k8s.Client, pool *sshpool.Pool, static fs.FS) *Server {
@@ -51,8 +60,15 @@ func NewServer(cfg *config.Config, engine *pipeline.Engine, kube *k8s.Client, po
 		engine: engine,
 		kube:   kube,
 		pool:   pool,
+		run:    pool,
 		static: static,
 	}
+}
+
+// WithRunner 替换远程命令执行实现（测试注入假 SSH 使用），返回自身便于链式调用
+func (s *Server) WithRunner(r shellrun.Runner) *Server {
+	s.run = r
+	return s
 }
 
 func (s *Server) Handler() http.Handler {
@@ -79,6 +95,8 @@ func (s *Server) Handler() http.Handler {
 
 	// 预检版本冲突（满足需求 2）
 	mux.HandleFunc("POST /api/precheck", s.precheck)
+	mux.HandleFunc("POST /api/artifacts/inspect", s.inspectArtifact)
+	mux.HandleFunc("GET /api/deploy-target", s.containerStatus)
 
 	// K8s 命名空间与 Pod 状态监控（满足需求 3）
 	mux.HandleFunc("GET /api/k8s/namespaces", s.getNamespaces)
@@ -288,7 +306,9 @@ func (s *Server) saveServer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 连接池按服务器 ID 缓存：host / 端口 / 凭据变更后必须失效旧长连接，否则继续复用 stale 连接
-	s.pool.Invalidate(&srv)
+	if s.pool != nil {
+		s.pool.Invalidate(&srv)
+	}
 	writeJSON(w, http.StatusOK, maskServer(&srv))
 }
 
@@ -302,8 +322,10 @@ func (s *Server) deleteServer(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	// 删除配置的同时断开其长连接，避免残留连接继续占用远端会话
-	s.pool.Disconnect(id)
+	// 删除配置的同时断开其长连接，避免残留连接继续占用远端会话（上面已断开一次，这里兜底处理并发新建）
+	if s.pool != nil {
+		s.pool.Disconnect(id)
+	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -341,10 +363,8 @@ func (s *Server) testServer(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	// 通过快照读取：直接访问 cfg.Server 会绕过读写锁，与配置保存并发时构成数据竞争
-	if s.cfg.ServerSettingsSnapshot().DryRun {
-		s.pool.MarkSimulated(&srv)
-		writeJSON(w, http.StatusOK, map[string]string{"message": fmt.Sprintf("SSH 长连接已建立 [%s@%s] (演练模式)", srv.User, srv.Host)})
+	if s.pool == nil {
+		writeErr(w, http.StatusInternalServerError, "SSH 连接池未初始化")
 		return
 	}
 	if err := s.pool.TestConnection(&srv); err != nil {
@@ -359,7 +379,10 @@ func (s *Server) disconnectServer(w http.ResponseWriter, r *http.Request) {
 		ServerID string `json:"serverId"`
 	}
 	_ = readJSON(r, &req)
-	n := s.pool.Disconnect(req.ServerID)
+	n := 0
+	if s.pool != nil {
+		n = s.pool.Disconnect(req.ServerID)
+	}
 	msg := fmt.Sprintf("已断开 %d 个 SSH 长连接并释放本地资源", n)
 	if n == 0 {
 		msg = "当前没有活动的长连接"
@@ -372,7 +395,10 @@ func (s *Server) disconnectServer(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) activeConnections(w http.ResponseWriter, r *http.Request) {
-	keys := s.pool.ActiveKeys()
+	var keys []string
+	if s.pool != nil {
+		keys = s.pool.ActiveKeys()
+	}
 	var details []map[string]string
 	for _, k := range keys {
 		if srv := s.cfg.FindServer(k); srv != nil && srv.ID == k {
@@ -468,7 +494,9 @@ func (s *Server) restoreConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 服务器配置可能已回退到旧凭据，断开全部长连接，下次使用时重建
-	s.pool.Disconnect("all")
+	if s.pool != nil {
+		s.pool.Disconnect("all")
+	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -506,6 +534,20 @@ func (s *Server) inspectLocalArtifact(w http.ResponseWriter, r *http.Request) {
 
 // pickLocalPath 唤起本机系统原生的文件夹或文件选择对话框，返回真实绝对路径
 func (s *Server) pickLocalPath(w http.ResponseWriter, r *http.Request) {
+	s.pathPickerMu.Lock()
+	if s.pathPickerBusy {
+		s.pathPickerMu.Unlock()
+		writeErr(w, http.StatusConflict, "已有文件选择框正在打开，请先关闭它")
+		return
+	}
+	s.pathPickerBusy = true
+	s.pathPickerMu.Unlock()
+	defer func() {
+		s.pathPickerMu.Lock()
+		s.pathPickerBusy = false
+		s.pathPickerMu.Unlock()
+	}()
+
 	var req struct {
 		Mode   string `json:"mode"` // "dir" 或 "file"
 		Prompt string `json:"prompt"`
@@ -559,6 +601,102 @@ func (s *Server) pickLocalPath(w http.ResponseWriter, r *http.Request) {
 		selected = strings.TrimRight(selected, "/")
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"canceled": false, "path": selected})
+}
+
+// ---------- 部署形态：K8s / Docker 容器 ----------
+
+// containerStatus 查询宿主机上同名容器是否在运行（只读，供页面展示"当前形态"）
+func (s *Server) containerStatus(w http.ResponseWriter, r *http.Request) {
+	appID := r.URL.Query().Get("appId")
+	app := s.cfg.FindApp(appID)
+	if app == nil {
+		writeErr(w, http.StatusNotFound, "应用不存在")
+		return
+	}
+	srv := s.cfg.FindServer(app.ServerID)
+	if srv == nil {
+		writeErr(w, http.StatusBadRequest, "应用未绑定有效的 SSH 服务器")
+		return
+	}
+	out := map[string]any{"appId": app.ID, "deployMode": app.DeployMode}
+	if app.DeployMode != config.DeployModeDocker || strings.TrimSpace(app.DockerContainer) == "" {
+		writeJSON(w, http.StatusOK, out)
+		return
+	}
+	out["container"] = app.DockerContainer
+	insp, err := dockerrun.InspectCmdFor(app)
+	if err != nil {
+		writeJSON(w, http.StatusOK, out)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+	raw, err := s.run.ExecuteOutput(ctx, srv, insp)
+	if err != nil {
+		out["error"] = err.Error()
+		writeJSON(w, http.StatusOK, out)
+		return
+	}
+	status, image := dockerrun.ParseInspect(raw)
+	out["status"] = status
+	out["image"] = image
+	out["running"] = status == "running"
+	writeJSON(w, http.StatusOK, out)
+}
+
+// ---------- 构建输入指纹预检（上传前判断新 Tag 是否是同一个镜像） ----------
+
+func (s *Server) inspectArtifact(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		AppID             string `json:"appId"`
+		Tag               string `json:"tag"`
+		UploadID          string `json:"uploadId"`
+		UseLocalArtifact  bool   `json:"useLocalArtifact"`
+		LocalArtifactPath string `json:"localArtifactPath"`
+		BuildDir          string `json:"buildDir"`
+		BuildCmd          string `json:"buildCmd"`
+	}
+	if err := readJSON(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	app := s.cfg.FindApp(req.AppID)
+	if app == nil {
+		writeErr(w, http.StatusNotFound, "应用不存在")
+		return
+	}
+	// 应用卡片上尚未落盘的编辑（修改构建配置弹窗里的构建目录/构建命令）优先于已保存配置
+	app = app.WithOverrides(req.BuildDir, req.BuildCmd)
+	src := pipeline.ArtifactSource{Tag: strings.TrimSpace(req.Tag), UploadID: req.UploadID}
+	if src.UploadID == "" {
+		path := app.ResolveLocalArtifactPath()
+		if p := strings.TrimSpace(req.LocalArtifactPath); p != "" {
+			path = config.ExpandHome(p)
+		}
+		if path == "" {
+			writeJSON(w, http.StatusOK, map[string]any{"fingerprint": ""})
+			return
+		}
+		src.LocalArtifact = path
+	}
+	fp, err := s.engine.InspectArtifact(app, src)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	out := map[string]any{
+		"fingerprint": fp.Fingerprint,
+		"sha256":      fp.SHA256,
+		"tagFree":     fp.TagFree,
+		"skipped":     fp.Skipped,
+	}
+	if fp.Fingerprint == "" {
+		out["reason"] = s.engine.FingerprintSkipReason(app, src)
+	}
+	if prev := s.engine.Store.FindFingerprint(app.ID, fp.Fingerprint); prev != nil {
+		out["previous"] = map[string]any{"tag": prev.Tag, "image": prev.Image, "createdAt": prev.CreatedAt}
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // ---------- 预检版本冲突 (需求 2) ----------
@@ -616,8 +754,11 @@ func (s *Server) getPods(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "未指定或找不到 SSH 服务器")
 		return
 	}
-	// 空命名空间由 k8s 层默认填充为 default，仅校验显式传入的值
-	if ns != "" && !checkK8sName(w, "命名空间", ns) {
+	// 空命名空间由 k8s 层默认填充为 default；"*" 表示查看全部命名空间（前端「全部命名空间」选项）
+	if ns == "" {
+		ns = "default"
+	}
+	if ns != k8s.AllNamespaces && !checkK8sName(w, "命名空间", ns) {
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
@@ -792,6 +933,8 @@ func (s *Server) startRelease(w http.ResponseWriter, r *http.Request) {
 		RunLocalBuild     bool   `json:"runLocalBuild"`
 		UseLocalArtifact  bool   `json:"useLocalArtifact"`
 		LocalArtifactPath string `json:"localArtifactPath"`
+		BuildDir          string `json:"buildDir"`
+		BuildCmd          string `json:"buildCmd"`
 		Force             bool   `json:"force"`
 		Remark            string `json:"remark"`
 	}
@@ -816,7 +959,7 @@ func (s *Server) startRelease(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	rel, err := s.engine.StartDeploy(pipeline.StartRequest{
+	rel, err := s.engine.StartDeployContext(r.Context(), pipeline.StartRequest{
 		AppID:            req.AppID,
 		Tag:              strings.TrimSpace(req.Tag),
 		UploadID:         req.UploadID,
@@ -824,6 +967,8 @@ func (s *Server) startRelease(w http.ResponseWriter, r *http.Request) {
 		UseLocalArtifact: req.UseLocalArtifact,
 		Force:            req.Force,
 		Remark:           req.Remark,
+		BuildDir:         req.BuildDir,
+		BuildCmd:         req.BuildCmd,
 	})
 	if err != nil {
 		var ce *pipeline.ConflictError

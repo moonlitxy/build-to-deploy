@@ -30,24 +30,28 @@ type Stage struct {
 }
 
 type Release struct {
-	ID         string     `json:"id"`
-	App        string     `json:"app"`
-	Kind       string     `json:"kind"` // deploy | rollback
-	Tag        string     `json:"tag"`
-	Image      string     `json:"image"` // 实际部署的镜像引用（优先 image@digest）
-	FileName   string     `json:"fileName,omitempty"`
-	FileSize   int64      `json:"fileSize,omitempty"`
-	FileSHA256 string     `json:"fileSha256,omitempty"`
-	Force      bool       `json:"force"` // 是否为覆盖已有版本
-	Operator   string     `json:"operator"`
-	Remark     string     `json:"remark"`
-	PrevImage  string     `json:"prevImage"`
-	RollbackOf string     `json:"rollbackOf,omitempty"`
-	Status     string     `json:"status"`
-	Error      string     `json:"error,omitempty"`
-	Stages     []Stage    `json:"stages"`
-	CreatedAt  time.Time  `json:"createdAt"`
-	FinishedAt *time.Time `json:"finishedAt,omitempty"`
+	ID         string `json:"id"`
+	App        string `json:"app"`
+	Kind       string `json:"kind"` // deploy | rollback
+	Tag        string `json:"tag"`
+	Image      string `json:"image"` // 实际部署的镜像引用（优先 image@digest）
+	FileName   string `json:"fileName,omitempty"`
+	FileSize   int64  `json:"fileSize,omitempty"`
+	FileSHA256 string `json:"fileSha256,omitempty"`
+	Force      bool   `json:"force"` // 是否为覆盖已有版本
+	Operator   string `json:"operator"`
+	Remark     string `json:"remark"`
+	PrevImage  string `json:"prevImage"`
+	// 构建输入指纹：产物内容 + 构建上下文（Dockerfile 等），相同即代表镜像内容相同，与 Tag 无关
+	ImageFP      string     `json:"imageFp,omitempty"`
+	ImageSummary string     `json:"imageSummary,omitempty"` // 构建后镜像内容摘要（sha256:...），空表示未检测
+	Mode         string     `json:"mode,omitempty"`         // 部署形态：k8s | docker
+	RollbackOf   string     `json:"rollbackOf,omitempty"`
+	Status       string     `json:"status"`
+	Error        string     `json:"error,omitempty"`
+	Stages       []Stage    `json:"stages"`
+	CreatedAt    time.Time  `json:"createdAt"`
+	FinishedAt   *time.Time `json:"finishedAt,omitempty"`
 }
 
 func (r *Release) Clone() *Release {
@@ -159,10 +163,25 @@ func (s *Store) List(app string, limit int) []*Release {
 	return out
 }
 
-// FindByImage 查找部署过该镜像引用的最近一条成功记录（用于由 digest 反查 tag）。
-func (s *Store) FindByImage(app, image string) *Release {
+// FindByImage 查找使用过该镜像引用（Tag 或摘要）的成功发布记录，按时间倒序。
+// 发布成功或部署未成功但已自动回滚的记录，都说明该镜像确实被线上使用过。
+func (s *Store) FindByImage(app, image string) []*Release {
+	var out []*Release
 	for _, r := range s.List(app, 0) {
-		if r.Image == image && r.Status == StatusSuccess {
+		if r.Image == image && (r.Status == StatusSuccess || r.Status == StatusRolledBack) {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// FindFingerprint 查找同一构建输入指纹的最近成功发布记录（用于判断"换了 Tag 其实是同一个镜像"）
+func (s *Store) FindFingerprint(app, fp string) *Release {
+	if fp == "" {
+		return nil
+	}
+	for _, r := range s.List(app, 0) {
+		if r.ImageFP == fp && (r.Status == StatusSuccess || r.Status == StatusRolledBack) {
 			return r
 		}
 	}

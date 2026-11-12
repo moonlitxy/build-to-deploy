@@ -32,7 +32,7 @@ func main() {
 
 	targetCfg := *cfgPath
 	if targetCfg == "" {
-		// 优先演练配置：直接 go run . 时绝不会误连真实服务器；生产配置可用 -config 显式指定
+		// 优先开发配置：直接 go run . 时无需额外参数；生产配置可用 -config 显式指定
 		for _, candidate := range []string{"configs/config.dev.yaml", "configs/config.yaml", "config.yaml"} {
 			if _, err := os.Stat(candidate); err == nil {
 				targetCfg = candidate
@@ -104,8 +104,7 @@ func main() {
 	}()
 
 	pool := sshpool.GlobalPool
-	// 与 pipeline.Engine 一样实时读取配置：网页切换演练模式后无需重启即可全局生效
-	kubeCli := k8s.NewClient(pool, func() bool { return cfg.ServerSettingsSnapshot().DryRun })
+	kubeCli := k8s.NewClient(pool)
 
 	engine := pipeline.NewEngine(cfg, st, ups, pool, kubeCli, cfg.Server.DataDir)
 
@@ -138,9 +137,6 @@ func main() {
 	log.Printf("🚀 Build-to-Deploy 本地发布平台启动成功 [%s]", version)
 	log.Printf("📄 当前使用配置: %s", targetCfg)
 	log.Printf("👉 浏览器直接访问: http://%s (无需登录密码)", displayAddr(cfg.Server.Listen))
-	if cfg.Server.DryRun {
-		log.Printf("⚠ 当前为演练模式 (DryRun)，模拟构建与K8s操作")
-	}
 
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)

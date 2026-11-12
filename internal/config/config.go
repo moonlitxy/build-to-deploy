@@ -26,7 +26,6 @@ type ServerSettings struct {
 	Listen      string `yaml:"listen" json:"listen"`           // 默认 ":8080"
 	DataDir     string `yaml:"dataDir" json:"dataDir"`         // 本地缓存、日志存放目录
 	MaxUploadMB int64  `yaml:"maxUploadMB" json:"maxUploadMB"` // 单个上传最大 MB
-	DryRun      bool   `yaml:"dryRun" json:"dryRun"`           // 是否演练模式（无需连真机）
 }
 
 type AppConfig struct {
@@ -57,6 +56,62 @@ type AppConfig struct {
 	Container      string `yaml:"container" json:"container"`           // 容器名称
 	RolloutTimeout int    `yaml:"rolloutTimeout" json:"rolloutTimeout"` // 等待就绪超时（秒）
 	AutoRollback   bool   `yaml:"autoRollback" json:"autoRollback"`     // 失败是否自动回滚
+
+	// 部署形态：k8s（默认，走 K8s 滚动发布）或 docker（宿主机上以单个容器运行，不依赖 K8s）
+	DeployMode string `yaml:"deployMode" json:"deployMode"`
+
+	// Docker 容器部署配置（deployMode=docker 时生效）
+	DockerContainer  string `yaml:"dockerContainer" json:"dockerContainer"`   // 容器名，如 shuili-mxpt-manager
+	DockerPort       string `yaml:"dockerPort" json:"dockerPort"`             // 端口映射，如 31530:8081
+	DockerVolumes    string `yaml:"dockerVolumes" json:"dockerVolumes"`       // 卷映射，逗号分隔宿主机目录:容器目录
+	DockerEnv        string `yaml:"dockerEnv" json:"dockerEnv"`               // 环境变量，逗号分隔 KEY=VALUE
+	DockerRunOpts    string `yaml:"dockerRunOpts" json:"dockerRunOpts"`       // 其他 docker run 参数，如 --restart=always --network=host
+	DockerHealthPath string `yaml:"dockerHealthPath" json:"dockerHealthPath"` // 部署后容器内探测的 HTTP 路径（空则只检查 Running）
+}
+
+// DeployModeK8s / DeployModeDocker 两种部署形态
+const (
+	DeployModeK8s    = "k8s"
+	DeployModeDocker = "docker"
+)
+
+var (
+	// DockerNameRe 容器名：与 docker 的容器名规则一致
+	DockerNameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$`)
+	// DockerPortRe 端口映射：仅允许数字端口对，防止把参数拼进 shell
+	DockerPortRe = regexp.MustCompile(`^[0-9]{1,5}(:[0-9]{1,5})?$`)
+	// DockerSpecRe 卷映射 / 环境变量 / 运行参数：白名单字符
+	DockerSpecRe = regexp.MustCompile(`^[A-Za-z0-9._/=:@+,-]*$`)
+	// DockerHealthPathRe 健康检查路径
+	DockerHealthPathRe = regexp.MustCompile(`^/[A-Za-z0-9._/-]*$`)
+)
+
+// DockerConfigured 是否已配置容器部署所需的容器名
+func (a *AppConfig) DockerConfigured() bool {
+	return strings.TrimSpace(a.DockerContainer) != ""
+}
+
+// ValidateDocker 校验 Docker 部署相关字段：这些值会拼进远程 docker 命令，必须严格白名单
+func ValidateDocker(a *AppConfig) error {
+	if !DockerNameRe.MatchString(a.DockerContainer) {
+		return fmt.Errorf("Docker 容器名不合法，只能包含字母、数字、. _ - (当前: %q)", a.DockerContainer)
+	}
+	if p := strings.TrimSpace(a.DockerPort); p != "" && !DockerPortRe.MatchString(p) {
+		return fmt.Errorf("Docker 端口映射不合法，应形如 31530:8081 (当前: %q)", a.DockerPort)
+	}
+	if v := strings.TrimSpace(a.DockerVolumes); v != "" && !DockerSpecRe.MatchString(v) {
+		return fmt.Errorf("Docker 卷映射不合法，只能使用字母、数字、路径分隔符、冒号与逗号 (当前: %q)", a.DockerVolumes)
+	}
+	if e := strings.TrimSpace(a.DockerEnv); e != "" && !DockerSpecRe.MatchString(e) {
+		return fmt.Errorf("Docker 环境变量不合法，应形如 KEY=VALUE，多个用逗号分隔 (当前: %q)", a.DockerEnv)
+	}
+	if o := strings.TrimSpace(a.DockerRunOpts); o != "" && !DockerSpecRe.MatchString(o) {
+		return fmt.Errorf("Docker 运行参数不合法，只允许字母、数字与 . _ / = : @ + , - (当前: %q)", a.DockerRunOpts)
+	}
+	if h := strings.TrimSpace(a.DockerHealthPath); h != "" && !DockerHealthPathRe.MatchString(h) {
+		return fmt.Errorf("Docker 健康检查路径必须以 / 开头且只包含安全字符 (当前: %q)", a.DockerHealthPath)
+	}
+	return nil
 }
 
 var (
@@ -108,6 +163,12 @@ func ValidateApp(a *AppConfig) error {
 	if strings.TrimSpace(a.K8sYamlFile) != "" && !K8sYamlFileRe.MatchString(a.K8sYamlFile) {
 		return fmt.Errorf("K8s YAML 文件名不合法，只能是如 order-service.yaml (当前: %q)", a.K8sYamlFile)
 	}
+	if a.DeployMode != "" && a.DeployMode != DeployModeK8s && a.DeployMode != DeployModeDocker {
+		return fmt.Errorf("部署形态只能是 k8s 或 docker (当前: %q)", a.DeployMode)
+	}
+	if a.DeployMode == DeployModeDocker {
+		return ValidateDocker(a)
+	}
 	return nil
 }
 
@@ -137,7 +198,6 @@ func Default() *Config {
 			Listen:      "127.0.0.1:8080",
 			DataDir:     "./data",
 			MaxUploadMB: 2048,
-			DryRun:      false,
 		},
 		SSHServers: []*sshpool.ServerConfig{
 			{
@@ -195,8 +255,22 @@ func (c *Config) normalize() {
 		if app.ID == "" {
 			app.ID = app.Name
 		}
+		if app.DeployMode == "" {
+			app.DeployMode = DeployModeK8s
+		}
+		if app.DeployMode == DeployModeDocker && app.DockerContainer == "" {
+			// 容器名默认与 Deployment 同名，兼容"同一应用两种形态切换"
+			app.DockerContainer = app.Deployment
+			if app.DockerContainer == "" {
+				app.DockerContainer = app.Name
+			}
+		}
 		if app.BuildCmd == "" {
 			app.BuildCmd = "cd {{.BuildDir}} && docker build -t {{.Image}}:{{.Tag}} ."
+		}
+		if app.DeployCmd == "" && app.DeployMode == DeployModeDocker {
+			// Docker 形态不依赖 K8s YAML：由流水线直接 docker rm/run 容器
+			app.DeployCmd = "docker run -d --name {{.Container}} {{.Image}}:{{.Tag}}"
 		}
 		if app.DeployCmd == "" {
 			if app.K8sYamlFile != "" {
@@ -551,6 +625,18 @@ func expandHome(p string) string {
 		}
 	}
 	return p
+}
+
+// WithOverrides 返回应用配置副本，并用前端尚未保存的编辑值覆盖构建相关字段（仅用于发布前本地比对，不落盘）
+func (a *AppConfig) WithOverrides(buildDir, buildCmd string) *AppConfig {
+	cp := *a
+	if d := strings.TrimSpace(buildDir); d != "" {
+		cp.BuildDir = trimRemoteSlash(d)
+	}
+	if c := strings.TrimSpace(buildCmd); c != "" {
+		cp.BuildCmd = c
+	}
+	return &cp
 }
 
 // ResolveLocalProjectDir 返回展开 ~ 后的本地项目目录路径

@@ -24,6 +24,7 @@ const state = {
     useDefaultArtifactByApp: {},
     lastTagByApp: {},
     podServerId: '',
+    podEnvId: '',
     podNamespace: '',
   },
 };
@@ -39,6 +40,7 @@ function loadPrefs() {
         useDefaultArtifactByApp: parsed.useDefaultArtifactByApp || {},
         lastTagByApp: parsed.lastTagByApp || {},
         podServerId: parsed.podServerId || '',
+        podEnvId: parsed.podEnvId || '',
         podNamespace: parsed.podNamespace || '',
       };
     }
@@ -51,16 +53,48 @@ function savePrefs() {
   } catch (_) {}
 }
 
+// 系统文件选择框同一时刻只允许一个：连点按钮不会再排队弹出多个对话框
+let pathPickerPending = null;
+
 async function pickLocalPath(mode, promptText) {
-  const res = await api('POST', '/api/local/pick-path', { mode, prompt: promptText });
-  if (!res.ok) {
-    alert(`打开本地文件选择器失败: ${res.data.error || '未知错误'}`);
-    return null;
+  if (pathPickerPending) {
+    return pathPickerPending;
   }
-  if (res.data.canceled || !res.data.path) {
-    return null;
-  }
-  return res.data.path;
+  // 前端超时略长于服务端（120s），避免网络异常时按钮一直卡在"打开中..."
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 125000);
+  pathPickerPending = (async () => {
+    try {
+      const res = await fetch('/api/local/pick-path', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode, prompt: promptText }),
+        signal: controller.signal,
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.status === 409) {
+        // 已有一个选择框开着（例如另一个标签页），本次不再叠加
+        return null;
+      }
+      if (!res.ok) {
+        alert(`打开本地文件选择器失败: ${data.error || '未知错误'}`);
+        return null;
+      }
+      if (data.canceled || !data.path) {
+        return null;
+      }
+      return data.path;
+    } catch (e) {
+      if (e.name === 'AbortError') {
+        alert('打开文件选择框超时，请重试');
+      }
+      return null;
+    } finally {
+      clearTimeout(timer);
+      pathPickerPending = null;
+    }
+  })();
+  return pathPickerPending;
 }
 
 // ---------------- 基础工具函数 ----------------
@@ -123,6 +157,10 @@ document.addEventListener('DOMContentLoaded', async () => {
   await refreshConfigs();
   await updateConnStatus();
   setInterval(updateConnStatus, 10000);
+  // 进入页面即拉取一次命名空间与 Pod，不必先手动刷新
+  if ($('tab-pods').classList.contains('active')) {
+    loadNamespacesAndPods();
+  }
 });
 
 function setupTabs() {
@@ -167,7 +205,11 @@ function renderAppSelects() {
     $('deployAppSelect').value = prevVal;
   }
   $('historyAppFilter').innerHTML = '<option value="">全部应用</option>' + opts;
+  renderPodSelects();
+}
 
+// Pod 页面服务器 / 环境下拉
+function renderPodSelects() {
   // Pod 页面服务器下拉：优先恢复上次查看的服务器
   const srvOpts = state.servers.map((s) => `<option value="${escapeHtml(s.id)}">${escapeHtml(s.name)} (${escapeHtml(s.host)})</option>`).join('');
   $('podServerSelect').innerHTML = srvOpts || '<option value="">暂无服务器</option>';
@@ -176,6 +218,31 @@ function renderAppSelects() {
     $('podServerSelect').value = savedSrv;
   } else if (state.servers.length > 0) {
     $('podServerSelect').value = state.servers[0].id;
+  }
+
+  // Pod 页面环境下拉：应用即环境（每个应用对应一套命名空间/工作负载），选中后自动带出其命名空间
+  const k8sApps = state.apps.filter((a) => a.deployMode !== 'docker');
+  $('podEnvSelect').innerHTML = k8sApps.map((a) => `<option value="${escapeHtml(a.id)}">${escapeHtml(a.name)}</option>`).join('') || '<option value="">暂无 K8s 应用</option>';
+  if (state.prefs.podEnvId && k8sApps.some((a) => a.id === state.prefs.podEnvId)) {
+    $('podEnvSelect').value = state.prefs.podEnvId;
+  } else if (k8sApps.length > 0) {
+    $('podEnvSelect').value = k8sApps[0].id;
+  }
+}
+
+// 查询容器形态下宿主机上同名容器的状态（运行中 / 已停止 / 不存在）
+async function refreshContainerStatus(appId) {
+  const el = $('pvDocker');
+  if (!el) return;
+  const res = await api('GET', `/api/deploy-target?appId=${encodeURIComponent(appId)}`);
+  if (!res.ok || !res.data || res.data.deployMode !== 'docker') return;
+  const st = res.data.status;
+  if (st === 'running') {
+    el.innerHTML += ` <span style="color:#059669">✅ 运行中${res.data.image ? ' · ' + escapeHtml(res.data.image) : ''}</span>`;
+  } else if (st) {
+    el.innerHTML += ` <span style="color:#d97706">⚠️ ${escapeHtml(st)}</span>`;
+  } else if (!res.data.error) {
+    el.innerHTML += ' <span style="color:#6b7280">（容器不存在，发布时创建）</span>';
   }
 }
 
@@ -201,10 +268,22 @@ function updatePathPreview() {
   $('pvServer').textContent = srv ? `${srv.name} (${srv.user}@${srv.host})` : (app.serverId || '-');
   $('pvArtifactDir').textContent = app.artifactDir || '未配置';
   $('pvBuildDir').textContent = app.buildDir || '未配置';
-  if (app.k8sYamlDir && app.k8sYamlFile) {
+  const isDocker = app.deployMode === 'docker';
+  if (isDocker) {
+    $('pvYamlDir').textContent = 'Docker 容器形态（不依赖 K8s）';
+  } else if (app.k8sYamlDir && app.k8sYamlFile) {
     $('pvYamlDir').innerHTML = `<span>${escapeHtml(app.k8sYamlDir)}/</span><strong style="color:#2563eb">${escapeHtml(app.k8sYamlFile)}</strong>`;
   } else {
     $('pvYamlDir').textContent = app.k8sYamlFile || app.k8sYamlDir || '未配置';
+  }
+  // Docker 形态：展示容器名与端口映射，并实时查询宿主机上的容器状态
+  const dockerItem = $('pvDockerItem');
+  if (dockerItem) {
+    dockerItem.classList.toggle('hidden', !isDocker);
+    if (isDocker) {
+      $('pvDocker').textContent = `${app.dockerContainer || app.deployment || app.name}${app.dockerPort ? ' · ' + app.dockerPort : ''}`;
+      refreshContainerStatus(app.id);
+    }
   }
   const curTag = $('tagInput').value.trim() || '<Tag>';
   $('pvImage').innerHTML = app.image
@@ -335,6 +414,7 @@ function setupDropZone() {
 
 function handleSelectedFile(file) {
   state.selectedFile = file;
+  state.uploadId = ''; // 换文件后旧上传任务失效，预检不能再用上一次的分片摘要
   if ($('useDefaultArtifactCheck')) {
     $('useDefaultArtifactCheck').checked = false;
   }
@@ -355,11 +435,22 @@ function setupButtons() {
   $('conflictConfirmBtn').addEventListener('click', onConfirmConflictDeploy);
   $('conflictCancelBtn').addEventListener('click', () => $('conflictModal').classList.add('hidden'));
   $('clearLogBtn').addEventListener('click', () => { $('logConsole').textContent = ''; });
-  $('refreshPodsBtn').addEventListener('click', loadPods);
+  $('refreshPodsBtn').addEventListener('click', loadNamespacesAndPods);
   $('podServerSelect').addEventListener('change', () => {
     // 记住 Pod 监控页最后查看的服务器
     state.prefs.podServerId = $('podServerSelect').value;
     savePrefs();
+    loadNamespacesAndPods();
+  });
+  $('podEnvSelect').addEventListener('change', () => {
+    // 环境（应用）变化：记住选择，并把该应用的命名空间设为当前命名空间
+    state.prefs.podEnvId = $('podEnvSelect').value;
+    savePrefs();
+    const ns = podEnvNamespace();
+    if (ns) {
+      state.prefs.podNamespace = ns;
+      savePrefs();
+    }
     loadNamespacesAndPods();
   });
   $('podNamespaceSelect').addEventListener('change', () => {
@@ -380,6 +471,7 @@ function setupButtons() {
     $('useDefaultArtifactCheck').addEventListener('change', (e) => {
       if (e.target.checked) {
         state.selectedFile = null;
+        state.uploadId = '';
         $('fileInput').value = '';
       }
       const appId = $('deployAppSelect').value;
@@ -488,8 +580,17 @@ function setupButtons() {
   });
 
   $('addAppBtn').addEventListener('click', () => openAppModal());
-  $('closeAppModalBtn').addEventListener('click', () => $('appModal').classList.add('hidden'));
+  $('closeAppModalBtn').addEventListener('click', () => {
+    stashAppDraft();
+    $('appModal').classList.add('hidden');
+  });
   $('saveAppBtn').addEventListener('click', saveApp);
+  if ($('editAppDeployMode')) $('editAppDeployMode').addEventListener('change', toggleDockerConfigBox);
+  if ($('editAppDockerContainer')) {
+    $('editAppDockerContainer').addEventListener('input', (e) => {
+      e.target.dataset.manual = '1';
+    });
+  }
   if ($('connectSrvBtn')) {
     $('connectSrvBtn').addEventListener('click', connectCurrentServer);
   }
@@ -512,6 +613,7 @@ function setupButtons() {
       if (!$('editAppId').value) {
         autoFillAppPathsByName(false);
       }
+      syncDockerContainerFromName();
     });
   }
   if ($('tplYamlApplyBtn')) {
@@ -562,16 +664,51 @@ async function onStartDeployClick() {
   appendLog(`\n[本地] 准备发布应用: ${appId}, Tag: ${tag} (${isLocalBuild ? '本地一键编译并上传' : '直接上传已有产物'})`);
   appendLog('[本地] 正在向服务器执行版本预检 (Precheck)...');
 
-  // 1. 版本冲突预检 (需求 2 核心要求)
+  // 1. 构建输入指纹预检：产物内容 + 构建上下文与历史版本都相同时，换 Tag 也只会得到同一个镜像
+  appendLog('[本地] 正在比对产物内容与构建上下文是否与历史版本相同...');
+  const draft = state.appDrafts && state.appDrafts[appId];
+  const fpRes = await api('POST', '/api/artifacts/inspect', {
+    appId,
+    tag,
+    uploadId: state.uploadId || '',
+    useLocalArtifact: !!useDefaultArtifact,
+    buildDir: (draft && draft.buildDir) || '',
+    buildCmd: (draft && draft.buildCmd) || '',
+  });
+  if (fpRes.ok && fpRes.data && fpRes.data.fingerprint) {
+    const prev = fpRes.data.previous;
+    if (prev || fpRes.data.tagFree) {
+      appendLog(`[警告] 本次产物与构建上下文和${prev ? '已验证版本 ' + prev.tag : '历史版本'}完全相同，换 Tag 只会构建出内容相同的镜像`);
+      showImageDupModal({
+        tag,
+        image: app.image,
+        prevTag: prev ? prev.tag : '',
+        prevImage: prev ? prev.image : '',
+        createdAt: prev ? prev.createdAt : '',
+        tagFree: !!fpRes.data.tagFree,
+        sha256: fpRes.data.sha256 || '',
+      });
+      state.pendingReleaseParams = { appId, tag, remark, isLocalBuild, useDefaultArtifact };
+      return;
+    }
+    appendLog(`[本地] 构建输入指纹: ${fpRes.data.fingerprint.slice(0, 12)}，与历史版本均不相同`);
+  } else if (fpRes.ok === false) {
+    appendLog(`[提示] 构建输入指纹比对跳过: ${fpRes.data.error || '无法读取产物'}`);
+  } else {
+    appendLog(`[提示] 已跳过发布前镜像内容检测: ${fpRes.data.reason || '构建命令无法静态解析'}（构建完成后仍会比对实际镜像摘要）`);
+  }
+
+  // 2. 版本冲突预检 (需求 2 核心要求)
   const preRes = await api('POST', '/api/precheck', { appId, tag });
   if (!preRes.ok) {
     appendLog(`[预检失败] ${preRes.data.error || '检查失败'}`);
     return alert(`预检失败: ${preRes.data.error || '未知错误'}`);
   }
 
+  (preRes.data.warnings || []).forEach((w) => appendLog(`[提示] ${w}`));
   const conflicts = preRes.data.conflicts || [];
   if (conflicts.length > 0) {
-    // 发现同版本 Tag，弹出确认弹窗
+    // 发现同版本 Tag 或线上/已部署过的同内容镜像，弹出确认弹窗
     state.pendingReleaseParams = { appId, tag, remark, isLocalBuild, useDefaultArtifact };
     showConflictModal(conflicts, tag);
     return;
@@ -584,6 +721,29 @@ async function onStartDeployClick() {
 function showConflictModal(conflicts, tag) {
   const itemsHtml = conflicts.map((c) => `<div class="conflict-item">⚠️ [${c.source}] ${escapeHtml(c.message)}</div>`).join('');
   $('conflictItems').innerHTML = itemsHtml;
+  // 只有"同内容镜像"类冲突时，说明覆盖不会产生新镜像：把提示尾注也换掉，避免让用户以为会重新构建
+  const imageOnly = conflicts.every((c) => c.kind === 'image');
+  const foot = $('conflictFoot');
+  if (foot) {
+    foot.innerHTML = imageOnly
+      ? '继续发布将<strong>直接复用内容相同的已有镜像</strong>（只追加新 Tag），不会重新构建，线上镜像内容不会变化。'
+      : '继续发布将<strong>覆盖构建该镜像</strong>并执行 K8s 滚动更新。请确认是否强制覆盖？';
+  }
+  // 服务端真实模式下会直接拒绝同指纹发布；前端在覆盖确认后仍以 force=true 提交，由服务端决定是否放行
+  $('conflictModal').classList.remove('hidden');
+}
+
+// 上传前的"同镜像不同 Tag"提醒：构建输入与历史版本相同，换 Tag 不会得到新镜像
+function showImageDupModal(info) {
+  const img = (t) => (info.image ? `${escapeHtml(info.image)}:${escapeHtml(t)}` : escapeHtml(t));
+  $('conflictItems').innerHTML = `
+    <div class="conflict-item">⚠️ [fingerprint] 本次产物内容与构建上下文（Dockerfile 等）和${info.prevTag ? '已验证版本 ' + escapeHtml(info.prevTag) : '历史版本'}完全相同</div>
+    <div class="conflict-item">🏷️ 将要创建的版本：${img(info.tag)}${info.prevTag ? '（与 ' + img(info.prevTag) + (info.createdAt ? '，' + fmtTime(info.createdAt) : '') + ' 内容一致）' : ''}</div>
+    <div class="conflict-item">🧩 构建命令${info.tagFree ? '不引用 Tag' : '中产物与上下文均未变化'}，重建只会得到同一个镜像${info.sha256 ? '（产物 SHA256: ' + escapeHtml(info.sha256.slice(0, 12)) + '）' : ''}</div>`;
+  const foot = $('conflictFoot');
+  if (foot) {
+    foot.innerHTML = '这通常意味着产物没有重新编译，或只是改了个文件名/换了 Tag。若确认就是同一份产物，可继续；发布时<strong>会复用已有镜像，不会重新构建</strong>。';
+  }
   $('conflictModal').classList.remove('hidden');
 }
 
@@ -596,6 +756,7 @@ async function onConfirmConflictDeploy() {
 }
 
 async function startDeployPipeline(appId, tag, remark, force, isLocalBuild, useDefaultArtifact) {
+  const draft = state.appDrafts && state.appDrafts[appId];
   state.isDeploying = true;
   $('startDeployBtn').disabled = true;
   $('cancelReleaseBtn').classList.remove('hidden');
@@ -622,7 +783,10 @@ async function startDeployPipeline(appId, tag, remark, force, isLocalBuild, useD
       useLocalArtifact: !!useDefaultArtifact,
       force,
       remark,
+      buildDir: (draft && draft.buildDir) || '',
+      buildCmd: (draft && draft.buildCmd) || '',
     });
+    state.uploadId = ''; // 已交给发布流水线，避免下次预检误用
 
     if (!startRes.ok) {
       throw new Error(startRes.data.error || '启动发布流水线失败');
@@ -896,56 +1060,74 @@ async function restoreConfigBackup(name) {
 // ---------------- K8s Pod 监控 (需求 3) ----------------
 let currentPods = [];
 
+const ALL_NS = '*';
+
+// 当前所选环境下标的命名空间（应用配置里的 namespace；未配置返回空）
+function podEnvNamespace() {
+  const envId = $('podEnvSelect').value;
+  const app = state.apps.find((a) => a.id === envId);
+  return (app && (app.namespace || '').trim()) || '';
+}
+
+// 拉取命名空间列表并回填下拉，保持当前选中的命名空间（不存在时回退到环境命名空间 / 第一个）
+async function loadNamespaceOptions(srvId, keep) {
+  const sel = $('podNamespaceSelect');
+  const res = await api('GET', `/api/k8s/namespaces?serverId=${encodeURIComponent(srvId)}`);
+  if (!res.ok || !Array.isArray(res.data)) {
+    sel.innerHTML = `<option value="${escapeHtml(ALL_NS)}">全部命名空间</option><option value="default">default</option>`;
+    return;
+  }
+  const list = res.data.slice().sort();
+  sel.innerHTML = `<option value="${escapeHtml(ALL_NS)}">全部命名空间</option>` +
+    list.map((ns) => `<option value="${escapeHtml(ns)}">${escapeHtml(ns)}</option>`).join('');
+  const candidates = [keep, podEnvNamespace(), state.prefs.podNamespace];
+  const hit = candidates.find((v) => v && list.includes(v) && v !== ALL_NS);
+  sel.value = hit || list[0] || 'default';
+}
+
+// 刷新按钮 / 切换服务器 / 切换环境：命名空间与 Pod 列表一次刷新到位
 async function loadNamespacesAndPods() {
   const srvId = $('podServerSelect').value;
   if (!srvId) return;
 
   $('podLoading').classList.remove('hidden');
-  const nsRes = await api('GET', `/api/k8s/namespaces?serverId=${encodeURIComponent(srvId)}`);
+  await loadNamespaceOptions(srvId, $('podNamespaceSelect').value);
+  await loadPods();
   $('podLoading').classList.add('hidden');
-
-  if (nsRes.ok && nsRes.data) {
-    const opts = nsRes.data.map((ns) => `<option value="${escapeHtml(ns)}">${escapeHtml(ns)}</option>`).join('');
-    $('podNamespaceSelect').innerHTML = opts || '<option value="default">default</option>';
-    // 恢复上次查看的命名空间；不存在时回到第一个
-    const savedNs = state.prefs.podNamespace;
-    if (savedNs && nsRes.data.includes(savedNs)) {
-      $('podNamespaceSelect').value = savedNs;
-    } else if (nsRes.data.length > 0) {
-      $('podNamespaceSelect').value = nsRes.data[0];
-    }
-  }
-  loadPods();
 }
 
 async function loadPods() {
   const srvId = $('podServerSelect').value;
-  const ns = $('podNamespaceSelect').value;
+  const ns = $('podNamespaceSelect').value || 'default';
   if (!srvId) return;
-  // 记录当前命名空间，切换服务器自动回退到第一个时也能被记住
-  if (ns && state.prefs.podNamespace !== ns) {
+  // 记录当前命名空间，切换服务器自动回退到第一个时也能被记住（「全部命名空间」不入偏好）
+  if (ns !== ALL_NS && state.prefs.podNamespace !== ns) {
     state.prefs.podNamespace = ns;
     savePrefs();
   }
 
-  $('podLoading').classList.remove('hidden');
-  $('podsTableBody').innerHTML = '<tr><td colspan="9" class="td-empty">正在加载 Pod 状态...</td></tr>';
+  if ($('podLoading').classList.contains('hidden')) $('podLoading').classList.remove('hidden');
+  $('podsTableBody').innerHTML = '<tr><td colspan="10" class="td-empty">正在加载 Pod 状态...</td></tr>';
 
   const res = await api('GET', `/api/k8s/pods?serverId=${encodeURIComponent(srvId)}&namespace=${encodeURIComponent(ns)}`);
   $('podLoading').classList.add('hidden');
 
   if (!res.ok) {
-    $('podsTableBody').innerHTML = `<tr><td colspan="9" class="td-empty" style="color:var(--danger)">加载失败: ${escapeHtml(res.data.error || '未知错误')}</td></tr>`;
+    $('podsTableBody').innerHTML = `<tr><td colspan="10" class="td-empty" style="color:var(--danger)">加载失败: ${escapeHtml(res.data.error || '未知错误')}</td></tr>`;
     return;
   }
 
   currentPods = res.data || [];
+  // 全集群视图按命名空间分组排序，便于一眼看清各环境
+  if (ns === ALL_NS) {
+    currentPods.sort((a, b) => (a.namespace || '').localeCompare(b.namespace || '') || a.name.localeCompare(b.name));
+  }
   renderPodsTable(currentPods);
 }
 
 function renderPodsTable(pods) {
   if (pods.length === 0) {
-    $('podsTableBody').innerHTML = '<tr><td colspan="9" class="td-empty">当前命名空间下无 Pod 运行</td></tr>';
+    $('podsTableBody').innerHTML = '<tr><td colspan="10" class="td-empty">当前命名空间下无 Pod 运行</td></tr>';
     return;
   }
 
@@ -956,6 +1138,7 @@ function renderPodsTable(pods) {
 
     return `<tr>
       <td><strong>${escapeHtml(p.name)}</strong></td>
+      <td><code>${escapeHtml(p.namespace || '-')}</code></td>
       <td><span class="pod-status-badge ${badgeCls}">${escapeHtml(p.status)}</span></td>
       <td>${escapeHtml(p.ready)}</td>
       <td>${p.restarts}</td>
@@ -1352,9 +1535,11 @@ function renderAppCards() {
       ${a.localBuildCmd || a.localArtifactPath ? `<div class="item-card-desc"><strong>⚡ 本地编译/默认产物:</strong> <code>${escapeHtml(a.localBuildCmd || '仅指定默认产物')}</code> (产物: <code>${escapeHtml(a.localArtifactPath || '-')}</code>)</div>` : ''}
       <div class="item-card-desc"><strong>📦 独立产物目录:</strong> <code>${escapeHtml(a.artifactDir || '-')}</code></div>
       <div class="item-card-desc"><strong>🔨 独立构建目录:</strong> <code>${escapeHtml(a.buildDir || '-')}</code></div>
-      <div class="item-card-desc"><strong>📄 共享 K8s 目录 + 独立 YAML:</strong> <code>${escapeHtml(a.k8sYamlDir || '-')}</code> / <code style="color:#2563eb;font-weight:700;">${escapeHtml(a.k8sYamlFile || (a.name + '.yaml'))}</code></div>
+      ${a.deployMode === 'docker'
+        ? `<div class="item-card-desc"><strong>🐳 部署形态: Docker 容器</strong> · 容器: <code>${escapeHtml(a.dockerContainer || a.deployment || a.name)}</code>${a.dockerPort ? ' · 端口: <code>' + escapeHtml(a.dockerPort) + '</code>' : ''}</div>`
+        : `<div class="item-card-desc"><strong>📄 共享 K8s 目录 + 独立 YAML:</strong> <code>${escapeHtml(a.k8sYamlDir || '-')}</code> / <code style="color:#2563eb;font-weight:700;">${escapeHtml(a.k8sYamlFile || (a.name + '.yaml'))}</code></div>`}
       <div class="item-card-desc"><strong>🏷️ 独立镜像与动态 Tag:</strong> <code>${escapeHtml(a.image || '-')}:&lt;Tag&gt;</code></div>
-      <div class="item-card-desc"><strong>☸️ K8s 目标工作负载:</strong> ns: <code>${escapeHtml(a.namespace)}</code>, deployment: <code>${escapeHtml(a.deployment)}</code></div>
+      ${a.deployMode === 'docker' ? '' : `<div class="item-card-desc"><strong>☸️ K8s 目标工作负载:</strong> ns: <code>${escapeHtml(a.namespace)}</code>, deployment: <code>${escapeHtml(a.deployment)}</code></div>`}
     </div>
   `).join('');
 }
@@ -1370,7 +1555,8 @@ function getImagePrefix() {
     const idx = found.image.lastIndexOf('/');
     return found.image.substring(0, idx + 1);
   }
-  return 'harbor.example.com/app/';
+  // 没有可参考的应用时不编造镜像仓库，由用户自己填写
+  return '';
 }
 
 function autoFillAppPathsByName(forceOverwrite) {
@@ -1433,6 +1619,16 @@ function openAppModal(app) {
   $('editAppDeployment').dataset.auto = app ? '0' : '1';
   $('editAppContainer').value = app ? (app.container || '') : '';
   $('editAppContainer').dataset.auto = app ? '0' : '1';
+  $('editAppDeployMode').value = app ? (app.deployMode || 'k8s') : 'k8s';
+  $('editAppDeployMode').dataset.orig = app ? (app.deployMode || 'k8s') : 'k8s';
+  $('editAppDockerContainer').value = app ? (app.dockerContainer || '') : '';
+  $('editAppDockerContainer').dataset.manual = app ? '1' : '0';
+  $('editAppDockerPort').value = app ? (app.dockerPort || '') : '';
+  $('editAppDockerVolumes').value = app ? (app.dockerVolumes || '') : '';
+  $('editAppDockerEnv').value = app ? (app.dockerEnv || '') : '';
+  $('editAppDockerRunOpts').value = app ? (app.dockerRunOpts || '') : '';
+  $('editAppDockerHealthPath').value = app ? (app.dockerHealthPath || '') : '';
+  toggleDockerConfigBox();
 
   // 渲染绑定服务器选项
   $('editAppServerId').innerHTML = state.servers.map((s) => `
@@ -1440,6 +1636,57 @@ function openAppModal(app) {
   `).join('');
 
   $('appModal').classList.remove('hidden');
+}
+
+// 未手工改过容器名时，Docker 容器名跟随应用名/Deployment（与后端 normalize 规则一致）
+function syncDockerContainerFromName() {
+  const dc = $('editAppDockerContainer');
+  if (!dc || dc.dataset.manual === '1') return;
+  const name = ($('editAppName').value || '').trim();
+  const dep = ($('editAppDeployment').value || '').trim() || name;
+  dc.value = dep;
+}
+
+// 部署形态切换：只有 Docker 形态才显示容器配置，并同步部署命令模板与默认容器名
+function toggleDockerConfigBox() {
+  const mode = $('editAppDeployMode').value;
+  const box = $('dockerConfigBox');
+  if (box) box.classList.toggle('hidden', mode !== 'docker');
+
+  const cmd = $('editAppDeployCmd');
+  const placeholder = mode === 'docker'
+    ? 'docker run -d --name {{.Container}} {{.Image}}:{{.Tag}}'
+    : 'kubectl apply -f {{.K8sYamlPath}}';
+  if (cmd) {
+    cmd.placeholder = placeholder;
+    // 切换了形态且命令还是另一形态的模板：替换成本形态的模板，避免"选了 Docker 仍去 kubectl apply"
+    const otherMode = mode === 'docker' ? cmd.value.trim().startsWith('kubectl ') : cmd.value.trim().startsWith('docker ');
+    if (otherMode) cmd.value = placeholder;
+  }
+
+  // 容器名默认跟随 Deployment / 应用名，与后端 normalize 的规则一致
+  const name = ($('editAppName').value || '').trim();
+  const dep = ($('editAppDeployment').value || '').trim() || name;
+  const dc = $('editAppDockerContainer');
+  if (dc && mode === 'docker' && !dc.value.trim()) dc.value = dep;
+
+  // 模板按钮只在对应形态下可用
+  const k8sOnly = mode !== 'docker';
+  ['tplYamlApplyBtn', 'tplSetImageBtn'].forEach((id) => {
+    const btn = $(id);
+    if (btn) btn.disabled = !k8sOnly;
+  });
+}
+
+// 未保存就关闭应用配置弹窗时，记下构建目录/构建命令草稿：少了这个，"编辑后不保存直接发布"会按旧配置构建失败
+function stashAppDraft() {
+  const id = $('editAppId').value;
+  if (!id) return;
+  state.appDrafts = state.appDrafts || {};
+  state.appDrafts[id] = {
+    buildDir: $('editAppBuildDir').value.trim(),
+    buildCmd: $('editAppBuildCmd').value.trim(),
+  };
 }
 
 window.editApp = function (id) {
@@ -1476,14 +1723,25 @@ async function saveApp() {
     namespace: $('editAppNamespace').value.trim() || 'default',
     deployment: $('editAppDeployment').value.trim() || name,
     container: $('editAppContainer').value.trim() || name,
+    deployMode: $('editAppDeployMode').value || 'k8s',
+    dockerContainer: $('editAppDockerContainer').value.trim(),
+    dockerPort: $('editAppDockerPort').value.trim(),
+    dockerVolumes: $('editAppDockerVolumes').value.trim(),
+    dockerEnv: $('editAppDockerEnv').value.trim(),
+    dockerRunOpts: $('editAppDockerRunOpts').value.trim(),
+    dockerHealthPath: $('editAppDockerHealthPath').value.trim(),
     rolloutTimeout: 300,
     autoRollback: true,
   };
 
   const res = await api('POST', '/api/apps', app);
-  if (!res.ok) return alert('保存应用失败: ' + res.data.error);
+  if (!res.ok) {
+    alert('保存应用失败: ' + res.data.error);
+    return;
+  }
 
   $('appModal').classList.add('hidden');
+  if (state.appDrafts) delete state.appDrafts[app.id];
   await refreshConfigs();
 }
 

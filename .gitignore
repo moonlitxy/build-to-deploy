@@ -14,5 +14,6 @@ configs/config.dev.yaml
 *.exe
 .DS_Store
 .idea/
+.claude/
 CLAUDE.md
 /tmp

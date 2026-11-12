@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"build-to-deploy/internal/shellrun"
 	"build-to-deploy/internal/sshpool"
 )
 
@@ -40,26 +41,15 @@ type PodInfo struct {
 }
 
 type Client struct {
-	Pool *sshpool.Pool
-	// dryRun 每次调用实时读取配置，与 pipeline.Engine 保持同一来源：
-	// 否则改配置后引擎真实执行、K8s 仍走模拟，会出现“回滚成功但实际没回滚”
-	dryRun func() bool
+	Pool shellrun.Runner
 }
 
-func (c *Client) isDryRun() bool { return c.dryRun != nil && c.dryRun() }
-
-func NewClient(pool *sshpool.Pool, dryRun func() bool) *Client {
-	return &Client{
-		Pool:   pool,
-		dryRun: dryRun,
-	}
+func NewClient(pool shellrun.Runner) *Client {
+	return &Client{Pool: pool}
 }
 
 // ListNamespaces 获取集群命名空间列表
 func (c *Client) ListNamespaces(ctx context.Context, srv *sshpool.ServerConfig) ([]string, error) {
-	if c.isDryRun() {
-		return []string{"default", "prod", "test", "kube-system"}, nil
-	}
 	out, err := c.Pool.ExecuteOutput(ctx, srv, "kubectl get namespaces -o jsonpath='{.items[*].metadata.name}'")
 	if err != nil {
 		return nil, fmt.Errorf("获取命名空间失败: %w", err)
@@ -71,45 +61,28 @@ func (c *Client) ListNamespaces(ctx context.Context, srv *sshpool.ServerConfig) 
 	return fields, nil
 }
 
-// ListPods 获取指定命名空间下的所有 Pod 及状态
+// AllNamespaces 是 API 层「全部命名空间」的查询值，内部映射为 allNamespacesPod 发送 kubectl get pods -A
+const AllNamespaces = allNamespacesPod
+
+// allNamespacesPod 是 ListPods 查询全集群时的命名空间占位符，输出中只保留 Pod 自身真实的 namespace
+const allNamespacesPod = "*"
+
+// ListPods 获取指定命名空间下的所有 Pod 及状态；namespace 为 allNamespacesPod 时查询全集群
 func (c *Client) ListPods(ctx context.Context, srv *sshpool.ServerConfig, namespace string) ([]PodInfo, error) {
+	all := namespace == allNamespacesPod
 	if namespace == "" {
 		namespace = "default"
 	}
-	// 命名空间校验放在 DryRun 分支之前，保证演练与真实模式行为一致
-	if err := CheckName("命名空间", namespace); err != nil {
-		return nil, err
-	}
-	if c.isDryRun() {
-		return []PodInfo{
-			{
-				Name:       "order-service-7d8b5c968-abc12",
-				Namespace:  namespace,
-				Status:     "Running",
-				Ready:      "1/1",
-				Restarts:   0,
-				Age:        "12m",
-				IP:         "10.244.1.34",
-				Node:       "node-worker-01",
-				Containers: []string{"order-service"},
-				Images:     []string{"harbor.example.com/app/order-service:v1.0.0"},
-			},
-			{
-				Name:       "order-service-7d8b5c968-xyz89",
-				Namespace:  namespace,
-				Status:     "Running",
-				Ready:      "1/1",
-				Restarts:   0,
-				Age:        "12m",
-				IP:         "10.244.2.56",
-				Node:       "node-worker-02",
-				Containers: []string{"order-service"},
-				Images:     []string{"harbor.example.com/app/order-service:v1.0.0"},
-			},
-		}, nil
+	if !all {
+		if err := CheckName("命名空间", namespace); err != nil {
+			return nil, err
+		}
 	}
 
 	cmd := fmt.Sprintf("kubectl get pods -n %s -o json", sshpool.ShellQuote(namespace))
+	if all {
+		cmd = "kubectl get pods -A -o json"
+	}
 	out, err := c.Pool.ExecuteOutput(ctx, srv, cmd)
 	if err != nil {
 		return nil, fmt.Errorf("查询 Pod 列表失败: %w", err)
@@ -218,10 +191,6 @@ func (c *Client) GetPodLogs(ctx context.Context, srv *sshpool.ServerConfig, name
 			return "", err
 		}
 	}
-	if c.isDryRun() {
-		return fmt.Sprintf("[dry-run] 日志示例 - Pod: %s, Namespace: %s, Container: %s\n2026-11-09T22:00:00Z INFO [main] Application started successfully\n2026-11-09T22:00:01Z INFO [http] Listening on :8080", pod, namespace, container), nil
-	}
-
 	cmd := fmt.Sprintf("kubectl logs -n %s %s --tail=%d", sshpool.ShellQuote(namespace), sshpool.ShellQuote(pod), tailLines)
 	if container != "" {
 		cmd += " -c " + sshpool.ShellQuote(container)
@@ -244,15 +213,6 @@ func (c *Client) RolloutStatus(ctx context.Context, w io.Writer, srv *sshpool.Se
 	if err := CheckName("Deployment", deployment); err != nil {
 		return err
 	}
-	if c.isDryRun() {
-		fmt.Fprintf(w, "[dry-run] kubectl -n %s rollout status deployment/%s --timeout=%ds\n", namespace, deployment, timeoutSec)
-		for i := 1; i <= 3; i++ {
-			time.Sleep(300 * time.Millisecond)
-			fmt.Fprintf(w, "Waiting for deployment rollout to finish: %d of 3 updated replicas are available...\n", i)
-		}
-		fmt.Fprintln(w, "deployment successfully rolled out")
-		return nil
-	}
 	cmd := fmt.Sprintf("kubectl -n %s rollout status deployment/%s --timeout=%ds", sshpool.ShellQuote(namespace), sshpool.ShellQuote(deployment), timeoutSec)
 	return c.Pool.RunCommand(ctx, srv, cmd, w)
 }
@@ -267,9 +227,6 @@ func (c *Client) RestartDeployment(ctx context.Context, srv *sshpool.ServerConfi
 	}
 	if err := CheckName("Deployment", deployment); err != nil {
 		return err
-	}
-	if c.isDryRun() {
-		return nil
 	}
 	cmd := fmt.Sprintf("kubectl -n %s rollout restart deployment/%s", sshpool.ShellQuote(namespace), sshpool.ShellQuote(deployment))
 	out, err := c.Pool.ExecuteOutput(ctx, srv, cmd)
@@ -291,10 +248,6 @@ func (c *Client) SetImage(ctx context.Context, w io.Writer, srv *sshpool.ServerC
 		return fmt.Errorf("镜像引用不合法: %q", image)
 	}
 	cmd := fmt.Sprintf("kubectl -n %s set image deployment/%s %s=%s", sshpool.ShellQuote(namespace), sshpool.ShellQuote(deployment), sshpool.ShellQuote(container), sshpool.ShellQuote(image))
-	if c.isDryRun() {
-		fmt.Fprintf(w, "[dry-run] $ %s\n", cmd)
-		return nil
-	}
 	return c.Pool.RunCommand(ctx, srv, cmd, w)
 }
 

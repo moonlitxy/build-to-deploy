@@ -19,7 +19,6 @@
     <span class="logo-icon">🚀</span>
     <span class="brand-text">Build-to-Deploy</span>
     <span class="sub-text">本地构建产物 → 远程服务器构建 & K8s 部署</span>
-    <span id="dryRunBadge" class="badge warn hidden">演练模式 (DryRun)</span>
   </div>
   <div style="display:flex;align-items:center;gap:14px;">
     <nav class="nav-tabs">
@@ -59,6 +58,7 @@
           <div class="path-item"><span class="p-label">📁 产物目录</span> <span id="pvArtifactDir" class="p-val">-</span></div>
           <div class="path-item"><span class="p-label">🔨 构建目录</span> <span id="pvBuildDir" class="p-val">-</span></div>
           <div class="path-item"><span class="p-label">📄 K8s 配置</span> <span id="pvYamlDir" class="p-val">-</span></div>
+          <div class="path-item hidden" id="pvDockerItem"><span class="p-label">🐳 Docker 容器</span> <span id="pvDocker" class="p-val">-</span></div>
           <div class="path-item"><span class="p-label">🏷️ 目标镜像</span> <span id="pvImage" class="p-val">-</span></div>
         </div>
 
@@ -202,9 +202,13 @@
             <select id="podServerSelect"></select>
           </div>
           <div class="filter-item">
+            <label>环境 (应用):</label>
+            <select id="podEnvSelect"></select>
+          </div>
+          <div class="filter-item">
             <label>命名空间 (Namespace):</label>
             <select id="podNamespaceSelect">
-              <option value="default">default</option>
+              <option value="">正在加载命名空间...</option>
             </select>
           </div>
           <button id="refreshPodsBtn" class="btn btn-secondary">
@@ -223,6 +227,7 @@
           <thead>
             <tr>
               <th>Pod 名称</th>
+              <th>命名空间</th>
               <th>状态</th>
               <th>就绪状态</th>
               <th>重启次数</th>
@@ -234,7 +239,7 @@
             </tr>
           </thead>
           <tbody id="podsTableBody">
-            <tr><td colspan="9" class="td-empty">请点击“刷新 Pod 列表”加载状态</td></tr>
+            <tr><td colspan="10" class="td-empty">请点击“刷新 Pod 列表”加载状态</td></tr>
           </tbody>
         </table>
       </div>
@@ -378,7 +383,7 @@
     <div class="modal-body">
       <p class="warn-text">检测到目标服务器或线上环境已存在与当前完全相同的镜像 Tag 版本：</p>
       <div id="conflictItems" class="conflict-list"></div>
-      <p class="warn-foot">继续发布将<strong>覆盖构建该镜像</strong>并执行 K8s 滚动更新。请确认是否强制覆盖？</p>
+      <p class="warn-foot" id="conflictFoot">继续发布将<strong>覆盖构建该镜像</strong>并执行 K8s 滚动更新。请确认是否强制覆盖？</p>
     </div>
     <div class="modal-footer">
       <button id="conflictCancelBtn" class="btn btn-secondary">取消发布</button>
@@ -519,6 +524,13 @@
             <option value="binary">通用可执行二进制</option>
           </select>
         </div>
+        <div class="form-group flex-1">
+          <label>部署形态</label>
+          <select id="editAppDeployMode">
+            <option value="k8s">K8s (Deployment 滚动发布)</option>
+            <option value="docker">Docker 容器 (宿主机 docker run)</option>
+          </select>
+        </div>
       </div>
 
       <div class="form-group">
@@ -624,6 +636,40 @@
         <div class="form-group flex-1">
           <label>容器名称 (Container)</label>
           <input type="text" id="editAppContainer" placeholder="order-service">
+        </div>
+      </div>
+
+      <!-- Docker 容器形态配置（部署形态选择 docker 时生效） -->
+      <div class="highlight-config-box hidden" id="dockerConfigBox">
+        <h4>🐳 Docker 容器部署配置 (不依赖 K8s，镜像直接在宿主机起容器)</h4>
+        <div class="form-row">
+          <div class="form-group flex-1">
+            <label>容器名 (DockerContainer)</label>
+            <input type="text" id="editAppDockerContainer" placeholder="如: shuili-mxpt-manager">
+            <div class="hint">留空时默认与 Deployment 同名；发布时同名容器会先被移除再启动</div>
+          </div>
+          <div class="form-group flex-1">
+            <label>端口映射 (宿主机:容器)</label>
+            <input type="text" id="editAppDockerPort" placeholder="如: 31530:8081">
+          </div>
+        </div>
+        <div class="form-group">
+          <label>卷映射 (逗号分隔)</label>
+          <input type="text" id="editAppDockerVolumes" placeholder="如: /data/app/upload:/app/uploadPath,/data/app/logs:/app/logs">
+        </div>
+        <div class="form-group">
+          <label>环境变量 (逗号分隔)</label>
+          <input type="text" id="editAppDockerEnv" placeholder="如: SPRING_PROFILES_ACTIVE=prod,TZ=Asia/Shanghai">
+        </div>
+        <div class="form-row">
+          <div class="form-group flex-1">
+            <label>其他 docker run 参数</label>
+            <input type="text" id="editAppDockerRunOpts" placeholder="如: --restart=always">
+          </div>
+          <div class="form-group flex-1">
+            <label>健康检查路径（容器内）</label>
+            <input type="text" id="editAppDockerHealthPath" placeholder="如: /actuator/health，留空只检查容器运行状态">
+          </div>
         </div>
       </div>
     </div>

@@ -2,7 +2,6 @@ server:
   listen: "127.0.0.1:8080"          # 本地页面访问地址: http://localhost:8080
   dataDir: "./data"        # 本地暂存文件与发布记录存放目录（相对启动时的工作目录，建议在项目根目录启动）
   maxUploadMB: 2048        # 支持上传最大产物大小(MB)
-  dryRun: false            # true 为演练模式(用于无网络环境模拟测试)
 
 # SSH 服务器长连接池配置（保活心跳常驻，避免频繁 SSH 握手触发限制）
 sshServers:
@@ -46,3 +45,13 @@ apps:
     container: "order-service"
     rolloutTimeout: 300
     autoRollback: true
+
+    # 4. 部署形态：k8s（默认，kubectl 滚动发布）或 docker（宿主机 docker run，单容器，不依赖 K8s）
+    deployMode: "k8s"
+    # 以下仅在 deployMode: docker 时生效（会拼进远程命令，只允许字母、数字与 . _ / = : @ + , -）
+    # dockerContainer: "order-service"        # 容器名，留空时取 Deployment
+    # dockerPort: "8080:8080"                 # 宿主端口:容器端口
+    # dockerVolumes: "/data/order/logs:/app/logs,/data/order/upload:/app/upload"
+    # dockerEnv: "TZ=Asia/Shanghai,SPRING_PROFILES_ACTIVE=prod"
+    # dockerRunOpts: "--restart=always"
+    # dockerHealthPath: "/actuator/health"    # 留空只检查容器 Running

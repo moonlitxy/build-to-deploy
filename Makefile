@@ -19,8 +19,7 @@ darwin:
 dev:
 	@if [ ! -f configs/config.dev.yaml ]; then \
 		sed -e 's|^  dataDir: "./data".*|  dataDir: "./data-dev"|' \
-		    -e 's|^  dryRun: false.*|  dryRun: true             # 演练模式：不连接远程主机，仅模拟构建与部署|' \
 		    configs/config.example.yaml > configs/config.dev.yaml; \
-		echo "已根据 configs/config.example.yaml 生成演练配置: configs/config.dev.yaml"; \
+		echo "已根据 configs/config.example.yaml 生成开发配置: configs/config.dev.yaml（连接真实环境）"; \
 	fi
 	go run $(MAIN) -config configs/config.dev.yaml
