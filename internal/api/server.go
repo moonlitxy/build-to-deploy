@@ -24,6 +24,7 @@ import (
 	"unicode"
 
 	"build-to-deploy/internal/config"
+	"build-to-deploy/internal/dockerops"
 	"build-to-deploy/internal/dockerrun"
 	"build-to-deploy/internal/k8s"
 	"build-to-deploy/internal/pipeline"
@@ -122,6 +123,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/precheck", s.precheck)
 	mux.HandleFunc("POST /api/artifacts/inspect", s.inspectArtifact)
 	mux.HandleFunc("GET /api/deploy-target", s.containerStatus)
+
+	// 部署形态：K8s / Docker 容器
+	mux.HandleFunc("GET /api/docker/images", s.listImages)
+	mux.HandleFunc("POST /api/docker/images/delete", s.deleteImages)
 
 	// K8s 命名空间与 Pod 状态监控（满足需求 3）
 	mux.HandleFunc("GET /api/k8s/namespaces", s.getNamespaces)
@@ -733,6 +738,183 @@ func (s *Server) containerStatus(w http.ResponseWriter, r *http.Request) {
 	out["image"] = image
 	out["running"] = status == "running"
 	writeJSON(w, http.StatusOK, out)
+}
+
+// ---------- 镜像维护（只读列表 + 用户显式删除） ----------
+
+// resolveAppServer 解析 appId 对应的应用与服务器，失败时已写出错误响应
+func (s *Server) resolveAppServer(w http.ResponseWriter, appID string) (*config.AppConfig, *sshpool.ServerConfig, bool) {
+	app := s.cfg.FindApp(appID)
+	if app == nil {
+		writeErr(w, http.StatusNotFound, "应用不存在")
+		return nil, nil, false
+	}
+	if strings.TrimSpace(app.Image) == "" {
+		writeErr(w, http.StatusBadRequest, "该应用尚未配置镜像名")
+		return nil, nil, false
+	}
+	srv := s.cfg.FindServer(app.ServerID)
+	if srv == nil {
+		writeErr(w, http.StatusBadRequest, "应用未绑定有效的 SSH 服务器")
+		return nil, nil, false
+	}
+	return app, srv, true
+}
+
+// protectedTags 本应用不可删除的版本：线上正在运行的版本 + 最近一次发布/回滚的版本
+func (s *Server) protectedTags(app *config.AppConfig) map[string]string {
+	out := map[string]string{}
+	prefix := app.Image + ":"
+	for _, rel := range s.engine.Store.List(app.ID, 1) {
+		if tag, ok := strings.CutPrefix(rel.Image, prefix); ok && tag != "" {
+			out[tag] = "最近一次发布的版本"
+		}
+	}
+	// 线上版本可能在列表之外（手工部署 / 回滚过），用一条轻量查询确认
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	srv := s.cfg.FindServer(app.ServerID)
+	if srv == nil {
+		return out
+	}
+	var out2 string
+	if app.DeployMode == config.DeployModeDocker {
+		if insp, err := dockerrun.InspectCmdFor(app); err == nil {
+			if raw, err := s.run.ExecuteOutput(ctx, srv, insp); err == nil {
+				_, out2 = dockerrun.ParseInspect(raw)
+			}
+		}
+	} else {
+		cmd := fmt.Sprintf("kubectl -n %s get deployment %s -o jsonpath=%s",
+			sshpool.ShellQuote(app.Namespace), sshpool.ShellQuote(app.Deployment),
+			sshpool.ShellQuote(fmt.Sprintf(`{.spec.template.spec.containers[?(@.name=="%s")].image}`, app.Container)))
+		if raw, err := s.run.ExecuteOutput(ctx, srv, cmd); err == nil {
+			out2 = strings.TrimSpace(raw)
+		}
+	}
+	if tag, ok := strings.CutPrefix(out2, prefix); ok && tag != "" {
+		out[tag] = "线上正在运行的版本"
+	}
+	return out
+}
+
+// listImages 列出应用镜像仓库下的所有 tag，并标注可删除 / 受保护
+func (s *Server) listImages(w http.ResponseWriter, r *http.Request) {
+	if !s.requireConn(w) {
+		return
+	}
+	app, srv, ok := s.resolveAppServer(w, r.URL.Query().Get("appId"))
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 40*time.Second)
+	defer cancel()
+	images, listErr := dockerops.List(ctx, s.run, srv, app.Image)
+	used, usedErr := dockerops.UsedTags(ctx, s.run, srv, app.Image)
+	protected := s.protectedTags(app)
+
+	views := make([]dockerops.Image, 0, len(images))
+	for _, img := range images {
+		img.InUse = used[img.Tag]
+		if reason, ok := protected[img.Tag]; ok {
+			img.Protected = true
+			img.ProtectedReason = reason
+		}
+		views = append(views, img)
+	}
+	resp := map[string]any{
+		"appId":  app.ID,
+		"image":  app.Image,
+		"server": srv.Host,
+		"images": views,
+	}
+	if listErr != nil {
+		resp["error"] = listErr.Error()
+	}
+	if usedErr != nil {
+		resp["warning"] = "无法确认容器引用关系，所有镜像都不会被标记为使用中: " + usedErr.Error()
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// deleteImages 删除用户显式勾选的镜像 tag；受保护或被容器引用的 tag 一律拒绝
+func (s *Server) deleteImages(w http.ResponseWriter, r *http.Request) {
+	if !s.requireConn(w) {
+		return
+	}
+	var req struct {
+		AppID string   `json:"appId"`
+		Refs  []string `json:"refs"`
+	}
+	if err := readJSON(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if len(req.Refs) == 0 {
+		writeErr(w, http.StatusBadRequest, "请先勾选要删除的镜像")
+		return
+	}
+	if len(req.Refs) > 200 {
+		writeErr(w, http.StatusBadRequest, "一次最多删除 200 个镜像")
+		return
+	}
+	app, srv, ok := s.resolveAppServer(w, req.AppID)
+	if !ok {
+		return
+	}
+	// 重新核对当前状态：页面上的标记可能已过期（期间有人发过版、起了容器）
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	used, usedErr := dockerops.UsedTags(ctx, s.run, srv, app.Image)
+	if usedErr != nil {
+		writeErr(w, http.StatusInternalServerError, "无法确认容器引用关系，已取消删除: "+usedErr.Error())
+		return
+	}
+	protected := s.protectedTags(app)
+	prefix := app.Image + ":"
+	var removed, skipped []string
+	for _, ref := range req.Refs {
+		tag, ok := strings.CutPrefix(ref, prefix)
+		if !ok {
+			writeErr(w, http.StatusBadRequest, fmt.Sprintf("镜像引用 %q 不属于应用 %s 的镜像仓库", ref, app.ID))
+			return
+		}
+		if reason, ok := protected[tag]; ok {
+			skipped = append(skipped, fmt.Sprintf("%s（%s）", ref, reason))
+			continue
+		}
+		if used[tag] {
+			skipped = append(skipped, fmt.Sprintf("%s（正被容器使用）", ref))
+			continue
+		}
+		removed = append(removed, ref)
+	}
+	output := ""
+	if len(removed) > 0 {
+		var err error
+		output, err = dockerops.Remove(ctx, s.run, srv, app.Image, removed)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, "删除镜像失败: "+err.Error()+optionalOutput(output))
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"removed": removed,
+		"skipped": skipped,
+		"output":  output,
+	})
+}
+
+// optionalOutput 把远程命令输出拼进错误信息，便于页面展示失败原因
+func optionalOutput(out string) string {
+	out = strings.TrimSpace(out)
+	if out == "" {
+		return ""
+	}
+	if len(out) > 500 {
+		out = out[:500] + "..."
+	}
+	return "\n" + out
 }
 
 // ---------- 构建输入指纹预检（上传前判断新 Tag 是否是同一个镜像） ----------

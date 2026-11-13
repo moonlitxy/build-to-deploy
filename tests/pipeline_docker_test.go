@@ -35,6 +35,18 @@ func newFakeSSH() *fakeSSH {
 	return &fakeSSH{outputs: map[string]string{}, files: map[string]string{}}
 }
 
+// rollbackImagesExist 让假执行器对"回滚前的镜像存在性检查"返回 exit=0（镜像仍在服务器上），
+// 其余命令沿用原假执行器的规则。
+func rollbackImagesExist(f *fakeSSH) *fakeSSH {
+	g := newFakeSSH()
+	g.outputs = f.outputs
+	g.files = f.files
+	g.runErr = f.runErr
+	g.execErr = f.execErr
+	g.outputs["docker image inspect -f"] = "0"
+	return g
+}
+
 func (f *fakeSSH) RunCommand(ctx context.Context, srv *sshpool.ServerConfig, cmd string, w io.Writer) error {
 	f.mu.Lock()
 	f.runs = append(f.runs, cmd)
@@ -317,7 +329,7 @@ func TestPDockerDockerModeCanceledSkipsRollback(t *testing.T) {
 }
 
 func TestPDockerDockerModeRollbackRelease(t *testing.T) {
-	eng, _, st, _, app := newDockerTestEnv(t)
+	eng, _, st, fake, app := newDockerTestEnv(t)
 	first, err := eng.StartDeploy(pipeline.StartRequest{AppID: app.ID, Tag: "v1.0.0", UseLocalArtifact: true})
 	if err != nil {
 		t.Fatal(err)
@@ -336,6 +348,9 @@ func TestPDockerDockerModeRollbackRelease(t *testing.T) {
 	for pipeline.IsRunning(eng, app.ID) && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
+
+	// 回滚前会确认目标镜像仍在服务器上：假执行器返回 exit=0 表示存在
+	eng.SSH = rollbackImagesExist(fake)
 
 	rb, err := eng.StartRollback(pipeline.RollbackRequest{ReleaseID: first.ID})
 	if err != nil {

@@ -675,6 +675,17 @@ func (e *Engine) StartRollback(req RollbackRequest) (*store.Release, error) {
 	if !imageRefRe.MatchString(target.Image) {
 		return nil, fmt.Errorf("历史记录镜像引用不合法 (%q)，无法回滚", target.Image)
 	}
+	// 平台不再自动删除旧镜像，但服务器上的镜像可能被手工清理或被 docker 回收：
+	// 启动回滚前先确认目标镜像仍在，避免 rollback 跑到一半才失败、留下半套记录。
+	checkCtx, checkCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	missing, checkErr := e.checkImageExists(checkCtx, srv, target.Image)
+	checkCancel()
+	if checkErr != nil {
+		return nil, fmt.Errorf("确认目标镜像 %s 是否存在失败: %w", target.Image, checkErr)
+	}
+	if missing {
+		return nil, fmt.Errorf("目标镜像 %s 已不在服务器 %s 上，无法回滚；请先在服务器上恢复该镜像或重新发布该版本", target.Image, srv.Host)
+	}
 
 	stages := []store.Stage{
 		{Name: "deploy", Title: "执行 K8s 镜像更新", Status: store.StatusPending},
@@ -1314,6 +1325,20 @@ func (r *pipelineRunner) refsForImage(cur string) []string {
 	return []string{cur}
 }
 
+// checkImageExists 确认镜像引用在服务器上仍然存在；missing 为 true 表示已不存在。
+// 用 docker image inspect 而非 docker images：前者对 tag、摘要（repo@sha256:...）都能识别。
+func (e *Engine) checkImageExists(ctx context.Context, srv *sshpool.ServerConfig, ref string) (missing bool, err error) {
+	if !imageRefRe.MatchString(ref) {
+		return false, fmt.Errorf("镜像引用不合法: %q", ref)
+	}
+	cmd := fmt.Sprintf("docker image inspect -f %s %s >/dev/null 2>&1; echo $?", shellQuote("{{.Id}}"), shellQuote(ref))
+	out, err := e.SSH.ExecuteOutput(ctx, srv, cmd)
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(out) != "0", nil
+}
+
 // fingerprintKey 标签里存的指纹：只保留前 26 位，足够区分不同构建输入
 func (r *pipelineRunner) fingerprintKey(fp string) string {
 	return fp
@@ -1534,6 +1559,7 @@ func (r *pipelineRunner) autoRollbackDocker(cause error, reason string) {
 func (r *pipelineRunner) runRollback() error {
 	r.hub.Logf(fmt.Sprintf("==> 🚨 开始回滚应用: %s [目标版本: %s]", r.app.Name, r.rel.Tag))
 	r.hub.Logf(fmt.Sprintf("==> 目标镜像: %s", r.rel.Image))
+	r.hub.Logf(fmt.Sprintf("==> 已确认目标镜像仍存在于服务器 %s 上", r.srv.Host))
 	if r.rel.RollbackOf != "" {
 		r.hub.Logf(fmt.Sprintf("==> 关联历史版本记录: %s", r.rel.RollbackOf))
 	}

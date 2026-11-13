@@ -203,8 +203,33 @@ func TestPMoreNoReuseForcesRebuild(t *testing.T) {
 	}
 }
 
+// 回滚前的镜像存在性检查：远程命令失败或引用非法时都要明确报错，而不是放行
+func TestPMoreRollbackImageCheckErrors(t *testing.T) {
+	eng, _, st, fake, app := newScriptedEnv(t, config.DeployModeK8s)
+	first, err := eng.StartDeploy(pipeline.StartRequest{AppID: app.ID, Tag: "v1.0.0", UseLocalArtifact: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitDoneStrict(t, st, first.ID)
+	deadline := time.Now().Add(3 * time.Second)
+	for pipeline.IsRunning(eng, app.ID) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	// 远程查询失败
+	fake.execErr = errors.New("ssh 断开")
+	if _, err := eng.StartRollback(pipeline.RollbackRequest{ReleaseID: first.ID}); err == nil || !strings.Contains(err.Error(), "是否存在失败") {
+		t.Fatalf("远程失败应报错: %v", err)
+	}
+	// 调用方先校验过引用，这里再覆盖一次函数级白名单
+	fake.execErr = nil
+	exists, err := pipeline.CheckImageExistsForTest(context.Background(), eng, eng.Cfg.SSHServers[0], "bad ref;rm -rf")
+	if err == nil || exists {
+		t.Fatalf("非法引用应报错: exists=%v err=%v", exists, err)
+	}
+}
+
 func TestPMoreRollbackErrorsAndTargets(t *testing.T) {
-	eng, _, st, _, app := newScriptedEnv(t, config.DeployModeK8s)
+	eng, _, st, fake, app := newScriptedEnv(t, config.DeployModeK8s)
 	first, err := eng.StartDeploy(pipeline.StartRequest{AppID: app.ID, Tag: "v1.0.0", UseLocalArtifact: true})
 	if err != nil {
 		t.Fatal(err)
@@ -213,6 +238,19 @@ func TestPMoreRollbackErrorsAndTargets(t *testing.T) {
 	if _, err := eng.StartRollback(pipeline.RollbackRequest{ReleaseID: "missing"}); err == nil {
 		t.Fatal("不存在的历史记录应报错")
 	}
+	// 回滚前会确认目标镜像仍在服务器上：先模拟"镜像已被清理"，应拒绝回滚且不建记录
+	fake.addRules(scriptRule{"docker image inspect -f", "1"})
+	if _, err := eng.StartRollback(pipeline.RollbackRequest{ReleaseID: first.ID}); err == nil {
+		t.Fatal("目标镜像不存在时应拒绝回滚")
+	} else if !strings.Contains(err.Error(), "已不在服务器") {
+		t.Fatalf("错误信息应说明镜像不存在: %v", err)
+	}
+	if rels := st.List(app.ID, 0); len(rels) != 1 {
+		t.Fatalf("拒绝回滚时不应创建发布记录: %d 条", len(rels))
+	}
+	// 镜像恢复后可以正常回滚（scriptedRunner 按顺序命中第一条匹配规则）
+	fake.rules = nil
+	fake.addRules(scriptRule{"docker image inspect -f", "0"})
 	rb, err := eng.StartRollback(pipeline.RollbackRequest{ReleaseID: first.ID})
 	if err != nil {
 		t.Fatal(err)
@@ -221,8 +259,9 @@ func TestPMoreRollbackErrorsAndTargets(t *testing.T) {
 	if done.Kind != "rollback" || done.RollbackOf != first.ID {
 		t.Fatalf("回滚记录 = %+v", done)
 	}
-	if !strings.Contains(readLogFile(t, eng, rb.ID), "开始回滚") {
-		t.Fatal("回滚日志缺失")
+	log := readLogFile(t, eng, rb.ID)
+	if !strings.Contains(log, "开始回滚") || !strings.Contains(log, "已确认目标镜像仍存在") {
+		t.Fatalf("回滚日志缺失:\n%s", log)
 	}
 }
 

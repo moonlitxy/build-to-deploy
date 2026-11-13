@@ -29,11 +29,17 @@ type fakeRunner struct {
 	cmds    []string
 	outputs map[string]string
 	err     error
+	// runErr / runOut 仅作用于 RunCommand：模拟远程命令失败并带回一段输出
+	runErr error
+	runOut string
 }
 
 func (f *fakeRunner) RunCommand(ctx context.Context, srv *sshpool.ServerConfig, cmd string, w io.Writer) error {
 	f.cmds = append(f.cmds, cmd)
-	return nil
+	if f.runOut != "" {
+		_, _ = io.WriteString(w, f.runOut)
+	}
+	return f.runErr
 }
 func (f *fakeRunner) ExecuteOutput(ctx context.Context, srv *sshpool.ServerConfig, cmd string) (string, error) {
 	f.cmds = append(f.cmds, cmd)

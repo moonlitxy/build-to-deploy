@@ -5,6 +5,7 @@ import (
 	"io"
 
 	"build-to-deploy/internal/config"
+	"build-to-deploy/internal/sshpool"
 )
 
 // 集中测试（tests/）使用的导出入口：包装包内步骤，生产代码不调用。
@@ -53,4 +54,9 @@ func RunLocalCommandForTest(ctx context.Context, workDir, cmd string, w io.Write
 // FileStatAndSHA256ForTest 包装 fileStatAndSHA256
 func FileStatAndSHA256ForTest(path string) (string, int64, string, error) {
 	return fileStatAndSHA256(path)
+}
+
+// CheckImageExistsForTest 包装 Engine.checkImageExists：回滚前确认目标镜像仍在服务器上
+func CheckImageExistsForTest(ctx context.Context, e *Engine, srv *sshpool.ServerConfig, ref string) (bool, error) {
+	return e.checkImageExists(ctx, srv, ref)
 }

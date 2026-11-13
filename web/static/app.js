@@ -1,6 +1,7 @@
 'use strict';
 
 const $ = (id) => document.getElementById(id);
+const ic = (name, cls = 'icon') => `<svg class="${cls}" aria-hidden="true"><use href="#i-${name}"></use></svg>`;
 const CHUNK_SIZE = 4 * 1024 * 1024;
 const TAG_RE = /^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$/;
 const PREFS_KEY = 'btd_user_prefs_v1';
@@ -19,6 +20,8 @@ const state = {
   isDeploying: false,
   // 全局 SSH 连接开关：服务启动后为 false，用户点击"连接服务器"后变 true
   connEnabled: false,
+  // 镜像维护页状态：当前选中的应用与其镜像列表
+  imageMaint: { appId: '', images: [] },
   pendingReleaseParams: null,
   prefs: {
     selectedAppId: '',
@@ -186,6 +189,10 @@ function setupTabs() {
       if (btn.dataset.tab === 'history') {
         loadHistory();
       }
+      if (btn.dataset.tab === 'config') {
+        // 镜像维护列表：只同步按钮状态，不自动访问远程
+        syncDeleteImagesBtn();
+      }
     });
   });
 }
@@ -215,6 +222,7 @@ function renderAppSelects() {
   }
   $('historyAppFilter').innerHTML = '<option value="">全部应用</option>' + opts;
   renderPodSelects();
+  renderImageAppSelect();
 }
 
 // Pod 页面服务器下拉：Pod 状态由后台定时静默刷新，服务器/命名空间才是筛选条件
@@ -235,18 +243,18 @@ async function refreshContainerStatus(appId) {
   if (!el) return;
   // 未连接服务器时不探测远程容器状态：启动/刷新页面要保持纯本地
   if (!state.connEnabled) {
-    el.innerHTML += ' <span style="color:#6b7280">（未连接服务器，不查询状态）</span>';
+    el.innerHTML += ' <span style="color:var(--text-muted)">（未连接服务器，不查询状态）</span>';
     return;
   }
   const res = await api('GET', `/api/deploy-target?appId=${encodeURIComponent(appId)}`);
   if (!res.ok || !res.data || res.data.deployMode !== 'docker') return;
   const st = res.data.status;
   if (st === 'running') {
-    el.innerHTML += ` <span style="color:#059669">✅ 运行中${res.data.image ? ' · ' + escapeHtml(res.data.image) : ''}</span>`;
+    el.innerHTML += ` <span style="color:var(--success-text)">${ic('check', 'icon icon-inline')} 运行中${res.data.image ? ' · ' + escapeHtml(res.data.image) : ''}</span>`;
   } else if (st) {
-    el.innerHTML += ` <span style="color:#d97706">⚠️ ${escapeHtml(st)}</span>`;
+    el.innerHTML += ` <span style="color:var(--warning-text)">${ic('alert', 'icon icon-inline')} ${escapeHtml(st)}</span>`;
   } else if (!res.data.error) {
-    el.innerHTML += ' <span style="color:#6b7280">（容器不存在，发布时创建）</span>';
+    el.innerHTML += ' <span style="color:var(--text-muted)">（容器不存在，发布时创建）</span>';
   }
 }
 
@@ -276,7 +284,7 @@ function updatePathPreview({ probeRemote = true } = {}) {
   if (isDocker) {
     $('pvYamlDir').textContent = 'Docker 容器形态（不依赖 K8s）';
   } else if (app.k8sYamlDir && app.k8sYamlFile) {
-    $('pvYamlDir').innerHTML = `<span>${escapeHtml(app.k8sYamlDir)}/</span><strong style="color:#2563eb">${escapeHtml(app.k8sYamlFile)}</strong>`;
+    $('pvYamlDir').innerHTML = `<span>${escapeHtml(app.k8sYamlDir)}/</span><strong style="color:var(--primary)">${escapeHtml(app.k8sYamlFile)}</strong>`;
   } else {
     $('pvYamlDir').textContent = app.k8sYamlFile || app.k8sYamlDir || '未配置';
   }
@@ -292,7 +300,7 @@ function updatePathPreview({ probeRemote = true } = {}) {
   }
   const curTag = $('tagInput').value.trim() || '<Tag>';
   $('pvImage').innerHTML = app.image
-    ? `<span>${escapeHtml(app.image)}:</span><strong style="color:#059669">${escapeHtml(curTag)}</strong>`
+    ? `<span>${escapeHtml(app.image)}:</span><strong style="color:var(--success-text)">${escapeHtml(curTag)}</strong>`
     : '未配置';
 
   // 更新本地编译配置预览
@@ -320,7 +328,7 @@ async function inspectLocalArtifact(appId) {
   if (!info.configured) {
     quickBox.classList.add('missing');
     badgeEl.textContent = '未设置默认产物路径';
-    pathEl.textContent = '可点击右侧“📄 选择文件”选取本地产物并自动记住该路径';
+    pathEl.textContent = '可点击右侧“选择文件”选取本地产物并自动记住该路径';
     checkEl.checked = false;
     checkEl.disabled = true;
     updateDropZoneVisual();
@@ -339,7 +347,7 @@ async function inspectLocalArtifact(appId) {
     }
   } else {
     quickBox.classList.add('missing');
-    badgeEl.textContent = '本地暂未生成此文件 (可点击右侧“📄 选择文件”重新指定)';
+    badgeEl.textContent = '本地暂未生成此文件';
     checkEl.checked = false;
     checkEl.disabled = true;
   }
@@ -364,10 +372,10 @@ function switchDeployMode(mode, persist = true) {
   const startBtn = $('startDeployBtn');
   if (isLocalBuild) {
     startBtn.classList.add('mode-local-build');
-    startBtn.innerHTML = '<span class="btn-icon">⚡</span> 执行本地编译并上传部署';
+    startBtn.innerHTML = `${ic('bolt')} 执行本地编译并上传部署`;
   } else {
     startBtn.classList.remove('mode-local-build');
-    startBtn.innerHTML = '<span class="btn-icon">🚀</span> 开始上传并构建部署';
+    startBtn.innerHTML = `${ic('arrow-up')} 开始上传并构建部署`;
   }
 }
 
@@ -633,13 +641,30 @@ function setupButtons() {
   if ($('connectSrvBtn')) {
     $('connectSrvBtn').addEventListener('click', connectCurrentServer);
   }
+  if ($('refreshImagesBtn')) {
+    $('refreshImagesBtn').addEventListener('click', loadImages);
+  }
+  if ($('deleteImagesBtn')) {
+    $('deleteImagesBtn').addEventListener('click', deleteSelectedImages);
+  }
+  if ($('imageMaintList')) {
+    $('imageMaintList').addEventListener('change', (e) => {
+      if (e.target.matches('input[data-image-ref]')) syncDeleteImagesBtn();
+    });
+  }
+  if ($('imageMaintAppSelect')) {
+    $('imageMaintAppSelect').addEventListener('change', () => {
+      state.imageMaint = { appId: $('imageMaintAppSelect').value, images: [] };
+      renderImages();
+    });
+  }
   $('disconnectAllBtn').addEventListener('click', disconnectAllConnections);
   $('tagInput').addEventListener('input', () => {
     const appId = $('deployAppSelect').value;
     const app = state.apps.find((a) => a.id === appId);
     if (app && app.image) {
       const curTag = $('tagInput').value.trim() || '<Tag>';
-      $('pvImage').innerHTML = `<span>${escapeHtml(app.image)}:</span><strong style="color:#059669">${escapeHtml(curTag)}</strong>`;
+      $('pvImage').innerHTML = `<span>${escapeHtml(app.image)}:</span><strong style="color:var(--success-text)">${escapeHtml(curTag)}</strong>`;
     }
   });
 
@@ -694,7 +719,7 @@ async function onStartDeployClick() {
     }
   } else {
     if (!state.selectedFile && !useDefaultArtifact) {
-      return alert('请先选择本地构建产物文件，或切换至“⚡ 本地一键编译并上传”模式');
+      return alert('请先选择本地构建产物文件，或切换至“本地一键编译并上传”模式');
     }
   }
 
@@ -763,7 +788,7 @@ async function onStartDeployClick() {
 }
 
 function showConflictModal(conflicts, tag) {
-  const itemsHtml = conflicts.map((c) => `<div class="conflict-item">⚠️ [${c.source}] ${escapeHtml(c.message)}</div>`).join('');
+  const itemsHtml = conflicts.map((c) => `<div class="conflict-item">[${c.source}] ${escapeHtml(c.message)}</div>`).join('');
   $('conflictItems').innerHTML = itemsHtml;
   // 只有"同内容镜像"类冲突时，说明覆盖不会产生新镜像：把提示尾注也换掉，避免让用户以为会重新构建
   const imageOnly = conflicts.every((c) => c.kind === 'image');
@@ -799,8 +824,8 @@ function showImageDupModal(info) {
   const sha = info.sha256 ? escapeHtml(info.sha256) : '';
   $('conflictItems').innerHTML = `
     <div class="conflict-item">🔎 产物 SHA256 校验：<code>${sha ? sha.slice(0, 24) + '…' : '未计算出摘要'}</code>（${sha ? '完整摘要与前次一致' : '无法比对'}）</div>
-    <div class="conflict-item">⚠️ [fingerprint] 本次产物内容与构建上下文（Dockerfile 等）和${info.prevTag ? '已验证版本 ' + escapeHtml(info.prevTag) : '历史版本'}完全相同</div>
-    <div class="conflict-item">🏷️ 将要创建的版本：${img(info.tag)}${info.prevTag ? '（与 ' + img(info.prevTag) + (info.createdAt ? '，' + fmtTime(info.createdAt) : '') + ' 内容一致）' : ''}</div>
+    <div class="conflict-item">[fingerprint] 本次产物内容与构建上下文（Dockerfile 等）和${info.prevTag ? '已验证版本 ' + escapeHtml(info.prevTag) : '历史版本'}完全相同</div>
+    <div class="conflict-item">将要创建的版本：${img(info.tag)}${info.prevTag ? '（与 ' + img(info.prevTag) + (info.createdAt ? '，' + fmtTime(info.createdAt) : '') + ' 内容一致）' : ''}</div>
     <div class="conflict-item">🧩 构建命令${info.tagFree ? '不引用 Tag' : '中产物与上下文均未变化'}，重建只会得到同一个镜像</div>`;
   const foot = $('conflictFoot');
   if (foot) {
@@ -1076,9 +1101,9 @@ function listenReleaseEvents(releaseId, isReconnect = false) {
 function renderStages(stages) {
   if (!stages || stages.length === 0) return;
   const html = stages.map((s) => {
-    const icon = s.status === 'success' ? '✔' : s.status === 'failed' ? '✖' : s.status === 'running' ? '⏳' : '○';
+    const iconName = s.status === 'success' ? 'check' : s.status === 'failed' ? 'x' : s.status === 'running' ? 'loader' : 'circle';
     return `<div class="stage-chip ${s.status}">
-      <span>${icon}</span>
+      ${ic(iconName, 'icon stage-icon')}
       <span>${escapeHtml(s.title)}</span>
     </div>`;
   }).join('');
@@ -1135,6 +1160,117 @@ function updateStatus(status, text) {
 }
 
 // ---------------- 配置备份与回滚（按服务） ----------------
+// ---------------- 镜像维护：平台不自动删除镜像，仅在此处由用户显式勾选 ----------------
+function renderImageAppSelect() {
+  const sel = $('imageMaintAppSelect');
+  if (!sel) return;
+  const prev = sel.value || state.prefs.imageMaintAppId || '';
+  sel.innerHTML = state.apps
+    .map((a) => `<option value="${escapeHtml(a.id)}">${escapeHtml(a.name)} · ${escapeHtml(a.image || '未配置镜像')}</option>`)
+    .join('');
+  if (prev && state.apps.some((a) => a.id === prev)) {
+    sel.value = prev;
+  }
+}
+
+async function loadImages() {
+  const appId = $('imageMaintAppSelect').value;
+  const hint = $('imageMaintHint');
+  if (!appId) {
+    hint.textContent = '请先选择应用。';
+    return;
+  }
+  if (!state.connEnabled) {
+    hint.textContent = '尚未连接服务器：请先点击顶部的「连接服务器」，再刷新镜像列表。';
+    return;
+  }
+  state.prefs.imageMaintAppId = appId;
+  savePrefs();
+  hint.textContent = '正在读取服务器上的镜像列表...';
+  const res = await api('GET', `/api/docker/images?appId=${encodeURIComponent(appId)}`);
+  if (!res.ok) {
+    hint.textContent = `读取失败: ${res.data.error || res.status}`;
+    state.imageMaint = { appId, images: [] };
+    renderImages();
+    return;
+  }
+  state.imageMaint = { appId, images: res.data.images || [] };
+  const parts = [`共 ${state.imageMaint.images.length} 个镜像（${res.data.image} @ ${res.data.server}）`];
+  if (res.data.error) parts.push(`读取出错: ${res.data.error}`);
+  if (res.data.warning) parts.push(res.data.warning);
+  hint.textContent = parts.join(' · ');
+  renderImages();
+}
+
+function renderImages() {
+  const list = $('imageMaintList');
+  if (!list) return;
+  const images = state.imageMaint.images || [];
+  if (images.length === 0) {
+    list.innerHTML = '<p class="config-sub-hint" style="padding:8px 0;">暂无镜像，或尚未刷新。</p>';
+    syncDeleteImagesBtn();
+    return;
+  }
+  const rows = images
+    .map((img) => {
+      const ref = `${state.apps.find((a) => a.id === state.imageMaint.appId)?.image || ''}:${img.tag}`;
+      const disabled = img.protected || img.inUse;
+      const badge = img.protected
+        ? `<span class="tag-badge" style="color:var(--success-text);">受保护 · ${escapeHtml(img.protectedReason || '')}</span>`
+        : img.inUse
+          ? '<span class="tag-badge" style="color:var(--warning-text);">被容器使用</span>'
+          : '<span class="tag-badge" style="color:var(--text-muted);">可删除</span>';
+      return `<tr>
+        <td><input type="checkbox" data-image-ref="${escapeHtml(ref)}" data-image-tag="${escapeHtml(img.tag)}" ${disabled ? 'disabled' : ''}></td>
+        <td><code>${escapeHtml(img.tag)}</code></td>
+        <td>${escapeHtml(img.id || '-')}</td>
+        <td>${escapeHtml(img.size || '-')}</td>
+        <td>${escapeHtml(img.createdAt || '-')}</td>
+        <td>${badge}</td>
+      </tr>`;
+    })
+    .join('');
+  list.innerHTML = `<div class="table-responsive"><table class="data-table">
+    <thead><tr><th style="width:40px;"></th><th>Tag</th><th>镜像 ID</th><th>大小</th><th>创建时间</th><th>状态</th></tr></thead>
+    <tbody>${rows}</tbody></table></div>`;
+  syncDeleteImagesBtn();
+}
+
+function selectedImageRefs() {
+  return Array.from(document.querySelectorAll('#imageMaintList input[data-image-ref]:checked')).map((el) => el.dataset.imageRef);
+}
+
+function syncDeleteImagesBtn() {
+  const btn = $('deleteImagesBtn');
+  if (!btn) return;
+  const n = selectedImageRefs().length;
+  btn.disabled = n === 0 || !state.connEnabled;
+  btn.textContent = n > 0 ? `删除勾选镜像 (${n})` : '删除勾选镜像';
+}
+
+async function deleteSelectedImages() {
+  const refs = selectedImageRefs();
+  if (refs.length === 0) return;
+  const appId = state.imageMaint.appId;
+  if (!appId) return;
+  const ok = confirm(`确认删除以下 ${refs.length} 个镜像？删除后无法回滚到这些版本：\n\n${refs.join('\n')}`);
+  if (!ok) return;
+  const res = await api('POST', '/api/docker/images/delete', { appId, refs });
+  if (!res.ok) {
+    alert(`✖ 删除失败: ${res.data.error || res.status}`);
+    return;
+  }
+  const removed = res.data.removed || [];
+  const skipped = res.data.skipped || [];
+  const lines = [];
+  if (removed.length) lines.push(`已删除 ${removed.length} 个镜像`);
+  if (skipped.length) lines.push(`跳过 ${skipped.length} 个：\n${skipped.join('\n')}`);
+  alert(lines.join('\n\n') || '没有删除任何镜像');
+  await loadImages();
+}
+
+// ---------------- 配置备份 ----------------
+
 // 备份文件名形如 order-service_v1.2.0_20261112-201500.000000000.yaml：
 // 一眼能看出是哪个服务、哪个版本、什么时候的配置；恢复只替换该服务。
 async function loadAppBackups() {
@@ -1331,7 +1467,7 @@ function renderPodsTable(pods) {
       <td>
         <div style="display:flex;gap:6px;">
           <button class="btn btn-secondary btn-sm" onclick="viewPodLog('${escapeHtml(p.name)}')">查看日志</button>
-          <button class="btn btn-secondary btn-sm" title="滚动重启该 Deployment" onclick="restartPodDeployment('${escapeHtml(p.name)}')">🔄 重启</button>
+          <button class="btn btn-secondary btn-sm" title="滚动重启该 Deployment" onclick="restartPodDeployment('${escapeHtml(p.name)}')">${ic('refresh')} 重启</button>
         </div>
       </td>
     </tr>`;
@@ -1562,8 +1698,8 @@ function renderServerDetail() {
   }
   const isConnected = state.activeServerIds.includes(s.id);
   const statusBadge = isConnected
-    ? '<span class="pod-status-badge pod-status-running">🟢 已建立长连接</span>'
-    : '<span class="pod-status-badge pod-status-offline">⚪ 未连接</span>';
+    ? '<span class="pod-status-badge pod-status-running">已建立长连接</span>'
+    : '<span class="pod-status-badge pod-status-offline">未连接</span>';
   panel.innerHTML = `
     <div class="server-detail-head">
       <span class="server-detail-name">${escapeHtml(s.name)}</span>
@@ -1583,7 +1719,7 @@ function renderServerDetail() {
     discBtn.disabled = !isConnected;
   }
   const connBtn = $('configConnectBtn');
-  if (connBtn) connBtn.innerHTML = isConnected ? '🔄 重新检测' : '⚡ 连接';
+  if (connBtn) connBtn.innerHTML = isConnected ? `${ic('refresh')} 重新检测` : `${ic('bolt')} 连接`;
 }
 
 async function connectCurrentServer() {
@@ -1636,6 +1772,7 @@ async function updateConnStatus() {
   ]);
   // 服务端开关是唯一权威来源：页面刷新后据此恢复，不会因此自动连接
   if (modeRes.ok) state.connEnabled = !!modeRes.data.enabled;
+  syncDeleteImagesBtn();
   if (res.ok) {
     const count = res.data.count || 0;
     state.activeServerIds = res.data.active || [];
@@ -1661,7 +1798,7 @@ async function updateConnStatus() {
       if (discBtn) discBtn.classList.remove('hidden');
     } else {
       if (dot) dot.classList.remove('connected');
-      txt.textContent = 'SSH 未连接 · 不会自动连接服务器';
+      txt.textContent = 'SSH 未连接';
       txt.className = 'conn-text';
       if (connBtn) connBtn.classList.remove('hidden');
       if (discBtn) discBtn.classList.add('hidden');
@@ -1841,14 +1978,14 @@ function renderAppCards() {
           <button class="btn btn-danger btn-sm" onclick="deleteApp('${escapeHtml(a.id)}')">删除</button>
         </div>
       </div>
-      ${a.localBuildCmd || a.localArtifactPath ? `<div class="item-card-desc"><strong>⚡ 本地编译/默认产物:</strong> <code>${escapeHtml(a.localBuildCmd || '仅指定默认产物')}</code> (产物: <code>${escapeHtml(a.localArtifactPath || '-')}</code>)</div>` : ''}
-      <div class="item-card-desc"><strong>📦 独立产物目录:</strong> <code>${escapeHtml(a.artifactDir || '-')}</code></div>
-      <div class="item-card-desc"><strong>🔨 独立构建目录:</strong> <code>${escapeHtml(a.buildDir || '-')}</code></div>
+      ${a.localBuildCmd || a.localArtifactPath ? `<div class="item-card-desc"><strong>本地编译/默认产物:</strong> <code>${escapeHtml(a.localBuildCmd || '仅指定默认产物')}</code> (产物: <code>${escapeHtml(a.localArtifactPath || '-')}</code>)</div>` : ''}
+      <div class="item-card-desc"><strong>独立产物目录:</strong> <code>${escapeHtml(a.artifactDir || '-')}</code></div>
+      <div class="item-card-desc"><strong>独立构建目录:</strong> <code>${escapeHtml(a.buildDir || '-')}</code></div>
       ${a.deployMode === 'docker'
-        ? `<div class="item-card-desc"><strong>🐳 部署形态: Docker 容器</strong> · 容器: <code>${escapeHtml(a.dockerContainer || a.deployment || a.name)}</code>${a.dockerPort ? ' · 端口: <code>' + escapeHtml(a.dockerPort) + '</code>' : ''}</div>`
-        : `<div class="item-card-desc"><strong>📄 共享 K8s 目录 + 独立 YAML:</strong> <code>${escapeHtml(a.k8sYamlDir || '-')}</code> / <code style="color:#2563eb;font-weight:700;">${escapeHtml(a.k8sYamlFile || (a.name + '.yaml'))}</code></div>`}
-      <div class="item-card-desc"><strong>🏷️ 独立镜像与动态 Tag:</strong> <code>${escapeHtml(a.image || '-')}:&lt;Tag&gt;</code></div>
-      ${a.deployMode === 'docker' ? '' : `<div class="item-card-desc"><strong>☸️ K8s 目标工作负载:</strong> ns: <code>${escapeHtml(a.namespace)}</code>, deployment: <code>${escapeHtml(a.deployment)}</code></div>`}
+        ? `<div class="item-card-desc"><strong>部署形态: Docker 容器</strong> · 容器: <code>${escapeHtml(a.dockerContainer || a.deployment || a.name)}</code>${a.dockerPort ? ' · 端口: <code>' + escapeHtml(a.dockerPort) + '</code>' : ''}</div>`
+        : `<div class="item-card-desc"><strong>共享 K8s 目录 + 独立 YAML:</strong> <code>${escapeHtml(a.k8sYamlDir || '-')}</code> / <code style="color:var(--primary);font-weight:600;">${escapeHtml(a.k8sYamlFile || (a.name + '.yaml'))}</code></div>`}
+      <div class="item-card-desc"><strong>独立镜像与动态 Tag:</strong> <code>${escapeHtml(a.image || '-')}:&lt;Tag&gt;</code></div>
+      ${a.deployMode === 'docker' ? '' : `<div class="item-card-desc"><strong>K8s 目标工作负载:</strong> ns: <code>${escapeHtml(a.namespace)}</code>, deployment: <code>${escapeHtml(a.deployment)}</code></div>`}
     </div>
   `).join('');
 }
@@ -2125,7 +2262,6 @@ function renderHistoryTable(list) {
 
   $('historyTableBody').innerHTML = list.map((r) => {
     const isSuccess = r.status === 'success';
-    const statusIcon = isSuccess ? '✔' : r.status === 'running' ? '⏳' : '✖';
     const statusText = isSuccess ? '发布成功' : r.status === 'running' ? '进行中' : '发布失败';
     const statusCls = isSuccess ? 'status-success' : r.status === 'running' ? 'status-running' : 'status-failed';
 
@@ -2145,7 +2281,7 @@ function renderHistoryTable(list) {
     return `
       <tr>
         <td>
-          <div style="font-weight:600;color:#1e293b">${fmtTime(r.createdAt)}</div>
+          <div style="font-weight:600;color:var(--text-main)">${fmtTime(r.createdAt)}</div>
         </td>
         <td>
           <div class="app-badge-inline">
@@ -2156,13 +2292,13 @@ function renderHistoryTable(list) {
         <td>
           <div class="history-tag-chip">
             <span>${escapeHtml(r.tag)}</span>
-            <button class="copy-tag-btn" title="复制版本号" onclick="copyText('${escapeHtml(r.tag)}')">📋</button>
+            <button class="copy-tag-btn" title="复制版本号" onclick="copyText('${escapeHtml(r.tag)}')">${ic('copy', 'icon icon-inline')}</button>
           </div>
-          ${r.force ? '<div class="force-tag-warn">⚠️ 强制覆盖版本</div>' : ''}
+          ${r.force ? '<div class="force-tag-warn">强制覆盖版本</div>' : ''}
         </td>
         <td>
           <span class="status-pill ${statusCls}">
-            <span>${statusIcon}</span> ${statusText}
+            ${statusText}
           </span>
           ${r.error ? `<div style="font-size:11px;color:var(--danger);margin-top:4px;max-width:180px;word-break:break-all">${escapeHtml(r.error)}</div>` : ''}
         </td>
@@ -2177,20 +2313,20 @@ function renderHistoryTable(list) {
         <td>
           <span class="duration-chip">${durationStr}</span>
         </td>
-        <td style="color:#475569;font-size:12px;max-width:180px;word-break:break-all">
+        <td style="color:var(--text-secondary);font-size:12px;max-width:180px;word-break:break-all">
           ${escapeHtml(r.remark || '-')}
         </td>
         <td>
           <div class="history-row-actions">
             <button class="btn btn-secondary btn-sm" onclick="openReleaseLogModal('${escapeHtml(r.id)}', '${escapeHtml(r.app)}', '${escapeHtml(r.tag)}', '${escapeHtml(r.createdAt || '')}')">
-              📋 查看日志
+              ${ic('file')} 查看日志
             </button>
             <button class="btn btn-secondary btn-sm" title="填入发布面板" onclick="reuseReleaseTag('${escapeHtml(r.app)}', '${escapeHtml(r.tag)}')">
-              🚀 选用
+              ${ic('rocket')} 选用
             </button>
             ${isSuccess ? `
-              <button class="btn btn-secondary btn-sm" style="color:#d97706;border-color:#fde68a;" title="回滚线上至此历史版本" onclick="triggerRollback('${escapeHtml(r.id)}')">
-                ↩️ 回滚
+              <button class="btn btn-warn btn-sm" title="回滚线上至此历史版本" onclick="triggerRollback('${escapeHtml(r.id)}')">
+                ${ic('undo')} 回滚
               </button>
             ` : ''}
           </div>
