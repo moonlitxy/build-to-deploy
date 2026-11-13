@@ -17,6 +17,8 @@ const state = {
   releaseId: null,
   eventSource: null,
   isDeploying: false,
+  // 全局 SSH 连接开关：服务启动后为 false，用户点击"连接服务器"后变 true
+  connEnabled: false,
   pendingReleaseParams: null,
   prefs: {
     selectedAppId: '',
@@ -157,8 +159,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   await refreshConfigs();
   await updateConnStatus();
   setInterval(updateConnStatus, 10000);
-  // 进入页面即拉取一次命名空间与 Pod，不必先手动刷新
-  if ($('tab-pods').classList.contains('active')) {
+  // 进入页面即拉取一次命名空间与 Pod，不必先手动刷新（仅限已连接服务器时；启动默认不连接）
+  if (state.connEnabled && $('tab-pods').classList.contains('active')) {
     loadNamespacesAndPods();
   }
 });
@@ -173,9 +175,11 @@ function setupTabs() {
       $(tabId).classList.add('active');
 
       if (btn.dataset.tab === 'pods') {
-        // 进入监控页：刷新一次命名空间与 Pod，随后交给后台定时静默刷新
-        loadNamespacesAndPods();
-        startPodAutoRefresh();
+        // 进入监控页：刷新一次命名空间与 Pod，随后交给后台定时静默刷新（未连接服务器时不主动访问远程）
+        if (state.connEnabled) {
+          loadNamespacesAndPods();
+          startPodAutoRefresh();
+        }
       } else {
         stopPodAutoRefresh();
       }
@@ -198,7 +202,7 @@ async function refreshConfigs() {
   renderAppSelects();
   renderServerPicker();
   renderAppCards();
-  updatePathPreview();
+  updatePathPreview({ probeRemote: false });
   await loadAppBackups();
 }
 
@@ -229,6 +233,11 @@ function renderPodSelects() {
 async function refreshContainerStatus(appId) {
   const el = $('pvDocker');
   if (!el) return;
+  // 未连接服务器时不探测远程容器状态：启动/刷新页面要保持纯本地
+  if (!state.connEnabled) {
+    el.innerHTML += ' <span style="color:#6b7280">（未连接服务器，不查询状态）</span>';
+    return;
+  }
   const res = await api('GET', `/api/deploy-target?appId=${encodeURIComponent(appId)}`);
   if (!res.ok || !res.data || res.data.deployMode !== 'docker') return;
   const st = res.data.status;
@@ -241,7 +250,7 @@ async function refreshContainerStatus(appId) {
   }
 }
 
-function updatePathPreview() {
+function updatePathPreview({ probeRemote = true } = {}) {
   const appId = $('deployAppSelect').value;
   const app = state.apps.find((a) => a.id === appId);
   if (!app) {
@@ -277,7 +286,8 @@ function updatePathPreview() {
     dockerItem.classList.toggle('hidden', !isDocker);
     if (isDocker) {
       $('pvDocker').textContent = `${app.dockerContainer || app.deployment || app.name}${app.dockerPort ? ' · ' + app.dockerPort : ''}`;
-      refreshContainerStatus(app.id);
+      // 只有用户主动切换应用时才顺便查一次远程容器状态；页面初始化/刷新不碰远程
+      if (probeRemote) refreshContainerStatus(app.id);
     }
   }
   const curTag = $('tagInput').value.trim() || '<Tag>';
@@ -1192,7 +1202,7 @@ let namespaceLoadedFor = ''; // 已拉取过命名空间列表的服务器，避
 function startPodAutoRefresh() {
   stopPodAutoRefresh();
   podAutoTimer = setInterval(() => {
-    if (document.hidden || !$('tab-pods').classList.contains('active')) return;
+    if (!state.connEnabled || document.hidden || !$('tab-pods').classList.contains('active')) return;
     // 正在查看某个 Pod 的日志时不打断弹窗
     const logModal = $('podLogModal');
     if (logModal && !logModal.classList.contains('hidden')) return;
@@ -1595,6 +1605,7 @@ async function connectCurrentServer() {
   btn.textContent = origText;
   btn.disabled = false;
   if (res.ok) {
+    state.connEnabled = true;
     await updateConnStatus();
   } else {
     alert(`✖ 连接失败: ${res.data.error || '未知错误'}`);
@@ -1611,14 +1622,20 @@ window.disconnectOneServer = async function (srvId) {
 };
 
 async function disconnectAllConnections() {
-  const res = await api('POST', '/api/servers/disconnect', {});
+  const res = await api('POST', '/api/conn-mode', { enabled: false });
   if (res.ok) {
+    state.connEnabled = false;
     await updateConnStatus();
   }
 }
 
 async function updateConnStatus() {
-  const res = await api('GET', '/api/servers/connections');
+  const [modeRes, res] = await Promise.all([
+    api('GET', '/api/conn-mode'),
+    api('GET', '/api/servers/connections'),
+  ]);
+  // 服务端开关是唯一权威来源：页面刷新后据此恢复，不会因此自动连接
+  if (modeRes.ok) state.connEnabled = !!modeRes.data.enabled;
   if (res.ok) {
     const count = res.data.count || 0;
     state.activeServerIds = res.data.active || [];
@@ -1636,9 +1653,15 @@ async function updateConnStatus() {
       txt.className = 'conn-text connected';
       if (connBtn) connBtn.classList.add('hidden');
       if (discBtn) discBtn.classList.remove('hidden');
+    } else if (state.connEnabled) {
+      if (dot) dot.classList.remove('connected');
+      txt.textContent = 'SSH 已开启 · 当前无长连接';
+      txt.className = 'conn-text';
+      if (connBtn) connBtn.classList.remove('hidden');
+      if (discBtn) discBtn.classList.remove('hidden');
     } else {
       if (dot) dot.classList.remove('connected');
-      txt.textContent = 'SSH 未连接';
+      txt.textContent = 'SSH 未连接 · 不会自动连接服务器';
       txt.className = 'conn-text';
       if (connBtn) connBtn.classList.remove('hidden');
       if (discBtn) discBtn.classList.add('hidden');
@@ -1652,6 +1675,7 @@ window.testOneServer = async function (srvId) {
   if (!srv) return;
   const res = await api('POST', '/api/servers/test', srv);
   if (res.ok) {
+    state.connEnabled = true;
     await updateConnStatus();
     alert(`✔ ${res.data.message || '连接测试成功！'}`);
   } else {
@@ -1744,6 +1768,9 @@ async function testServerConnection() {
   $('testServerConnBtn').disabled = false;
 
   if (res.ok) {
+    // 测试连接成功同样会打开服务端连接开关，同步本地状态
+    state.connEnabled = true;
+    await updateConnStatus();
     alert(`✔ ${res.data.message || '连接成功！'}`);
   } else {
     alert(`✖ 连接失败: ${res.data.error}`);

@@ -53,6 +53,25 @@ type Server struct {
 	// 并发请求直接返回 409，避免排队中的请求在用户关掉一个后再弹出来
 	pathPickerMu   sync.Mutex
 	pathPickerBusy bool
+
+	// connMu / connEnabled 全局 SSH 连接开关：启动后默认关闭，除"测试连接/连接服务器"外，
+	// 所有会访问远程服务器的接口都先检查它，避免无人值守地连上目标机器。
+	connMu      sync.Mutex
+	connEnabled bool
+}
+
+// SetConnectionEnabled 打开/关闭全局 SSH 连接开关
+func (s *Server) SetConnectionEnabled(on bool) {
+	s.connMu.Lock()
+	s.connEnabled = on
+	s.connMu.Unlock()
+}
+
+// ConnectionEnabled 当前是否允许访问远程服务器
+func (s *Server) ConnectionEnabled() bool {
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	return s.connEnabled
 }
 
 func NewServer(cfg *config.Config, engine *pipeline.Engine, kube *k8s.Client, pool *sshpool.Pool, static fs.FS) *Server {
@@ -82,6 +101,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/servers/test", s.testServer)
 	mux.HandleFunc("POST /api/servers/disconnect", s.disconnectServer)
 	mux.HandleFunc("GET /api/servers/connections", s.activeConnections)
+	mux.HandleFunc("GET /api/conn-mode", s.connMode)
+	mux.HandleFunc("POST /api/conn-mode", s.setConnMode)
 
 	// 应用管理（支持产物目录、构建目录、K8s目录独立配置）
 	mux.HandleFunc("GET /api/apps", s.listApps)
@@ -375,7 +396,31 @@ func (s *Server) testServer(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "SSH 连接失败: "+err.Error())
 		return
 	}
+	// 连接成功即打开全局开关：此后页面上的监控、预检、发布等操作才允许访问远程服务器
+	s.SetConnectionEnabled(true)
 	writeJSON(w, http.StatusOK, map[string]string{"message": fmt.Sprintf("SSH 连接成功 [%s@%s]！心跳长连接已保持。", srv.User, srv.Host)})
+}
+
+// connMode 返回全局连接开关状态
+func (s *Server) connMode(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]bool{"enabled": s.ConnectionEnabled()})
+}
+
+// setConnMode 打开或关闭全局连接开关；关闭时同时断开所有长连接
+func (s *Server) setConnMode(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := readJSON(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	s.SetConnectionEnabled(req.Enabled)
+	closed := 0
+	if !req.Enabled && s.pool != nil {
+		closed = s.pool.Disconnect("")
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"enabled": req.Enabled, "closed": closed})
 }
 
 func (s *Server) disconnectServer(w http.ResponseWriter, r *http.Request) {
@@ -396,6 +441,16 @@ func (s *Server) disconnectServer(w http.ResponseWriter, r *http.Request) {
 		"closed":  n,
 		"message": msg,
 	})
+}
+
+// requireConn 全局连接闸门：未连接时拒绝一切会访问远程服务器的接口，
+// 保证服务启动后在本机没有任何远程动作，必须由用户显式点击"连接服务器"。
+func (s *Server) requireConn(w http.ResponseWriter) bool {
+	if s.ConnectionEnabled() {
+		return true
+	}
+	writeErr(w, http.StatusPreconditionFailed, "尚未连接服务器：请先在页面上点击「连接服务器」")
+	return false
 }
 
 func (s *Server) activeConnections(w http.ResponseWriter, r *http.Request) {
@@ -640,6 +695,9 @@ func (s *Server) pickLocalPath(w http.ResponseWriter, r *http.Request) {
 
 // containerStatus 查询宿主机上同名容器是否在运行（只读，供页面展示"当前形态"）
 func (s *Server) containerStatus(w http.ResponseWriter, r *http.Request) {
+	if !s.requireConn(w) {
+		return
+	}
 	appID := r.URL.Query().Get("appId")
 	app := s.cfg.FindApp(appID)
 	if app == nil {
@@ -680,6 +738,9 @@ func (s *Server) containerStatus(w http.ResponseWriter, r *http.Request) {
 // ---------- 构建输入指纹预检（上传前判断新 Tag 是否是同一个镜像） ----------
 
 func (s *Server) inspectArtifact(w http.ResponseWriter, r *http.Request) {
+	if !s.requireConn(w) {
+		return
+	}
 	var req struct {
 		AppID             string `json:"appId"`
 		Tag               string `json:"tag"`
@@ -735,6 +796,9 @@ func (s *Server) inspectArtifact(w http.ResponseWriter, r *http.Request) {
 // ---------- 预检版本冲突 (需求 2) ----------
 
 func (s *Server) precheck(w http.ResponseWriter, r *http.Request) {
+	if !s.requireConn(w) {
+		return
+	}
 	var req struct {
 		AppID string `json:"appId"`
 		Tag   string `json:"tag"`
@@ -762,6 +826,9 @@ func (s *Server) precheck(w http.ResponseWriter, r *http.Request) {
 // ---------- K8s 命名空间与 Pod 状态监控 (需求 3) ----------
 
 func (s *Server) getNamespaces(w http.ResponseWriter, r *http.Request) {
+	if !s.requireConn(w) {
+		return
+	}
 	serverId := r.URL.Query().Get("serverId")
 	srv := s.cfg.FindServer(serverId)
 	if srv == nil {
@@ -780,6 +847,9 @@ func (s *Server) getNamespaces(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) getPods(w http.ResponseWriter, r *http.Request) {
+	if !s.requireConn(w) {
+		return
+	}
 	serverId := r.URL.Query().Get("serverId")
 	ns := r.URL.Query().Get("namespace")
 	srv := s.cfg.FindServer(serverId)
@@ -806,6 +876,9 @@ func (s *Server) getPods(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) getPodLogs(w http.ResponseWriter, r *http.Request) {
+	if !s.requireConn(w) {
+		return
+	}
 	serverId := r.URL.Query().Get("serverId")
 	ns := r.URL.Query().Get("namespace")
 	pod := r.URL.Query().Get("pod")
@@ -838,6 +911,9 @@ func (s *Server) getPodLogs(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) restartDeployment(w http.ResponseWriter, r *http.Request) {
+	if !s.requireConn(w) {
+		return
+	}
 	var req struct {
 		ServerID   string `json:"serverId"`
 		Namespace  string `json:"namespace"`
@@ -959,6 +1035,9 @@ func (s *Server) listReleases(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) startRelease(w http.ResponseWriter, r *http.Request) {
+	if !s.requireConn(w) {
+		return
+	}
 	var req struct {
 		AppID             string `json:"appId"`
 		Tag               string `json:"tag"`
@@ -1021,6 +1100,9 @@ func (s *Server) startRelease(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) rollbackRelease(w http.ResponseWriter, r *http.Request) {
+	if !s.requireConn(w) {
+		return
+	}
 	id, ok := releaseID(w, r)
 	if !ok {
 		return
@@ -1055,6 +1137,9 @@ func (s *Server) getRelease(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) cancelRelease(w http.ResponseWriter, r *http.Request) {
+	if !s.requireConn(w) {
+		return
+	}
 	id, ok := releaseID(w, r)
 	if !ok {
 		return

@@ -1618,7 +1618,7 @@ func (e *Engine) releaseRunning(appID string) {
 }
 
 func (r *pipelineRunner) cleanup() {
-	r.hub.Logf("\n==> 阶段 [cleanup]: 自动清理历史版本产物与回收镜像缓存")
+	r.hub.Logf("\n==> 阶段 [cleanup]: 自动清理历史版本产物")
 	keepCount := 5 // 默认保留最近 5 个产物版本
 	if r.app.ArtifactDir != "" && r.app.ArtifactDir != "/" {
 		// 只清理本应用历次上传的产物文件，避免误删目录内手工放置的 Dockerfile、配置等
@@ -1644,9 +1644,8 @@ func (r *pipelineRunner) cleanup() {
 		_ = os.Remove(r.artifact)
 	}
 
-	// 自动回收 Docker 悬空镜像 (dangling images)
-	_ = r.engine.SSH.RunCommand(context.Background(), r.srv, "docker image prune -f", io.Discard)
-	r.hub.Logf("✔ 已回收远程 Docker 悬空虚悬镜像 (dangling images)")
+	// 注意：不自动删除远程 Docker 镜像（包括悬空层与旧版本 tag），历史版本由运维自行管理，
+	// 避免误删回滚依赖的镜像。
 }
 
 func (e *Engine) Hub(id string) *Hub {

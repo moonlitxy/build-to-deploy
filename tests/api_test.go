@@ -109,6 +109,8 @@ apps:
 	fake := &fakeRunner{outputs: map[string]string{}}
 	eng.SSH = fake
 	srv := api.NewServer(cfg, eng, k8s.NewClient(fake), nil, fs.FS(nil))
+	// 其余用例验证的是"已连接服务器"后的行为；连接闸门本身由 TestAPIConnModeGate 覆盖
+	srv.SetConnectionEnabled(true)
 	return srv.WithRunner(fake), cfg, fake, dir
 }
 
@@ -442,6 +444,62 @@ func TestAPIPrecheckEndpoint(t *testing.T) {
 	}
 	if rec = do(t, h, "POST", "/api/precheck", `{"appId":"nope","tag":"v1"}`, nil); rec.Code != 404 {
 		t.Fatalf("未知应用应 404，实际 %d", rec.Code)
+	}
+}
+
+// 服务启动后默认不连接服务器：远程相关接口一律 412，打开开关后恢复
+func TestAPIConnModeGate(t *testing.T) {
+	srv, _, fake, _ := newTestServer(t)
+	srv.SetConnectionEnabled(false)
+	h := srv.Handler()
+
+	if rec := do(t, h, "GET", "/api/conn-mode", "", nil); rec.Code != 200 || !strings.Contains(rec.Body.String(), "false") {
+		t.Fatalf("默认应为未连接: %d %s", rec.Code, rec.Body.String())
+	}
+	remoteCalls := []struct{ method, path, body string }{
+		{"GET", "/api/deploy-target?appId=demo", ""},
+		{"POST", "/api/precheck", `{"appId":"demo","tag":"v1"}`},
+		{"GET", "/api/k8s/namespaces?serverId=s1", ""},
+		{"GET", "/api/k8s/pods?serverId=s1", ""},
+		{"GET", "/api/k8s/pod-logs?serverId=s1&pod=p1", ""},
+		{"POST", "/api/k8s/restart", `{"serverId":"s1","namespace":"shuili","deployment":"demo"}`},
+		{"POST", "/api/releases", `{"appId":"demo","tag":"v1","useLocalArtifact":true}`},
+	}
+	for _, c := range remoteCalls {
+		if rec := do(t, h, c.method, c.path, c.body, nil); rec.Code != 412 {
+			t.Fatalf("%s %s 未连接时应 412，实际 %d %s", c.method, c.path, rec.Code, rec.Body.String())
+		}
+	}
+	// 配置类只读接口不受影响：无需连接也能查看/编辑配置
+	if rec := do(t, h, "GET", "/api/apps", "", nil); rec.Code != 200 {
+		t.Fatalf("应用列表应在离线时可读: %d", rec.Code)
+	}
+
+	// 打开开关后恢复
+	if rec := do(t, h, "POST", "/api/conn-mode", `{"enabled":true}`, nil); rec.Code != 200 {
+		t.Fatalf("开启 = %d %s", rec.Code, rec.Body.String())
+	}
+	if !srv.ConnectionEnabled() {
+		t.Fatal("开关应已打开")
+	}
+	fake.outputs["kubectl get namespaces"] = "shuili"
+	if rec := do(t, h, "GET", "/api/k8s/namespaces?serverId=s1", "", nil); rec.Code != 200 {
+		t.Fatalf("已连接后命名空间 = %d %s", rec.Code, rec.Body.String())
+	}
+
+	// 关闭开关：同时断开所有长连接，并再次拦截远程接口
+	if rec := do(t, h, "POST", "/api/conn-mode", `{"enabled":false}`, nil); rec.Code != 200 || !strings.Contains(rec.Body.String(), "closed") {
+		t.Fatalf("关闭 = %d %s", rec.Code, rec.Body.String())
+	}
+	if srv.ConnectionEnabled() {
+		t.Fatal("开关应已关闭")
+	}
+	if rec := do(t, h, "GET", "/api/k8s/namespaces?serverId=s1", "", nil); rec.Code != 412 {
+		t.Fatalf("关闭后应 412，实际 %d", rec.Code)
+	}
+	// 非法 body 返回 400
+	if rec := do(t, h, "POST", "/api/conn-mode", `{`, nil); rec.Code != 400 {
+		t.Fatalf("非法 JSON 应 400，实际 %d", rec.Code)
 	}
 }
 
