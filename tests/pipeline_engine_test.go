@@ -94,6 +94,13 @@ func (s *scriptedRunner) addRules(r ...scriptRule) {
 	s.mu.Unlock()
 }
 
+// prependRules 把规则插到最前面：map 无法保证顺序，需要"更具体的命令优先命中"时用这个
+func (s *scriptedRunner) prependRules(r ...scriptRule) {
+	s.mu.Lock()
+	s.rules = append(append([]scriptRule(nil), r...), s.rules...)
+	s.mu.Unlock()
+}
+
 // newScriptedEnv 完整引擎（远程全部走假执行器）
 func newScriptedEnv(t *testing.T, mode string) (*pipeline.Engine, *config.Config, *store.Store, *scriptedRunner, *config.AppConfig) {
 	t.Helper()
@@ -202,6 +209,61 @@ func TestPEngineK8sPipelineSuccess(t *testing.T) {
 	cmds := strings.Join(fake.snapshot(), "\n")
 	if !strings.Contains(cmds, "kubectl apply -f") || !strings.Contains(cmds, "rollout status") {
 		t.Fatalf("应执行 apply 与 rollout:\n%s", cmds)
+	}
+}
+
+// 换了 Tag、甚至换了产物文件名，只要本地产物 SHA256 与已发布版本一致就必须提醒
+func TestPEngineWarnOnSameArtifactHash(t *testing.T) {
+	eng, _, st, fake, app := newScriptedEnv(t, config.DeployModeK8s)
+	fake.addRules(
+		scriptRule{"docker images -q", ""},
+		scriptRule{"get deployment", "app/demo:v0.9.0"},
+		scriptRule{"docker image inspect", "sha256:111111111111 []"},
+		scriptRule{"docker images --no-trunc", "app/demo:v0.9.0 sha256:111111111111\n"},
+	)
+	first, err := eng.StartDeploy(pipeline.StartRequest{AppID: app.ID, Tag: "v1.0.0", UseLocalArtifact: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstDone := waitDoneStrict(t, st, first.ID)
+	if firstDone.Status != store.StatusSuccess || firstDone.FileSHA256 == "" {
+		t.Fatalf("首次发布失败: %+v\n%s", firstDone, readLogFile(t, eng, first.ID))
+	}
+
+	// 把产物改个文件名、重新发布到新 Tag：内容不变
+	artifacts := filepath.Dir(app.ResolveLocalArtifactPath())
+	renamed := filepath.Join(artifacts, "renamed.jar")
+	if err := os.WriteFile(renamed, []byte("PK\x03\x04jar"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	second, err := eng.StartDeploy(pipeline.StartRequest{AppID: app.ID, Tag: "v1.0.1", UseLocalArtifact: true, Force: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := waitDoneStrict(t, st, second.ID)
+	log := readLogFile(t, eng, second.ID)
+	if !strings.Contains(log, "本地产物与已发布版本 v1.0.0 的产物内容完全相同") {
+		t.Fatalf("产物哈希一致时应提醒，即使换了 Tag:\n%s", log)
+	}
+	// 产物相同 → 镜像摘要也相同 → 部署前暂停等待确认，而不是直接上线
+	if done.Status != store.StatusNeedsConfirm {
+		t.Fatalf("镜像摘要与历史版本相同时应暂停确认，实际 %s:\n%s", done.Status, log)
+	}
+	if done.DuplicateOf != firstDone.ID {
+		t.Fatalf("记录应标记重复来源: got %q want %q", done.DuplicateOf, firstDone.ID)
+	}
+
+	// 用户确认后继续：使用已构建好的镜像直接部署
+	fake.cmds = nil
+	if _, err := eng.ResumeRelease(second.ID, done.ImageSummary); err != nil {
+		t.Fatal(err)
+	}
+	final := waitDoneStrict(t, st, second.ID)
+	if final.Status != store.StatusSuccess {
+		t.Fatalf("确认后应完成部署: %s\n%s", final.Error, readLogFile(t, eng, second.ID))
+	}
+	if cmds := strings.Join(fake.snapshot(), "\n"); strings.Contains(cmds, "docker build -t") {
+		t.Fatalf("继续时不应重新构建:\n%s", cmds)
 	}
 }
 

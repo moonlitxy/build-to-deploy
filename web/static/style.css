@@ -1819,8 +1819,36 @@ input[type="checkbox"] {
   max-width: 96vw;
 }
 
+/* 提醒类弹窗：苹果风格的克制样式，不整块铺红色，只用顶部细条 + 图标表达"需要留意" */
 .modal-warn {
-  border-top: 4px solid var(--danger);
+  position: relative;
+}
+
+.modal-warn::before {
+  content: '';
+  display: block;
+  height: 4px;
+  background: var(--warning);
+  flex-shrink: 0;
+}
+
+/* 镜像内容重复属于"提醒"，不是危险操作：苹果风格的浅蓝，柔和克制 */
+.modal-warn.is-notice::before {
+  background: linear-gradient(90deg, rgba(0, 113, 227, 0.75), rgba(0, 113, 227, 0.28));
+}
+
+.modal-warn.is-danger::before {
+  background: var(--danger);
+}
+
+.modal-icon-badge.is-notice {
+  background: var(--primary-soft);
+  color: var(--primary);
+}
+
+.modal-icon-badge.is-danger {
+  background: rgba(255, 59, 48, 0.1);
+  color: var(--danger-text);
 }
 
 .modal-header {
@@ -1902,26 +1930,73 @@ input[type="checkbox"] {
   margin-bottom: 12px;
   color: var(--text-secondary);
   font-size: 13.5px;
+  line-height: 1.5;
 }
 
 .warn-foot {
   margin-top: 14px;
-  color: var(--danger-text);
+  color: var(--text-secondary);
   font-size: 13px;
+  line-height: 1.55;
+}
+
+.modal-warn.is-danger .warn-foot {
+  color: var(--danger-text);
   font-weight: 600;
 }
 
+/* 冲突/重复信息列表：白色分组卡片 + 细分隔线，接近 iOS 的分组列表观感；
+   提醒语气下改为浅蓝透明底，和顶部细条呼应 */
 .conflict-list {
-  padding: 10px 14px;
-  border: 1px solid rgba(255, 59, 48, 0.16);
-  border-radius: 10px;
-  background: rgba(255, 59, 48, 0.06);
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--card-bg);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.03);
+}
+
+.modal-warn.is-notice .conflict-list {
+  border-color: rgba(0, 113, 227, 0.14);
+  background: rgba(0, 113, 227, 0.055);
+  box-shadow: none;
+}
+
+.modal-warn.is-notice .conflict-item + .conflict-item {
+  border-top-color: rgba(0, 113, 227, 0.1);
+}
+
+.modal-warn.is-notice .conflict-item code {
+  background: rgba(0, 113, 227, 0.08);
+  color: var(--text-secondary);
+}
+
+.conflict-list:empty {
+  display: none;
 }
 
 .conflict-item {
-  margin-bottom: 4px;
-  color: var(--danger-text);
-  font-size: 12.5px;
+  padding: 11px 14px;
+  color: var(--text-main);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.conflict-item + .conflict-item {
+  border-top: 1px solid var(--border);
+}
+
+.conflict-item code {
+  padding: 1px 6px;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.045);
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.conflict-item strong {
+  font-weight: 600;
+  color: var(--text-main);
 }
 
 .pod-log-pre,

@@ -148,6 +148,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/releases/{id}/events", s.releaseEvents)
 	mux.HandleFunc("GET /api/releases/{id}/log", s.releaseLog)
 	mux.HandleFunc("POST /api/releases/{id}/cancel", s.cancelRelease)
+	mux.HandleFunc("POST /api/releases/{id}/resume", s.resumeRelease)
 
 	// 前端页面托管（无需账号密码，直接本地访问）
 	mux.Handle("/", http.FileServer(http.FS(s.static)))
@@ -409,6 +410,45 @@ func (s *Server) testServer(w http.ResponseWriter, r *http.Request) {
 // connMode 返回全局连接开关状态
 func (s *Server) connMode(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]bool{"enabled": s.ConnectionEnabled()})
+}
+
+// resumeRelease 用户在"镜像内容重复"弹窗里确认仍然部署后，从一致性检查阶段继续执行同一发布记录
+func (s *Server) resumeRelease(w http.ResponseWriter, r *http.Request) {
+	if !s.requireConn(w) {
+		return
+	}
+	id, ok := releaseID(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		// ImageSummary 用户确认时看到的镜像摘要；与记录不一致说明确认已过期
+		ImageSummary string `json:"imageSummary"`
+	}
+	if err := readJSON(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	rel, err := s.engine.ResumeRelease(id, req.ImageSummary)
+	if err != nil {
+		var de *pipeline.DuplicateDeployError
+		if errors.As(err, &de) {
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"error": de.Error(),
+				"duplicate": map[string]any{
+					"imageSummary":  de.ImageSummary,
+					"currentImage":  de.CurrentImage,
+					"currentTag":    de.CurrentTag,
+					"duplicateTag":  de.DuplicateTag,
+					"sameAsCurrent": de.SameAsCurrent,
+				},
+			})
+			return
+		}
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusAccepted, rel)
 }
 
 // setConnMode 打开或关闭全局连接开关；关闭时同时断开所有长连接
@@ -1231,7 +1271,9 @@ func (s *Server) startRelease(w http.ResponseWriter, r *http.Request) {
 		BuildCmd          string `json:"buildCmd"`
 		Force             bool   `json:"force"`
 		NoReuse           bool   `json:"noReuse"`
-		Remark            string `json:"remark"`
+		// KeepSameImage 用户在弹窗里的确认，值是被确认的镜像摘要
+		KeepSameImage string `json:"keepSameImage"`
+		Remark        string `json:"remark"`
 	}
 	if err := readJSON(r, &req); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
@@ -1262,6 +1304,7 @@ func (s *Server) startRelease(w http.ResponseWriter, r *http.Request) {
 		UseLocalArtifact: req.UseLocalArtifact,
 		Force:            req.Force,
 		NoReuse:          req.NoReuse,
+		KeepSameImage:    req.KeepSameImage,
 		Remark:           req.Remark,
 		BuildDir:         req.BuildDir,
 		BuildCmd:         req.BuildCmd,
@@ -1272,6 +1315,21 @@ func (s *Server) startRelease(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusConflict, map[string]any{
 				"error":    ce.Error(),
 				"precheck": ce.Result,
+			})
+			return
+		}
+		// 镜像内容与线上/历史版本完全相同：返回 409，前端弹窗让用户决定是否仍然部署
+		var de *pipeline.DuplicateDeployError
+		if errors.As(err, &de) {
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"error": de.Error(),
+				"duplicate": map[string]any{
+					"imageSummary":  de.ImageSummary,
+					"currentImage":  de.CurrentImage,
+					"currentTag":    de.CurrentTag,
+					"duplicateTag":  de.DuplicateTag,
+					"sameAsCurrent": de.SameAsCurrent,
+				},
 			})
 			return
 		}

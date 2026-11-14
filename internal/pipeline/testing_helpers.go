@@ -60,3 +60,13 @@ func FileStatAndSHA256ForTest(path string) (string, int64, string, error) {
 func CheckImageExistsForTest(ctx context.Context, e *Engine, srv *sshpool.ServerConfig, ref string) (bool, error) {
 	return e.checkImageExists(ctx, srv, ref)
 }
+
+// MarkRunningForTest 占用应用的发布锁（模拟另一条流水线正在运行）
+func MarkRunningForTest(e *Engine, appID, releaseID string, cancel context.CancelFunc) {
+	e.mu.Lock()
+	e.running[appID] = &activeRun{releaseID: releaseID, cancel: cancel}
+	e.mu.Unlock()
+}
+
+// ReleaseRunningForTest 释放应用的发布锁
+func ReleaseRunningForTest(e *Engine, appID string) { e.releaseRunning(appID) }

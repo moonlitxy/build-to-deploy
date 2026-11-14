@@ -140,7 +140,13 @@ func (e *Engine) Precheck(ctx context.Context, app *config.AppConfig, tag string
 		}
 		// 新 Tag，但线上镜像的内容摘要已经上线过：换了名字的同一个镜像
 		if !strings.HasPrefix(res.CurrentTag, "sha256") {
-			res.CurrentImage = e.currentImageSummary(ctx, srv, app)
+			summary, err := e.currentImageSummary(ctx, srv, app)
+			if err != nil {
+				// 取不到线上摘要时不能静默跳过：否则"镜像内容未变化"的重复发布会被当成正常发布放行
+				res.Warnings = append(res.Warnings, "无法获取线上镜像内容摘要，本次发布将跳过镜像内容一致性检查: "+err.Error())
+			} else {
+				res.CurrentImage = summary
+			}
 		}
 		if img := res.CurrentImage; img != "" {
 			if rels := e.Store.FindByImage(app.ID, img); len(rels) > 0 && rels[0].Tag != tag {
@@ -213,28 +219,56 @@ func (e *Engine) imageSummary(ctx context.Context, srv *sshpool.ServerConfig, re
 	return pickDigest(buildstage.SummarizeImages(out, imageRepoOf(ref), extractTag(ref)))
 }
 
+// k8sImageIDSummary 从集群侧读取线上容器实际运行的镜像摘要。
+// 优先取 Pod status 里的 imageID（kubelet 上报，镜像必然存在于节点上，不依赖构建机本地有没有副本）；
+// 取不到时退回按 Deployment 里的镜像引用在本机 docker inspect。
+func (e *Engine) k8sImageIDSummary(ctx context.Context, srv *sshpool.ServerConfig, app *config.AppConfig) (string, error) {
+	// 按容器名精确匹配，避免 sidecar / initContainer 干扰
+	jsonPath := fmt.Sprintf(`{range .items[*]}{range .status.containerStatuses[?(@.name=="%s")]}{.imageID}{"\n"}{end}{end}`, app.Container)
+	cmd := fmt.Sprintf("kubectl -n %s get pods -o jsonpath=%s",
+		shellQuote(app.Namespace), shellQuote(jsonPath))
+	out, err := e.SSH.ExecuteOutput(ctx, srv, cmd)
+	if err != nil {
+		return "", fmt.Errorf("读取线上 Pod 镜像 ID 失败: %w", err)
+	}
+	return normalizeImageID(out), nil
+}
+
+// normalizeImageID 把 kubelet 上报的 imageID（形如 docker://sha256:<64hex>）规整为 sha256:<64hex>；无法识别时返回空串
+func normalizeImageID(out string) string {
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		// 多个 Pod 时取第一行有效的：滚动更新期间新旧 Pod 可能共存，precheck 只关心当前稳定版本
+		for _, s := range buildstage.SummarizeImages(line, "", "") {
+			if strings.HasPrefix(s, "sha256:") && len(s) == len("sha256:")+64 {
+				return s
+			}
+		}
+	}
+	return ""
+}
+
 // currentImageSummary 返回线上容器镜像的内容摘要：优先取 RepoDigests 中的 sha256 摘要，失败时退回镜像 ID。
 // 用途是把"换了个名字的同一镜像"识别出来，因此必须以内容摘要为准，不能比较 Tag。
-func (e *Engine) currentImageSummary(ctx context.Context, srv *sshpool.ServerConfig, app *config.AppConfig) string {
+func (e *Engine) currentImageSummary(ctx context.Context, srv *sshpool.ServerConfig, app *config.AppConfig) (string, error) {
+	// 先走集群侧 imageID：构建机本地没有该镜像时也能拿到内容摘要
+	if app.DeployMode != config.DeployModeDocker {
+		if sum, err := e.k8sImageIDSummary(ctx, srv, app); err == nil && sum != "" {
+			return sum, nil
+		}
+	}
 	fmtSel := shellQuote(`{{.Id}} {{json .RepoDigests}}`)
 	cmd := fmt.Sprintf("kubectl -n %s get deployment %s -o jsonpath=%s | xargs -r docker image inspect -f %s 2>/dev/null",
 		shellQuote(app.Namespace), shellQuote(app.Deployment),
 		shellQuote(fmt.Sprintf(`{.spec.template.spec.containers[?(@.name=="%s")].image}`, app.Container)), fmtSel)
 	out, err := e.SSH.ExecuteOutput(ctx, srv, cmd)
 	if err != nil {
-		return ""
+		return "", fmt.Errorf("在本机 inspect 线上镜像失败: %w", err)
 	}
-	repo := app.Image
-	for _, s := range buildstage.SummarizeImages(out, repo, "") {
-		if strings.HasPrefix(s, "sha256:") && len(s) == len("sha256:")+64 {
-			return s
-		}
+	if sum := normalizeImageID(out); sum != "" {
+		return sum, nil
 	}
-	// 没有 RepoDigests（本地构建、未推仓库）时用镜像 ID 兜底：本地同名镜像的 ID 与内容一一对应
-	for _, s := range buildstage.SummarizeImages(out, repo, "") {
-		return s
-	}
-	return ""
+	return "", fmt.Errorf("构建机上找不到线上镜像 %s 的本地副本（未推送到镜像仓库时无法比对内容）", app.Image)
 }
 
 // FingerprintSkipReason 说明为什么无法计算指纹，供前端提示（不阻断发布）
@@ -400,6 +434,9 @@ type StartRequest struct {
 	Remark           string
 	// NoReuse 用户选择"即使内容相同也重新构建"：跳过复用已有镜像，强制执行 docker build
 	NoReuse bool
+	// KeepSameImage 用户已确认"镜像内容与线上相同仍要部署"（并附上确认时的镜像摘要），
+	// 流水线在部署前一致性检查遇到同摘要时不再中止；摘要对不上则视为确认已过期，照常检查
+	KeepSameImage string
 	// BuildDir / BuildCmd 前端未保存的构建配置草稿，非空时覆盖已保存配置
 	BuildDir string
 	BuildCmd string
@@ -548,6 +585,7 @@ func (e *Engine) startDeploy(parent context.Context, req StartRequest) (*store.R
 		store.Stage{Name: "upload", Title: "SFTP 上传至产物目录", Status: store.StatusPending},
 		store.Stage{Name: "sync", Title: "准备构建上下文", Status: store.StatusPending},
 		store.Stage{Name: "build", Title: "执行镜像构建", Status: store.StatusPending},
+		store.Stage{Name: "consistency", Title: "确认镜像内容与线上不同", Status: store.StatusPending},
 	)
 	if strings.TrimSpace(app.PushCmd) != "" {
 		stages = append(stages, store.Stage{Name: "push", Title: "推送镜像", Status: store.StatusPending})
@@ -613,6 +651,7 @@ func (e *Engine) startDeploy(parent context.Context, req StartRequest) (*store.R
 			artifact:      localArtifact,
 			runLocalBuild: req.RunLocalBuild,
 			noReuse:       req.NoReuse,
+			keepSameImage: req.KeepSameImage,
 			precheck:      pre,
 		}
 		err := runner.run()
@@ -768,6 +807,7 @@ type pipelineRunner struct {
 	artifact      string
 	runLocalBuild bool
 	noReuse       bool // 用户明确要求重新构建：不复用内容相同的已有镜像
+	keepSameImage string
 	precheck      *PrecheckResult
 }
 
@@ -1059,6 +1099,14 @@ func (r *pipelineRunner) run() error {
 		if skipped > 0 {
 			fmt.Fprintf(w, "[警告] 构建命令中有 %d 处输入无法静态解析（通配符 / --build-arg 等），镜像内容比对可能不完整\n", skipped)
 		}
+		// 产物内容与历史版本相同：即使换了 Tag、换了文件名，构建出的镜像也是同一个。
+		// 这里只按产物 SHA256 判断，不依赖构建命令能否静态解析，因此改名换 Tag 也绕不过去。
+		if prev := r.engine.Store.FindByFileSHA256(r.app.ID, r.rel.FileSHA256); prev != nil {
+			fmt.Fprintf(w, "[警告] 本次本地产物与已发布版本 %s 的产物内容完全相同（产物 SHA256: %s）：即使换 Tag 或换文件名，构建出的镜像仍然是同一个\n",
+				prev.Tag, buildstage.Short(r.rel.FileSHA256, 12))
+			r.update(func(rel *store.Release) { rel.DuplicateOf = prev.ID })
+			r.rel.DuplicateOf = prev.ID
+		}
 		if prev := r.engine.Store.FindFingerprint(r.app.ID, fp); prev != nil {
 			fmt.Fprintf(w, "[警告] 本次产物与构建上下文和已发布版本 %s 完全相同：构建出的镜像内容与它一致，本 Tag 只是同一个镜像的另一个名字\n", prev.Tag)
 		} else if !spec.Tagged {
@@ -1097,47 +1145,45 @@ func (r *pipelineRunner) run() error {
 	}
 
 	// 4. 执行镜像构建（或复用内容相同的已有镜像）
+	built := false
 	if err := r.stage("build", func(w io.Writer) error {
-		if r.noReuse {
-			fmt.Fprintln(w, "已选择重新构建：跳过复用已有镜像，直接执行 docker build")
-			if err := r.buildImage(w); err != nil {
-				return err
-			}
-			if err := r.labelImage(w); err != nil {
-				fmt.Fprintf(w, "[警告] 写入镜像指纹标签失败（不影响发布）: %v\n", err)
-			}
-			return r.checkBuiltImage(w)
-		}
-		reuse, full, err := r.findReusableImage(w)
-		if err != nil {
-			return err
-		}
-		if reuse != "" && full != "" {
-			// 前提：复用镜像与内容相同的历史镜像打上本 Tag。只做 RENAME，产物与构建上下文由指纹保证一致，
-			// 因此不会把"构建命令本身会失败"的情况静默放过去
-			fmt.Fprintf(w, "✔ 已找到内容相同的镜像 %s（摘要 %s，由历史版本构建，构建输入指纹与本次一致）\n", reuse, buildstage.Short(full, 19))
-			fmt.Fprintf(w, "复用构建结果，不重复执行 docker build，仅追加 Tag: %s\n", r.rel.Image)
-			if err := r.retagImage(w, reuse, full); err != nil {
-				fmt.Fprintf(w, "[警告] 为内容相同的镜像追加 Tag 失败，将退回正常构建: %v\n", err)
-				return r.buildImage(w)
-			}
-			r.update(func(rel *store.Release) { rel.ImageSummary = full })
-			r.rel.ImageSummary = full
-			return nil
-		}
-
-		if err := r.buildImage(w); err != nil {
-			return err
-		}
-		if err := r.labelImage(w); err != nil {
-			fmt.Fprintf(w, "[警告] 写入镜像指纹标签失败（不影响发布）: %v\n", err)
-		}
-		// 摘要已在 labelImage 中取得并写入记录；内容与线上完全相同的情况在这里拒绝部署
-		return r.checkBuiltImage(w)
+		var err error
+		built, err = r.runBuildStage(w)
+		return err
 	}); err != nil {
 		return err
 	}
 
+	// 4.5 部署前确认：以镜像内容摘要（而不是产物哈希）判断本次是否真的改变了线上镜像。
+	// 重复时中止并等待用户确认（记录状态 needs_confirm），确认后由 ResumeRelease 从 runFromDeploy 继续。
+	if err := r.confirmBeforeDeploy(built); err != nil {
+		return err
+	}
+
+	return r.runFromDeploy()
+}
+
+// confirmBeforeDeploy 部署前的一致性确认（两种形态口径一致，都在改动线上之前执行）。
+// 用户已确认过同一摘要（TargetSummary 与本次一致）时直接放行。
+func (r *pipelineRunner) confirmBeforeDeploy(built bool) error {
+	if r.rel.ImageSummary == "" || r.rel.TargetSummary == r.rel.ImageSummary {
+		return nil
+	}
+	if !built {
+		// 本次未产生新镜像（如构建阶段失败已返回）；走不到这里，留作防御
+		return nil
+	}
+	return r.stage("consistency", func(w io.Writer) error {
+		if r.app.DeployMode == config.DeployModeDocker {
+			return r.confirmDockerNotSame(w)
+		}
+		return r.confirmNotDeployed(w)
+	})
+}
+
+// runFromDeploy 推送、部署与就绪等待。首次执行与"重复确认后继续"共用这一段：
+// 继续时不需要重新上传、重新构建，直接用记录里已构建好的镜像。
+func (r *pipelineRunner) runFromDeploy() error {
 	// 5. 推送镜像（如果有配置 pushCmd）
 	if strings.TrimSpace(r.app.PushCmd) != "" {
 		if err := r.stage("push", func(w io.Writer) error {
@@ -1196,7 +1242,191 @@ func (r *pipelineRunner) run() error {
 	return nil
 }
 
+// runBuildStage 执行构建阶段的全部处理；返回 true 表示已得到实际镜像（构建或复用），
+// 需要再由 confirmNotDeployed 做部署前的一致性确认。
+func (r *pipelineRunner) runBuildStage(w io.Writer) (bool, error) {
+	if r.noReuse {
+		fmt.Fprintln(w, "已选择重新构建：跳过复用已有镜像，直接执行 docker build")
+		if err := r.buildImage(w); err != nil {
+			return false, err
+		}
+		if err := r.labelImage(w); err != nil {
+			fmt.Fprintf(w, "[警告] 写入镜像指纹标签失败（不影响发布）: %v\n", err)
+		}
+		return true, r.checkBuiltImage(w)
+	}
+	reuse, full, err := r.findReusableImage(w)
+	if err != nil {
+		return false, err
+	}
+	if reuse != "" && full != "" {
+		// 前提：复用镜像与内容相同的历史镜像打上本 Tag。只做 RENAME，产物与构建上下文由指纹保证一致，
+		// 因此不会把"构建命令本身会失败"的情况静默放过去
+		fmt.Fprintf(w, "✔ 已找到内容相同的镜像 %s（摘要 %s，由历史版本构建，构建输入指纹与本次一致）\n", reuse, buildstage.Short(full, 19))
+		fmt.Fprintf(w, "复用构建结果，不重复执行 docker build，仅追加 Tag: %s\n", r.rel.Image)
+		if err := r.retagImage(w, reuse, full); err != nil {
+			fmt.Fprintf(w, "[警告] 为内容相同的镜像追加 Tag 失败，将退回正常构建: %v\n", err)
+			return false, r.buildImage(w)
+		}
+		r.update(func(rel *store.Release) { rel.ImageSummary = full })
+		r.rel.ImageSummary = full
+		// 复用镜像同样要与线上比对：换 Tag 并不能绕开"镜像内容没变"的提醒
+		r.warnIfSameAsCurrent(w, full)
+		return true, nil
+	}
+
+	if err := r.buildImage(w); err != nil {
+		return false, err
+	}
+	if err := r.labelImage(w); err != nil {
+		fmt.Fprintf(w, "[警告] 写入镜像指纹标签失败（不影响发布）: %v\n", err)
+	}
+	// 摘要已在 labelImage 中取得并写入记录；内容与线上完全相同的情况在这里拒绝部署
+	return true, r.checkBuiltImage(w)
+}
+
+// DuplicateDeployError 构建出的镜像与线上或已发布版本内容完全相同时返回：
+// 不是致命错误，而是"需要用户显式确认是否仍然部署"，API 层据此返回 409 弹窗。
+type DuplicateDeployError struct {
+	// ImageSummary 本次镜像摘要
+	ImageSummary string
+	// CurrentImage / CurrentTag 部署前重新读取的线上镜像摘要与版本
+	CurrentImage string
+	CurrentTag   string
+	// DuplicateTag 与本次镜像内容相同的历史版本
+	DuplicateTag string
+	// SameAsCurrent 与线上正在运行的镜像内容相同（部署后线上不会有任何变化）
+	SameAsCurrent bool
+}
+
+func (d *DuplicateDeployError) Error() string {
+	if d.SameAsCurrent {
+		return fmt.Sprintf("本次镜像与线上正在运行的版本 %s 内容完全相同（镜像摘要 %s），部署后线上不会有任何变化。确认后仍可继续部署",
+			d.CurrentTag, buildstage.Short(d.ImageSummary, 19))
+	}
+	return fmt.Sprintf("本次镜像与历史版本 %s 内容完全相同（镜像摘要 %s），只是换了个 Tag。确认后仍可继续部署",
+		d.DuplicateTag, buildstage.Short(d.ImageSummary, 19))
+}
+
+// confirmNotDeployed 部署前以镜像内容摘要（不是产物哈希）做三方比对：本次镜像 vs 线上实际运行的镜像
+// vs 上一个发布版本。这里重新读取一次线上摘要，而不是沿用 precheck 时的值——
+// 构建到部署之间可能有别的发布或手工变更，沿用旧值会得出错误结论。
+func (r *pipelineRunner) confirmNotDeployed(w io.Writer) error {
+	sum := r.rel.ImageSummary
+	if sum == "" {
+		fmt.Fprintln(w, "[警告] 未能获取本次构建的镜像摘要，跳过部署前的镜像内容一致性检查")
+		return nil
+	}
+
+	current, currentTag := r.liveCurrentImage()
+	if current == "" {
+		fmt.Fprintln(w, "[警告] 部署前无法重新读取线上镜像摘要，跳过镜像内容一致性检查")
+	} else if current == sum {
+		msg := fmt.Sprintf("本次镜像与线上正在运行的版本 %s 内容完全相同（镜像摘要 %s），部署后线上不会有任何变化", currentTag, buildstage.Short(sum, 19))
+		fmt.Fprintf(w, "[警告] %s\n", msg)
+		dup := &DuplicateDeployError{ImageSummary: sum, CurrentImage: current, CurrentTag: currentTag, SameAsCurrent: true}
+		return r.allowIfConfirmed(w, dup)
+	} else {
+		fmt.Fprintf(w, "✔ 线上镜像摘要 %s（%s）与本次镜像不同\n", buildstage.Short(current, 19), currentTag)
+	}
+
+	if prev := r.engine.Store.FindByImageSummary(r.app.ID, sum); prev != nil && prev.Tag != r.rel.Tag {
+		msg := fmt.Sprintf("本次镜像与历史版本 %s 内容完全相同（镜像摘要 %s），只是换了个 Tag", prev.Tag, buildstage.Short(sum, 19))
+		fmt.Fprintf(w, "[警告] %s\n", msg)
+		return r.allowIfConfirmed(w, &DuplicateDeployError{ImageSummary: sum, CurrentImage: current, CurrentTag: currentTag, DuplicateTag: prev.Tag})
+	}
+	return nil
+}
+
+// allowIfConfirmed 用户此前已针对同一摘要确认"仍然部署"时记录并放行，否则把重复信息交回给调用方中止
+func (r *pipelineRunner) allowIfConfirmed(w io.Writer, dup *DuplicateDeployError) error {
+	if r.keepSameImage != "" && r.keepSameImage == dup.ImageSummary {
+		r.update(func(rel *store.Release) { rel.TargetSummary = dup.ImageSummary })
+		r.rel.TargetSummary = dup.ImageSummary
+		fmt.Fprintln(w, "✔ 用户已确认镜像内容未变化仍需部署，继续执行")
+		return nil
+	}
+	r.markDuplicate(dup)
+	return dup
+}
+
+// markDuplicate 记录重复来源，供历史页面展示
+func (r *pipelineRunner) markDuplicate(dup *DuplicateDeployError) {
+	id := ""
+	for _, rel := range r.engine.Store.List(r.app.ID, 0) {
+		if rel.ImageSummary == dup.ImageSummary && rel.ID != r.rel.ID {
+			id = rel.ID
+			break
+		}
+	}
+	if id == "" {
+		return
+	}
+	r.update(func(rel *store.Release) { rel.DuplicateOf = id })
+	r.rel.DuplicateOf = id
+}
+
+// confirmDockerNotSame 容器形态部署前确认：本次镜像与容器当前运行的镜像内容一致时中止，等用户确认。
+// 必须放在 docker rm -f 之前调用。
+func (r *pipelineRunner) confirmDockerNotSame(w io.Writer) error {
+	sum := r.rel.ImageSummary
+	if sum == "" || r.rel.TargetSummary == sum {
+		return nil
+	}
+	current, currentTag := r.liveCurrentImage()
+	if current == "" || current != sum {
+		return nil
+	}
+	msg := fmt.Sprintf("本次镜像与容器 %s 当前运行的版本 %s 内容完全相同（镜像摘要 %s），重建容器不会改变线上服务",
+		r.app.DockerContainer, currentTag, buildstage.Short(sum, 19))
+	fmt.Fprintf(w, "[警告] %s\n", msg)
+	return r.allowIfConfirmed(w, &DuplicateDeployError{ImageSummary: sum, CurrentImage: current, CurrentTag: currentTag, SameAsCurrent: true})
+}
+
+// liveCurrentImage 部署前即时读取线上镜像摘要与版本号；取不到时返回空串（由调用方决定如何降级）
+func (r *pipelineRunner) liveCurrentImage() (sum, tag string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	srv := r.srv
+	if r.app.DeployMode == config.DeployModeDocker {
+		insp, err := dockerrun.InspectCmdFor(r.app)
+		if err != nil {
+			return "", ""
+		}
+		out, err := r.engine.SSH.ExecuteOutput(ctx, srv, insp)
+		if err != nil {
+			return "", ""
+		}
+		_, image := dockerrun.ParseInspect(out)
+		if image == "" {
+			return "", ""
+		}
+		if strings.HasPrefix(image, "sha256:") {
+			return image, ""
+		}
+		return normalizeImageID(r.engine.imageSummary(ctx, srv, image)), extractTag(image)
+	}
+	var sum2 string
+	if app := r.app; app.Namespace != "" && app.Deployment != "" && app.Container != "" {
+		if s, err := r.engine.k8sImageIDSummary(ctx, srv, app); err == nil && s != "" {
+			return s, r.precheck.CurrentTag
+		}
+		// kubelet 未上报 imageID（或被裁剪）时退回构建机本地的 inspect，与 precheck 口径一致
+		raw, err := r.engine.SSH.ExecuteOutput(ctx, srv, fmt.Sprintf("kubectl -n %s get deployment %s -o jsonpath=%s",
+			shellQuote(app.Namespace), shellQuote(app.Deployment),
+			shellQuote(fmt.Sprintf(`{.spec.template.spec.containers[?(@.name=="%s")].image}`, app.Container))))
+		if err == nil {
+			if image := strings.TrimSpace(raw); image != "" {
+				sum2 = normalizeImageID(r.engine.imageSummary(ctx, srv, image))
+				return sum2, extractTag(image)
+			}
+		}
+	}
+	return "", ""
+}
+
 // buildSpec 渲染构建命令并解析构建要素；无法解析时在日志中说明，返回 nil 让流水线照常构建
+
 func (r *pipelineRunner) buildSpec(w io.Writer) *buildstage.Spec {
 	spec := r.engine.buildSpec(r.app, r.rel.Tag)
 	if spec == nil {
@@ -1236,18 +1466,6 @@ func pickDigest(list []string) string {
 		return list[0]
 	}
 	return ""
-}
-
-// recordImageSummary 记录构建后镜像的内容摘要，供下次发布比对
-func (r *pipelineRunner) recordImageSummary(w io.Writer, ref string) error {
-	sum := r.inspectImage(ref)
-	if sum == "" {
-		return nil
-	}
-	r.update(func(rel *store.Release) { rel.ImageSummary = sum })
-	r.rel.ImageSummary = sum
-	fmt.Fprintf(w, "镜像内容摘要: %s\n", sum)
-	return nil
 }
 
 // findReusableImage 查找内容相同的已有镜像。
@@ -1382,11 +1600,9 @@ func (r *pipelineRunner) labelImage(w io.Writer) error {
 	return nil
 }
 
-// checkBuiltImage 构建完成后比对镜像内容与已知版本：命中即说明"换了 Tag 的同一个镜像"，只提示不阻断
+// checkBuiltImage 构建阶段读取镜像内容摘要并记录；与历史版本、线上版本完全相同时给出提醒
+// （判定依据是 Docker 镜像摘要，不是产物哈希）。真正的部署前拦截在 confirmNotDeployed。
 func (r *pipelineRunner) checkBuiltImage(w io.Writer) error {
-	if r.rel.ImageFP == "" {
-		return nil
-	}
 	sum := r.inspectImage(r.rel.Image)
 	if sum == "" {
 		return nil
@@ -1406,16 +1622,22 @@ func (r *pipelineRunner) checkBuiltImage(w io.Writer) error {
 			fmt.Fprintf(w, "[警告] 新构建的镜像与历史版本 %s 内容完全相同（摘要 %s）：换 Tag 并不会产生新的镜像内容\n", rel.Tag, sum)
 		}
 	}
-	if cur := r.precheck.CurrentImage; cur != "" && cur == sum && cur == r.rel.PrevImage && r.precheck.CurrentTag == r.rel.Tag {
-		// 构建命令不依赖产物（如只做 docker build、Tag 与产物无关）时，换 Tag 会被误判为"新版本"：
-		// 线上镜像一个字都不会变，这种情况直接拒绝，避免留下一条实际没生效的发布记录
-		return fmt.Errorf("新构建的镜像与线上正在运行的镜像完全相同（摘要 %s），本次发布不会改变线上服务；"+
-			"请确认构建命令确实使用了新产物（或修改 Tag 之外的内容），如构建命令不引用产物，请调整后重试", sum)
-	}
-	if cur := r.precheck.CurrentImage; cur != "" && cur == sum {
-		fmt.Fprintln(w, "[警告] 新构建的镜像与线上当前运行的镜像内容完全相同，本次发布不会改变线上镜像")
-	}
+	r.warnIfSameAsCurrent(w, sum)
 	return nil
+}
+
+// warnIfSameAsCurrent 镜像内容与线上正在运行的镜像一致时提醒：线上镜像不会发生任何变化，换 Tag 也不会改变这一点
+func (r *pipelineRunner) warnIfSameAsCurrent(w io.Writer, sum string) {
+	if sum == "" || r.precheck == nil || !r.sameAsCurrent(sum) {
+		return
+	}
+	fmt.Fprintf(w, "[警告] 本次镜像与线上当前运行的版本 %s 内容完全相同（摘要 %s），本次发布不会改变线上镜像，换 Tag 也不会\n",
+		r.precheck.CurrentTag, buildstage.Short(sum, 19))
+}
+
+// sameAsCurrent 镜像内容摘要是否与线上正在运行的镜像一致
+func (r *pipelineRunner) sameAsCurrent(sum string) bool {
+	return sum != "" && r.precheck != nil && r.precheck.CurrentImage != "" && r.precheck.CurrentImage == sum
 }
 
 // deployDocker 让宿主机上以指定镜像运行（同名容器先移除再启动）。
@@ -1606,10 +1828,14 @@ func (r *pipelineRunner) finish(err error) {
 	now := time.Now()
 	status := store.StatusSuccess
 	if err != nil {
-		// 阶段内已自行处理过的终态（如自动回滚成功）不应在结尾被覆盖
-		if errors.Is(err, context.Canceled) {
+		var dup *DuplicateDeployError
+		switch {
+		case errors.As(err, &dup):
+			// 镜像内容重复：线上什么都没变，标为"待确认"而不是失败，前端据此弹窗
+			status = store.StatusNeedsConfirm
+		case errors.Is(err, context.Canceled):
 			status = store.StatusCanceled
-		} else {
+		default:
 			status = store.StatusFailed
 		}
 	}
@@ -1631,6 +1857,8 @@ func (r *pipelineRunner) finish(err error) {
 			// 自动执行历史版本与磁盘清理
 			r.cleanup()
 		}
+	} else if status == store.StatusNeedsConfirm {
+		r.hub.Logf(fmt.Sprintf("\n==> ⏸️ 已暂停，等待确认: %v", err))
 	} else {
 		r.hub.Logf(fmt.Sprintf("\n==> ❌ 发布终止: %v", err))
 	}
@@ -1672,6 +1900,90 @@ func (r *pipelineRunner) cleanup() {
 
 	// 注意：不自动删除远程 Docker 镜像（包括悬空层与旧版本 tag），历史版本由运维自行管理，
 	// 避免误删回滚依赖的镜像。
+}
+
+// ResumeRelease 用户在"镜像内容完全相同"的弹窗里确认仍然部署后，从部署阶段继续执行同一条发布记录。
+// 不会重新上传或构建：直接使用记录里已构建好的镜像。imageSummary 必须与记录一致，否则说明确认已过期。
+func (e *Engine) ResumeRelease(id, imageSummary string) (*store.Release, error) {
+	rel, err := e.Store.Get(id)
+	if err != nil {
+		return nil, fmt.Errorf("未找到发布记录: %w", err)
+	}
+	if rel.Status != store.StatusNeedsConfirm {
+		return nil, fmt.Errorf("该发布当前状态为 %s，无需继续", rel.Status)
+	}
+	if imageSummary == "" || imageSummary != rel.ImageSummary {
+		return nil, fmt.Errorf("确认的镜像摘要与记录不一致（记录: %s），请重新发布", buildstage.Short(rel.ImageSummary, 19))
+	}
+	if !imageRefRe.MatchString(rel.Image) {
+		return nil, fmt.Errorf("记录中的镜像引用不合法 (%q)，无法继续部署", rel.Image)
+	}
+	app := e.Cfg.FindApp(rel.App)
+	if app == nil {
+		return nil, fmt.Errorf("应用 %s 不存在", rel.App)
+	}
+	if err := validateAppForPipeline(app); err != nil {
+		return nil, err
+	}
+	srv := e.Cfg.FindServer(app.ServerID)
+	if srv == nil {
+		return nil, fmt.Errorf("未找到服务器配置: %s", app.ServerID)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	run := &activeRun{releaseID: rel.ID, cancel: cancel}
+	e.mu.Lock()
+	if r, ok := e.running[app.ID]; ok {
+		e.mu.Unlock()
+		cancel()
+		return nil, fmt.Errorf("应用 %s 正在发布中 (%s)，请稍候", app.Name, r.releaseID)
+	}
+	e.running[app.ID] = run
+	e.mu.Unlock()
+
+	ok := false
+	defer func() {
+		if !ok {
+			cancel()
+			e.releaseRunning(app.ID)
+		}
+	}()
+
+	pre := &PrecheckResult{Current: rel.PrevImage, CurrentTag: extractTag(rel.PrevImage)}
+	running := store.StatusRunning
+	e.Store.Update(rel.ID, func(r *store.Release) {
+		r.Status = running
+		r.TargetSummary = imageSummary
+		r.Error = ""
+		r.FinishedAt = nil
+		for i := range r.Stages {
+			if r.Stages[i].Name == "consistency" {
+				r.Stages[i].Status = store.StatusSkipped
+			}
+		}
+	})
+	ok = true
+
+	hub := newHub(e.LogPath(rel.ID))
+	hub.Logf("==> 用户已确认镜像内容未变化，仍要继续部署")
+
+	e.mu.Lock()
+	e.hubs[rel.ID] = hub
+	e.mu.Unlock()
+
+	go func() {
+		defer cancel()
+		defer e.releaseRunning(app.ID)
+		cur, _ := e.Store.Get(rel.ID)
+		runner := &pipelineRunner{
+			engine: e, ctx: ctx, rel: cur, app: app, srv: srv, hub: hub, precheck: pre,
+		}
+		err := runner.runFromDeploy()
+		runner.finish(err)
+		hub.Close()
+		e.dropHub(rel.ID)
+	}()
+	return rel, nil
 }
 
 func (e *Engine) Hub(id string) *Hub {

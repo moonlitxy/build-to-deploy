@@ -100,3 +100,20 @@ func TryAutoRollbackForTest(r *RunnerLike, cause error) {
 func UpdateRemoteYamlForTest(r *RunnerLike, w io.Writer, image string) error {
 	return r.updateRemoteK8sYamlImage(w, image)
 }
+
+// SetKeepSameImageForTest 设置"用户已确认的镜像摘要"
+func (r *RunnerLike) SetKeepSameImageForTest(sum string) { r.keepSameImage = sum }
+
+// SetPrecheckForTest 设置预检结果（线上版本信息）
+func (r *RunnerLike) SetPrecheckForTest(pre *PrecheckResult) { r.precheck = pre }
+
+// SetImageSummaryForTest 设置本次镜像摘要
+func (r *RunnerLike) SetImageSummaryForTest(sum string) {
+	r.rel.ImageSummary = sum
+}
+
+// ConfirmBeforeDeployForTest 包装 confirmBeforeDeploy
+func ConfirmBeforeDeployForTest(r *RunnerLike, built bool) error { return r.confirmBeforeDeploy(built) }
+
+// NormalizeImageIDForTest 包装 normalizeImageID
+func NormalizeImageIDForTest(s string) string { return normalizeImageID(s) }

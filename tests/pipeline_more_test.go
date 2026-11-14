@@ -161,6 +161,154 @@ func TestPMoreReuseImageOnRebuild(t *testing.T) {
 	_ = cfg
 }
 
+// Docker 形态：线上容器运行的镜像与本次重建结果内容一致时，必须提醒并拒绝部署（换 Tag 也不会改变线上）
+func TestPMoreWarnWhenRebuildSameAsDockerContainer(t *testing.T) {
+	eng, _, st, fake, app := newScriptedEnv(t, config.DeployModeDocker)
+	sum := "sha256:" + strings.Repeat("9", 64)
+	fake.addRules(
+		scriptRule{"docker images -q", ""},
+		scriptRule{"docker inspect", "running " + app.Image + ":v0.9.0"},
+		scriptRule{"docker images --no-trunc", ""},
+	)
+	fake.prependRules(scriptRule{"docker image inspect", sum + " []"})
+	rel, err := eng.StartDeploy(pipeline.StartRequest{AppID: app.ID, Tag: "v1.0.0", UseLocalArtifact: true, NoReuse: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := waitDoneStrict(t, st, rel.ID)
+	log := readLogFile(t, eng, rel.ID)
+	if !strings.Contains(log, "与线上当前运行的版本 v0.9.0 内容完全相同") {
+		t.Fatalf("重建结果与线上容器一致时应提醒:\n%s", log)
+	}
+	if done.Status != store.StatusNeedsConfirm {
+		t.Fatalf("镜像摘要与线上容器一致时应暂停并等待确认: status=%s\n%s", done.Status, log)
+	}
+	if strings.Contains(log, "docker rm -f") {
+		t.Fatalf("被拦截时不应重启容器:\n%s", log)
+	}
+}
+
+// 直接执行 docker build 时，若结果与线上正在运行的版本内容一致，即使换成别的 Tag 也要提醒
+func TestPMoreWarnWhenBuiltImageSameAsCurrent(t *testing.T) {
+	eng, _, st, fake, app := newScriptedEnv(t, config.DeployModeK8s)
+	// 线上运行的 v0.9.0 与本次构建结果的镜像摘要一致（两条 inspects 都返回同一个摘要）
+	sum := "sha256:" + strings.Repeat("9", 64)
+	// 线上镜像的内容摘要查询（含 xargs 的更具体命令）必须排在 "docker image inspect" 之前命中
+	fake.addRules(
+		scriptRule{"docker images -q", ""},
+		scriptRule{"get deployment", "app/demo:v0.9.0"},
+		scriptRule{"docker images --no-trunc", ""},
+	)
+	fake.prependRules(
+		scriptRule{"xargs -r docker image inspect", sum + " []"},
+		scriptRule{"docker image inspect", sum + " []"},
+	)
+	rel, err := eng.StartDeploy(pipeline.StartRequest{AppID: app.ID, Tag: "v1.0.0", UseLocalArtifact: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := waitDoneStrict(t, st, rel.ID)
+	log := readLogFile(t, eng, rel.ID)
+	// 判定依据是镜像摘要：构建阶段先提醒，部署前的一致性确认阶段再拦截
+	if !strings.Contains(log, "与线上当前运行的版本 v0.9.0 内容完全相同") {
+		t.Fatalf("镜像内容与线上相同时应提醒，换 Tag 也一样:\n%s", log)
+	}
+	if done.Status != store.StatusNeedsConfirm || !strings.Contains(done.Error, "部署后线上不会有任何变化") {
+		t.Fatalf("镜像摘要与线上相同时应暂停并等待确认: status=%s err=%s\n%s", done.Status, done.Error, log)
+	}
+	if strings.Contains(log, "kubectl apply") || strings.Contains(log, "rollout status") {
+		t.Fatalf("被拦截时不应执行部署:\n%s", log)
+	}
+}
+
+// 镜像内容与线上相同 → 暂停；用户确认同一摘要后从部署阶段继续，不重新构建
+func TestPMoreResumeAfterDuplicateConfirm(t *testing.T) {
+	eng, _, st, fake, app := newScriptedEnv(t, config.DeployModeK8s)
+	sum := "sha256:" + strings.Repeat("9", 64)
+	fake.addRules(
+		scriptRule{"docker images -q", ""},
+		scriptRule{"get deployment", "app/demo:v0.9.0"},
+		scriptRule{"docker images --no-trunc", ""},
+	)
+	fake.prependRules(
+		scriptRule{"xargs -r docker image inspect", sum + " []"},
+		scriptRule{"docker image inspect", sum + " []"},
+	)
+	rel, err := eng.StartDeploy(pipeline.StartRequest{AppID: app.ID, Tag: "v1.0.0", UseLocalArtifact: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := waitDoneStrict(t, st, rel.ID)
+	if done.Status != store.StatusNeedsConfirm {
+		t.Fatalf("应进入待确认状态: %s\n%s", done.Status, readLogFile(t, eng, rel.ID))
+	}
+	if strings.Contains(readLogFile(t, eng, rel.ID), "kubectl apply") {
+		t.Fatal("待确认时不应部署")
+	}
+
+	// 摘要对不上：拒绝继续
+	if _, err := eng.ResumeRelease(rel.ID, "sha256:other"); err == nil {
+		t.Fatal("摘要不一致时应拒绝继续")
+	}
+	// 状态已不是待确认时也拒绝
+	if _, err := eng.ResumeRelease("nope", sum); err == nil {
+		t.Fatal("不存在的记录应报错")
+	}
+
+	fake.cmds = nil
+	if _, err := eng.ResumeRelease(rel.ID, sum); err != nil {
+		t.Fatal(err)
+	}
+	final := waitDoneStrict(t, st, rel.ID)
+	log := readLogFile(t, eng, rel.ID)
+	if final.Status != store.StatusSuccess {
+		t.Fatalf("确认后应继续完成部署: %s\n%s", final.Status, log)
+	}
+	if final.TargetSummary != sum {
+		t.Fatalf("应记录确认的镜像摘要: %q", final.TargetSummary)
+	}
+	cmds := strings.Join(fake.snapshot(), "\n")
+	if !strings.Contains(cmds, "kubectl apply") || strings.Contains(cmds, "docker build -t") || strings.Contains(cmds, "docker tag") {
+		t.Fatalf("继续时只应部署，不应重新构建或重新打 Tag:\n%s", cmds)
+	}
+	// 再次继续：状态已不是待确认
+	if _, err := eng.ResumeRelease(rel.ID, sum); err == nil {
+		t.Fatal("已完成的记录不应再次继续")
+	}
+}
+
+// 并发保护：同一应用已有流水线在跑时，确认继续部署必须被拒绝，不能出现两条流水线同时改线上
+func TestPMoreResumeRejectsWhenAnotherReleaseRunning(t *testing.T) {
+	eng, _, st, fake, app := newScriptedEnv(t, config.DeployModeK8s)
+	sum := "sha256:" + strings.Repeat("9", 64)
+	fake.addRules(
+		scriptRule{"docker images -q", ""},
+		scriptRule{"get deployment", "app/demo:v0.9.0"},
+		scriptRule{"docker images --no-trunc", ""},
+	)
+	fake.prependRules(
+		scriptRule{"xargs -r docker image inspect", sum + " []"},
+		scriptRule{"docker image inspect", sum + " []"},
+	)
+	rel, err := eng.StartDeploy(pipeline.StartRequest{AppID: app.ID, Tag: "v1.0.0", UseLocalArtifact: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitDoneStrict(t, st, rel.ID)
+
+	// 模拟另一条发布正在占用该应用
+	var cancellation context.CancelFunc = func() {}
+	done := make(chan struct{})
+	pipeline.MarkRunningForTest(eng, app.ID, "other-release", cancellation)
+	defer func() {
+		pipeline.ReleaseRunningForTest(eng, app.ID)
+		close(done)
+	}()
+	if _, err := eng.ResumeRelease(rel.ID, sum); err == nil || !strings.Contains(err.Error(), "正在发布中") {
+		t.Fatalf("并发时应拒绝继续: %v", err)
+	}
+}
+
 // TestPMoreNoReuseForcesRebuild 用户明确选择"仍然重新构建"时不复用内容相同的已有镜像
 func TestPMoreNoReuseForcesRebuild(t *testing.T) {
 	eng, _, st, fake, app := newScriptedEnv(t, config.DeployModeDocker)

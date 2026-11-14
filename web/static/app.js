@@ -457,7 +457,14 @@ function handleSelectedFile(file) {
 // ---------------- 发布主流程 ----------------
 function setupButtons() {
   $('startDeployBtn').addEventListener('click', onStartDeployClick);
-  $('conflictConfirmBtn').addEventListener('click', onConfirmConflictDeploy);
+  $('conflictConfirmBtn').addEventListener('click', () => {
+    // 同一个弹窗承载两种场景：版本冲突（覆盖/复用）与镜像内容重复（仍在部署中确认继续）
+    if ($('conflictModal').dataset.mode === 'duplicate') {
+      onConfirmDuplicateDeploy();
+      return;
+    }
+    onConfirmConflictDeploy();
+  });
   $('conflictRebuildBtn').addEventListener('click', onRebuildInsteadOfReuse);
   $('conflictCancelBtn').addEventListener('click', () => $('conflictModal').classList.add('hidden'));
   $('clearLogBtn').addEventListener('click', () => { $('logConsole').textContent = ''; });
@@ -787,24 +794,41 @@ async function onStartDeployClick() {
   startDeployPipeline(appId, tag, remark, false, isLocalBuild, useDefaultArtifact);
 }
 
+// showConflictModal 展示预检冲突并让用户确认；k8s-image（线上内容重复）与会丢弃线上版本的覆盖都不是"复用"
 function showConflictModal(conflicts, tag) {
+  if ($('conflictIntro')) $('conflictIntro').textContent = '检测到目标服务器或线上环境已存在与当前完全相同的镜像 Tag 版本：';
   const itemsHtml = conflicts.map((c) => `<div class="conflict-item">[${c.source}] ${escapeHtml(c.message)}</div>`).join('');
   $('conflictItems').innerHTML = itemsHtml;
-  // 只有"同内容镜像"类冲突时，说明覆盖不会产生新镜像：把提示尾注也换掉，避免让用户以为会重新构建
-  const imageOnly = conflicts.every((c) => c.kind === 'image');
+  // 仅"服务器上本地已有同内容镜像"（docker-image）会走复用；线上正在跑的同内容镜像（k8s-image）不能当成复用
+  const reusable = conflicts.length > 0 && conflicts.every((c) => c.source === 'docker-image');
   const foot = $('conflictFoot');
   if (foot) {
-    foot.innerHTML = imageOnly
+    foot.innerHTML = reusable
       ? '继续发布将<strong>直接复用内容相同的已有镜像</strong>（只追加新 Tag），不会重新构建，线上镜像内容不会变化。'
       : '继续发布将<strong>覆盖构建该镜像</strong>并执行 K8s 滚动更新。请确认是否强制覆盖？';
   }
+  setModalTone(reusable ? 'notice' : 'danger');
   setConflictActions({
-    title: imageOnly ? '检测到镜像内容重复' : '发现版本冲突 - 需二次确认',
-    confirmText: imageOnly ? '复用已有镜像并添加新 Tag' : '确认覆盖并继续发布',
-    showRebuild: imageOnly,
+    title: reusable ? '检测到镜像内容重复' : '发现版本冲突 - 需二次确认',
+    confirmText: reusable ? '复用已有镜像并添加新 Tag' : '确认覆盖并继续发布',
+    showRebuild: reusable,
   });
   // 服务端真实模式下会直接拒绝同指纹发布；前端在覆盖确认后仍以 force=true 提交，由服务端决定是否放行
   $('conflictModal').classList.remove('hidden');
+}
+
+// setModalTone 设置弹窗语气：danger（覆盖/冲突，红色）或 notice（重复提醒，琥珀色）
+function setModalTone(tone) {
+  const card = document.querySelector('#conflictModal .modal-card');
+  const badge = document.querySelector('#conflictModal .modal-icon-badge');
+  [card, badge].forEach((el) => {
+    if (!el) return;
+    el.classList.remove('is-danger', 'is-notice');
+    el.classList.add(tone === 'danger' ? 'is-danger' : 'is-notice');
+  });
+  const confirmBtn = $('conflictConfirmBtn');
+  if (confirmBtn) confirmBtn.classList.toggle('btn-danger', tone === 'danger');
+  if (confirmBtn) confirmBtn.classList.toggle('btn-primary', tone !== 'danger');
 }
 
 // setConflictActions 统一控制冲突弹窗的标题与按钮（需求的"是否把新 Tag 指向已有镜像"）
@@ -831,6 +855,7 @@ function showImageDupModal(info) {
   if (foot) {
     foot.innerHTML = '这通常意味着产物没有重新编译，或只是改了个文件名/换了 Tag。请选择：<strong>复用已有镜像</strong>（只把新 Tag 指向它，最快）或<strong>仍然重新构建</strong>（构建出的内容仍会相同）。';
   }
+  setModalTone('notice');
   setConflictActions({
     title: '镜像内容重复 - 选择如何处理新 Tag',
     confirmText: '复用已有镜像并添加新 Tag',
@@ -854,6 +879,67 @@ async function onRebuildInsteadOfReuse() {
   const { appId, tag, remark, isLocalBuild, useDefaultArtifact, uploadId } = state.pendingReleaseParams;
   appendLog(`[确认覆盖] 用户选择重新构建镜像（不复用已有镜像），版本: ${tag}`);
   startDeployPipeline(appId, tag, remark, true, isLocalBuild, useDefaultArtifact, true, uploadId || '', true);
+}
+
+// 镜像内容重复（以镜像摘要为准）：线上不会有变化，由用户决定是否仍然部署
+function showDuplicateDeployModal(info, releaseId) {
+  if ($('conflictIntro')) $('conflictIntro').textContent = '部署前按镜像内容摘要（Docker image digest）比对，检测到重复：';
+  const short = (v) => (v ? escapeHtml(String(v).slice(0, 19)) + '…' : '-');
+  $('conflictItems').innerHTML = `
+    <div class="conflict-item">🧱 本次镜像摘要：<code>${short(info.imageSummary)}</code></div>
+    ${info.sameAsCurrent
+      ? `<div class="conflict-item">线上正在运行的版本：<strong>${escapeHtml(info.currentTag || '-')}</strong>（摘要 <code>${short(info.currentImage)}</code>），与本次镜像<strong>完全相同</strong></div>
+         <div class="conflict-item">⚙️ 部署后线上镜像不会有任何变化，服务内容与现在一致</div>`
+      : `<div class="conflict-item">历史版本 <strong>${escapeHtml(info.duplicateTag || '-')}</strong> 与本次镜像内容完全相同，只是换了个 Tag</div>`}`;
+  const foot = $('conflictFoot');
+  if (foot) {
+    foot.innerHTML = '这通常意味着产物没有重新编译、Dockerfile 与基础镜像都没变。仍然继续将<strong>按当前镜像部署一次</strong>，线上内容不会变化。';
+  }
+  setModalTone('notice');
+  setConflictActions({
+    title: '镜像内容与线上相同 - 确认是否继续部署',
+    confirmText: '仍然部署（内容不变）',
+    showRebuild: false,
+  });
+  // 复用"取消"按钮：直接放弃，发布记录停在待确认状态
+  $('conflictModal').dataset.mode = 'duplicate';
+  $('conflictModal').dataset.releaseId = releaseId || '';
+  $('conflictModal').dataset.imageSummary = info.imageSummary || '';
+  $('conflictModal').classList.remove('hidden');
+  state.isDeploying = false;
+  $('startDeployBtn').disabled = false;
+  $('cancelReleaseBtn').classList.add('hidden');
+}
+
+async function onConfirmDuplicateDeploy() {
+  const modal = $('conflictModal');
+  const releaseId = modal.dataset.releaseId;
+  const imageSummary = modal.dataset.imageSummary;
+  modal.classList.add('hidden');
+  modal.dataset.mode = '';
+  if (!releaseId) {
+    alert('发布记录已丢失，请重新发布');
+    return;
+  }
+  appendLog(`[确认] 用户确认镜像内容未变化，仍继续部署: ${releaseId}`);
+  state.isDeploying = true;
+  $('startDeployBtn').disabled = true;
+  $('cancelReleaseBtn').classList.remove('hidden');
+  const res = await api('POST', `/api/releases/${encodeURIComponent(releaseId)}/resume`, { imageSummary });
+  if (!res.ok) {
+    if (res.status === 409 && res.data && res.data.duplicate) {
+      // 确认期间线上又变了：用新的摘要重新弹窗
+      showDuplicateDeployModal(res.data.duplicate, releaseId);
+      return;
+    }
+    alert(`继续部署失败: ${res.data.error || res.status}`);
+    updateStatus('failed', '继续部署失败');
+    resetDeployUi();
+    return;
+  }
+  state.releaseId = releaseId;
+  updateStatus('running', '已确认继续部署');
+  listenReleaseEvents(releaseId);
 }
 
 // resetDeployUi 让发布按钮恢复可点击（预检/校验弹窗返回或异常时）
@@ -924,6 +1010,11 @@ async function startDeployPipeline(appId, tag, remark, force, isLocalBuild, useD
     });
     state.uploadId = ''; // 已交给发布流水线，避免下次预检误用
 
+    if (startRes.status === 409 && startRes.data && startRes.data.duplicate) {
+      // 构建出的镜像与线上/历史版本内容完全相同：流水线已暂停，等用户在弹窗里决定
+      showDuplicateDeployModal(startRes.data.duplicate, startRes.data.id || state.releaseId || '');
+      return;
+    }
     if (!startRes.ok) {
       throw new Error(startRes.data.error || '启动发布流水线失败');
     }
@@ -1057,8 +1148,17 @@ function listenReleaseEvents(releaseId, isReconnect = false) {
   es.addEventListener('release', (e) => {
     const rel = JSON.parse(e.data);
     renderStages(rel.stages || []);
-    const finished = ['success', 'failed', 'canceled', 'rolledback'].includes(rel.status);
-    if (rel.status === 'success') {
+    const finished = ['success', 'failed', 'canceled', 'rolledback', 'needs_confirm'].includes(rel.status);
+    if (rel.status === 'needs_confirm') {
+      // 流水线在部署前检测到镜像内容重复并已暂停：弹出确认框，确认后调 /resume 继续
+      updateStatus('idle', '等待确认是否仍要部署');
+      showDuplicateDeployModal({
+        imageSummary: rel.imageSummary || '',
+        sameAsCurrent: true,
+        currentTag: (rel.error || '').match(/版本\s+(\S+?)\s+内容完全相同/)?.[1] || '',
+        currentImage: '',
+      }, rel.id);
+    } else if (rel.status === 'success') {
       updateStatus('success', '发布完成');
     } else if (rel.status === 'failed' || rel.status === 'canceled') {
       updateStatus('failed', rel.status === 'canceled' ? '已中止' : '发布失败');

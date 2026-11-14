@@ -106,6 +106,26 @@ func TestStoreStoreFindByImageAndFingerprint(t *testing.T) {
 	if got := st.FindByImage("app", "sha256:ddd"); len(got) != 1 {
 		t.Fatalf("rolledback 记录应命中: %+v", got)
 	}
+
+	// 按产物 SHA256 查找：与 Tag、文件名无关
+	a.FileSHA256 = "file-1"
+	st.Update("a1", func(r *store.Release) { r.FileSHA256 = "file-1" })
+	if got := st.FindByFileSHA256("app", "file-1"); got == nil || got.ID != "a1" {
+		t.Fatalf("FindByFileSHA256 = %+v", got)
+	}
+	if got := st.FindByFileSHA256("app", ""); got != nil {
+		t.Fatal("空产物摘要不应命中")
+	}
+	if got := st.FindByFileSHA256("other", "file-1"); got != nil {
+		t.Fatal("不同应用不应命中")
+	}
+	failed := newStoreRelease("f1", "app", "v5")
+	failed.Status = store.StatusFailed
+	failed.FileSHA256 = "file-failed"
+	st.Add(failed)
+	if got := st.FindByFileSHA256("app", "file-failed"); got != nil {
+		t.Fatalf("失败记录不应命中: %+v", got)
+	}
 }
 
 func TestStoreStoreCopyAndDone(t *testing.T) {

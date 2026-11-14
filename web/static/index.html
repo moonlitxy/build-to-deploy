@@ -424,13 +424,13 @@
 
 <!-- 模态弹窗：Tag 版本冲突确认覆盖 (需求 2 核心) -->
 <div id="conflictModal" class="modal-backdrop hidden">
-  <div class="modal-card modal-warn">
+  <div class="modal-card modal-warn is-notice">
     <div class="modal-header">
-      <div class="modal-icon-badge"><svg class="icon"><use href="#i-alert"/></svg></div>
+      <div class="modal-icon-badge is-notice"><svg class="icon"><use href="#i-alert"/></svg></div>
       <h3 class="modal-title" id="conflictModalTitle">发现版本冲突 - 需二次确认</h3>
     </div>
     <div class="modal-body">
-      <p class="warn-text">检测到目标服务器或线上环境已存在与当前完全相同的镜像 Tag 版本：</p>
+      <p class="warn-text" id="conflictIntro">检测到目标服务器或线上环境已存在与当前完全相同的镜像 Tag 版本：</p>
       <div id="conflictItems" class="conflict-list"></div>
       <p class="warn-foot" id="conflictFoot">继续发布将<strong>覆盖构建该镜像</strong>并执行 K8s 滚动更新。请确认是否强制覆盖？</p>
     </div>
