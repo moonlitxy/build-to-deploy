@@ -57,23 +57,29 @@ type Pool struct {
 	keepTick    time.Duration
 	newSFTPLazy func(*ssh.Client) (*sftp.Client, error)
 	heartbeat   func(*Pool, string, *ssh.Client, chan struct{})
-	// cleanupTick 非空时用测试提供的 tick 源驱动清理循环
+	// cleanupTick 非空时用测试提供的 tick 源驱动清理循环（只在启动清理循环前设置一次）
 	cleanupTick <-chan time.Time
 }
 
 var GlobalPool = NewPool()
 
 func NewPool() *Pool {
-	p := &Pool{
+	p := newPool()
+	// 定时清理超过 30 分钟未使用的连接
+	go p.cleanupLoop()
+	return p
+}
+
+// newPool 构造连接池但不启动后台清理循环。
+// cleanupTick 在构造时确定：后台循环只读取一次，避免测试中途替换 tick 源造成数据竞争。
+func newPool() *Pool {
+	return &Pool{
 		conns:     make(map[string]*cachedConn),
 		dial:      dialSSH,
 		newSFTP:   func(c *ssh.Client) (*sftp.Client, error) { return sftp.NewClient(c) },
 		keepalive: sendKeepalive,
 		keepTick:  25 * time.Second,
 	}
-	// 定时清理超过 30 分钟未使用的连接
-	go p.cleanupLoop()
-	return p
 }
 
 // sendKeepalive 默认心跳：向服务器发一个无害的全局请求，能收到回复即认为连接存活
@@ -100,16 +106,16 @@ func (p *Pool) sweepIdle(idle time.Duration) {
 }
 
 func (p *Pool) cleanupLoop() {
-	ticker := time.NewTicker(2 * time.Minute)
-	defer ticker.Stop()
+	// 循环启动后不再读取 cleanupTick 字段：测试注入的 tick 源在构造时已确定
 	if p.cleanupTick != nil {
 		for range p.cleanupTick {
 			p.sweepIdle(30 * time.Minute)
 		}
 		return
 	}
-	for ticker := range p.cleanupTick {
-		_ = ticker
+	ticker := time.NewTicker(2 * time.Minute)
+	defer ticker.Stop()
+	for range ticker.C {
 		p.sweepIdle(30 * time.Minute)
 	}
 }

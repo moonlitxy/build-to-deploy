@@ -93,11 +93,18 @@ func WriteRemoteFileForTest(p *Pool, cfg *ServerConfig, remote, content string) 
 // ConnKeyForTest 暴露连接池键生成规则
 func ConnKeyForTest(cfg *ServerConfig) string { return connKey(cfg) }
 
-// StartCleanupLoop 启动空闲连接清理循环（测试可用 SetCleanupTick 控制节奏）
+// StartCleanupLoop 启动空闲连接清理循环
 func (p *Pool) StartCleanupLoop() { go p.cleanupLoop() }
 
-// SetCleanupTick 用指定 tick 源驱动清理循环
+// SetCleanupTick 指定清理节奏；必须在该池启动任何清理循环之前调用（构造期确定，循环启动后不再读取）
 func (p *Pool) SetCleanupTick(ch <-chan time.Time) { p.cleanupTick = ch }
+
+// NewPoolForTest 构造不自动启动后台清理循环的连接池，测试可控地驱动 sweep
+func NewPoolForTest(tick <-chan time.Time) *Pool {
+	p := newPool()
+	p.cleanupTick = tick
+	return p
+}
 
 // InsertConnForTest 直接插入一条无真实会话的连接，用于验证清理/断开等簿记逻辑不因空连接 panic。
 // 注意：ActiveKeys 只统计真实 ssh 连接，这类条目不会出现在活跃列表里。

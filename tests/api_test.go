@@ -234,6 +234,10 @@ func TestAPIGuardHostAndOrigin(t *testing.T) {
 	if rec.Code == http.StatusForbidden {
 		t.Fatalf("同源请求不应被拒绝")
 	}
+	// GET 同样校验 Origin（DNS rebinding 下可能读到发布日志等敏感数据）
+	if rec = do(t, h, "GET", "/api/releases", "", map[string]string{"Origin": "http://evil.example.com"}); rec.Code != http.StatusForbidden {
+		t.Fatalf("跨站读请求应 403，实际 %d", rec.Code)
+	}
 }
 
 func TestAPIInspectArtifactEndpoint(t *testing.T) {

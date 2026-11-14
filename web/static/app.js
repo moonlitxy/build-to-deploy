@@ -468,7 +468,25 @@ function setupButtons() {
     onConfirmConflictDeploy();
   });
   $('conflictRebuildBtn').addEventListener('click', onRebuildInsteadOfReuse);
-  $('conflictCancelBtn').addEventListener('click', () => $('conflictModal').classList.add('hidden'));
+  $('conflictCancelBtn').addEventListener('click', async () => {
+    const modal = $('conflictModal');
+    const isDuplicate = modal.dataset.mode === 'duplicate';
+    const releaseId = modal.dataset.releaseId;
+    modal.classList.add('hidden');
+    // 镜像重复暂停的记录不在"运行中"，不主动放弃会永远停在待确认
+    if (isDuplicate && releaseId) {
+      const res = await api('POST', `/api/releases/${encodeURIComponent(releaseId)}/cancel`);
+      if (!res.ok) {
+        // 已经在跑（例如另一处确认了继续）时取消接口会报"未在运行"，此时保留原记录即可
+        appendLog(`[提示] 放弃本次发布未生效: ${res.data.error || res.status}`);
+      } else {
+        appendLog('[提示] 已放弃本次发布（镜像内容与线上相同，未部署）');
+        updateStatus('idle', '已放弃');
+      }
+    }
+    modal.dataset.mode = '';
+    modal.dataset.releaseId = '';
+  });
   $('clearLogBtn').addEventListener('click', () => { $('logConsole').textContent = ''; });
   $('refreshPodsBtn').addEventListener('click', refreshPodsManually);
   $('podServerSelect').addEventListener('change', () => {

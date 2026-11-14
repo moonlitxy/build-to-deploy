@@ -20,11 +20,18 @@ import (
 	"build-to-deploy/internal/upload"
 )
 
+// 测试用镜像摘要：线上版本与构建结果必须不同，否则会触发部署前一致性拦截
+var (
+	onlineSum = "sha256:" + strings.Repeat("1", 64)
+	builtSum  = "sha256:" + strings.Repeat("2", 64)
+)
+
 // scriptedRunner 按命令关键字返回预设输出，并记录执行过的命令
 type scriptedRunner struct {
 	mu      sync.Mutex
 	cmds    []string
 	rules   []scriptRule
+	first   []scriptRule
 	runErr  error
 	execErr error
 	files   map[string]string
@@ -49,6 +56,13 @@ func (s *scriptedRunner) ExecuteOutput(ctx context.Context, srv *sshpool.ServerC
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.cmds = append(s.cmds, cmd)
+	// 规则按添加顺序命中；"docker image inspect" 也出现在 "kubectl ... | xargs -r docker image inspect" 里，
+	// 因此更具体的 *First 规则优先，其余仍按顺序
+	for _, r := range s.first {
+		if strings.Contains(cmd, r.contains) {
+			return r.out, nil
+		}
+	}
 	for _, r := range s.rules {
 		if strings.Contains(cmd, r.contains) {
 			return r.out, nil
@@ -94,10 +108,10 @@ func (s *scriptedRunner) addRules(r ...scriptRule) {
 	s.mu.Unlock()
 }
 
-// prependRules 把规则插到最前面：map 无法保证顺序，需要"更具体的命令优先命中"时用这个
+// prependRules 优先规则：在所有普通规则之前命中（用于更具体的命令）
 func (s *scriptedRunner) prependRules(r ...scriptRule) {
 	s.mu.Lock()
-	s.rules = append(append([]scriptRule(nil), r...), s.rules...)
+	s.first = append(append([]scriptRule(nil), r...), s.first...)
 	s.mu.Unlock()
 }
 
@@ -187,8 +201,15 @@ func TestPEngineK8sPipelineSuccess(t *testing.T) {
 	fake.addRules(
 		scriptRule{"docker images -q", ""},
 		scriptRule{"get deployment", "app/demo:v0.9.0"},
-		scriptRule{"docker image inspect", "sha256:111111111111 []"},
-		scriptRule{"docker images --no-trunc", "app/demo:v0.9.0 sha256:111111111111\n"},
+		// 线上摘要必须与构建结果不同，否则会被部署前一致性检查拦下
+		scriptRule{"docker image inspect", builtSum + " []"},
+		scriptRule{"docker images --no-trunc", "app/demo:v0.9.0 " + onlineSum + "\n"},
+	)
+	// 线上镜像摘要查询（kubelet imageID 与 inspect 回退）优先于构建结果的 inspect 规则命中
+	fake.prependRules(
+		scriptRule{"kubectl -n 'prod' get pods", onlineSum + "\n"},
+		scriptRule{"xargs -r docker image inspect", onlineSum + " []"},
+		scriptRule{"docker image inspect -f '{{.Id}} {{json .RepoDigests}}' 'app/demo:v0.9.0'", onlineSum + " []"},
 	)
 	rel, err := eng.StartDeploy(pipeline.StartRequest{AppID: app.ID, Tag: "v1.0.0", UseLocalArtifact: true})
 	if err != nil {
@@ -218,8 +239,15 @@ func TestPEngineWarnOnSameArtifactHash(t *testing.T) {
 	fake.addRules(
 		scriptRule{"docker images -q", ""},
 		scriptRule{"get deployment", "app/demo:v0.9.0"},
-		scriptRule{"docker image inspect", "sha256:111111111111 []"},
-		scriptRule{"docker images --no-trunc", "app/demo:v0.9.0 sha256:111111111111\n"},
+		// 线上摘要必须与构建结果不同，否则会被部署前一致性检查拦下
+		scriptRule{"docker image inspect", builtSum + " []"},
+		scriptRule{"docker images --no-trunc", "app/demo:v0.9.0 " + onlineSum + "\n"},
+	)
+	// 线上镜像摘要查询（kubelet imageID 与 inspect 回退）优先于构建结果的 inspect 规则命中
+	fake.prependRules(
+		scriptRule{"kubectl -n 'prod' get pods", onlineSum + "\n"},
+		scriptRule{"xargs -r docker image inspect", onlineSum + " []"},
+		scriptRule{"docker image inspect -f '{{.Id}} {{json .RepoDigests}}' 'app/demo:v0.9.0'", onlineSum + " []"},
 	)
 	first, err := eng.StartDeploy(pipeline.StartRequest{AppID: app.ID, Tag: "v1.0.0", UseLocalArtifact: true})
 	if err != nil {
@@ -357,8 +385,15 @@ func TestPEngineRequestContextCancelDoesNotKillPipeline(t *testing.T) {
 	fake.addRules(
 		scriptRule{"docker images -q", ""},
 		scriptRule{"get deployment", "app/demo:v0.9.0"},
-		scriptRule{"docker image inspect", "sha256:111111111111 []"},
-		scriptRule{"docker images --no-trunc", "app/demo:v0.9.0 sha256:111111111111\n"},
+		// 线上摘要必须与构建结果不同，否则会被部署前一致性检查拦下
+		scriptRule{"docker image inspect", builtSum + " []"},
+		scriptRule{"docker images --no-trunc", "app/demo:v0.9.0 " + onlineSum + "\n"},
+	)
+	// 线上镜像摘要查询（kubelet imageID 与 inspect 回退）优先于构建结果的 inspect 规则命中
+	fake.prependRules(
+		scriptRule{"kubectl -n 'prod' get pods", onlineSum + "\n"},
+		scriptRule{"xargs -r docker image inspect", onlineSum + " []"},
+		scriptRule{"docker image inspect -f '{{.Id}} {{json .RepoDigests}}' 'app/demo:v0.9.0'", onlineSum + " []"},
 	)
 	// 模拟 HTTP handler：StartDeployContext 返回后请求 ctx 立即被取消（响应写出）
 	reqCtx, reqCancel := context.WithCancel(context.Background())

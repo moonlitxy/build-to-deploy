@@ -77,10 +77,16 @@ func newFakeSSHServer(t *testing.T) (*ssh.Client, func()) {
 // fakePool 用假拨号/假 SFTP 构造连接池，拨号计数用于验证"复用 vs 重建"
 func fakePool(t *testing.T, keepaliveErr error) (*sshpool.Pool, *int32, *ssh.Client) {
 	t.Helper()
+	return fakePoolWithTick(t, nil, keepaliveErr)
+}
+
+// fakePoolWithTick 在构造期注入清理节奏（循环启动后不再替换，避免数据竞争）
+func fakePoolWithTick(t *testing.T, tick <-chan time.Time, keepaliveErr error) (*sshpool.Pool, *int32, *ssh.Client) {
+	t.Helper()
 	master, closer := newFakeSSHServer(t)
 	t.Cleanup(closer)
 	var dials int32
-	p := sshpool.NewPool()
+	p := sshpool.NewPoolForTest(tick)
 	p.SetDial(func(*sshpool.ServerConfig) (*ssh.Client, error) {
 		atomic.AddInt32(&dials, 1)
 		return master, nil
@@ -432,9 +438,8 @@ func TestSSHPoolFakeDialSSHAgentAndDefaultKeyProbe(t *testing.T) {
 }
 
 func TestSSHPoolFakeCleanupLoopSweeps(t *testing.T) {
-	p, _, _ := fakePool(t, nil)
 	tick := make(chan time.Time)
-	p.SetCleanupTick(tick)
+	p, _, _ := fakePoolWithTick(t, tick, nil)
 	go p.StartCleanupLoop()
 	if _, _, err := p.GetClient(fakeCfg); err != nil {
 		t.Fatal(err)

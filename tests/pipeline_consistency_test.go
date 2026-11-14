@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"build-to-deploy/internal/config"
 	"build-to-deploy/internal/pipeline"
@@ -146,5 +148,88 @@ func TestPResumeRefreshesPrevImage(t *testing.T) {
 	}
 	if final.PrevImage != "app/demo:v0.9.5" {
 		t.Fatalf("上一版本应刷新为确认时的线上版本，实际 %q", final.PrevImage)
+	}
+}
+
+// 远端产物摘要与本地不一致时必须中止：防止共用目录时用错别人的产物构建
+func TestPVerifyRemoteArtifact(t *testing.T) {
+	eng, _, _, fake, app := newScriptedEnv(t, config.DeployModeK8s)
+	hub := pipeline.NewHub(filepath.Join(t.TempDir(), "v.log"))
+	defer hub.Close()
+	sum := strings.Repeat("a", 64)
+	rel := &store.Release{ID: "v1", App: app.ID, Tag: "v1.0.0", FileSHA256: sum}
+	r := pipeline.NewRunnerLike(eng, context.Background(), rel, app, eng.Cfg.SSHServers[0], hub, "", nil)
+	var buf strings.Builder
+
+	fake.addRules(scriptRule{"sha256sum", sum + "  /data/p.jar\n"})
+	if err := pipeline.VerifyRemoteArtifactForTest(r, &buf, "/data/p.jar"); err != nil {
+		t.Fatalf("摘要一致时应通过: %v", err)
+	}
+	if !strings.Contains(buf.String(), "校验通过") {
+		t.Fatalf("应打印校验通过: %s", buf.String())
+	}
+
+	// 大小写不同也算一致（sha256sum 输出为小写，但不应因大小写误判）
+	fake.rules = nil
+	fake.addRules(scriptRule{"sha256sum", strings.ToUpper(sum) + "  /data/p.jar\n"})
+	if err := pipeline.VerifyRemoteArtifactForTest(r, &strings.Builder{}, "/data/p.jar"); err != nil {
+		t.Fatalf("大小写不同不应误判: %v", err)
+	}
+
+	// 内容不一致：中止
+	fake.rules = nil
+	fake.addRules(scriptRule{"sha256sum", strings.Repeat("b", 64) + "  /data/p.jar\n"})
+	buf.Reset()
+	if err := pipeline.VerifyRemoteArtifactForTest(r, &buf, "/data/p.jar"); err == nil || !strings.Contains(err.Error(), "不一致") {
+		t.Fatalf("摘要不一致应中止: %v", err)
+	}
+
+	// 远端没有 sha256sum / 命令失败：只告警，不阻断
+	fake.rules = nil
+	fake.execErr = errors.New("command not found")
+	if err := pipeline.VerifyRemoteArtifactForTest(r, &strings.Builder{}, "/data/p.jar"); err != nil {
+		t.Fatalf("无法校验时应降级: %v", err)
+	}
+	fake.execErr = nil
+	fake.addRules(scriptRule{"sha256sum", ""})
+	if err := pipeline.VerifyRemoteArtifactForTest(r, &strings.Builder{}, "/data/p.jar"); err != nil {
+		t.Fatalf("空输出应降级: %v", err)
+	}
+}
+
+// cleanup 只删除当前产物目录下真实存在、且属于本应用上传的文件
+func TestPCleanup(t *testing.T) {
+	eng, _, st, fake, app := newScriptedEnv(t, config.DeployModeK8s)
+	hub := pipeline.NewHub(filepath.Join(t.TempDir(), "c2.log"))
+	defer hub.Close()
+	for i, name := range []string{"a1.jar", "a2.jar", "a3.jar", "a4.jar", "a5.jar", "a6.jar"} {
+		st.Add(&store.Release{ID: "r" + name, App: app.ID, Tag: "v1.0." + strconv.Itoa(i), FileName: name,
+			Status: store.StatusSuccess, CreatedAt: time.Now().Add(time.Duration(i) * time.Minute)})
+	}
+	// 非法文件名不参与清理
+	st.Add(&store.Release{ID: "bad", App: app.ID, Tag: "v9", FileName: "../evil", Status: store.StatusSuccess})
+	rel := &store.Release{ID: "cur", App: app.ID, Tag: "v2", FileName: "a6.jar"}
+	r := pipeline.NewRunnerLike(eng, context.Background(), rel, app, eng.Cfg.SSHServers[0], hub, "", nil)
+	pipeline.CleanupForTest(r)
+
+	var cleanCmd string
+	for _, c := range fake.snapshot() {
+		if strings.Contains(c, "rm -f --") {
+			cleanCmd = c
+		}
+	}
+	if cleanCmd == "" {
+		t.Fatal("超过 5 个版本时应触发清理")
+	}
+	// 文件名全部先列出、再在远端按"真实存在"过滤后 tail，因此最新文件出现在列表里是正常的；
+	// 关键是要保留最近 5 个（tail -n +6）、非法文件名不得出现
+	if strings.Contains(cleanCmd, "../evil") {
+		t.Fatalf("非法文件名不应进入清理列表: %s", cleanCmd)
+	}
+	if !strings.Contains(cleanCmd, "tail -n +6") {
+		t.Fatalf("应保留最近 5 个版本: %s", cleanCmd)
+	}
+	if !strings.Contains(cleanCmd, "[ -f") {
+		t.Fatalf("清理前应确认远端文件真实存在: %s", cleanCmd)
 	}
 }

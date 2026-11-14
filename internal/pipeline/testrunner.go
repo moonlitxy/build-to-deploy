@@ -117,3 +117,11 @@ func ConfirmBeforeDeployForTest(r *RunnerLike, built bool) error { return r.conf
 
 // NormalizeImageIDForTest 包装 normalizeImageID
 func NormalizeImageIDForTest(s string) string { return normalizeImageID(s) }
+
+// VerifyRemoteArtifactForTest 包装 verifyRemoteArtifact
+func VerifyRemoteArtifactForTest(r *RunnerLike, w io.Writer, remotePath string) error {
+	return r.verifyRemoteArtifact(w, remotePath)
+}
+
+// CleanupForTest 包装 cleanup
+func CleanupForTest(r *RunnerLike) { r.cleanup() }

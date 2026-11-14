@@ -177,11 +177,13 @@ func guard(next http.Handler) http.Handler {
 			writeErr(w, http.StatusForbidden, "仅允许通过 localhost 访问本服务: "+r.Host)
 			return
 		}
+		// GET 也可能泄露敏感数据（发布日志、Pod 日志），DNS rebinding 场景下请求可能不带 Origin：
+		// 因此对所有请求都校验 Origin，跨站一律拒绝，不依赖浏览器是否附带该头
+		if origin := r.Header.Get("Origin"); origin != "" && !sameOrigin(origin, r.Host) {
+			writeErr(w, http.StatusForbidden, "跨站请求已被拒绝 (Origin 不匹配)")
+			return
+		}
 		if r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions {
-			if origin := r.Header.Get("Origin"); origin != "" && !sameOrigin(origin, r.Host) {
-				writeErr(w, http.StatusForbidden, "跨站请求已被拒绝 (Origin 不匹配)")
-				return
-			}
 			// 跨站表单提交（text/plain 等"简单" Content-Type）不触发预检、也可能不带 Origin，
 			// 因此除上传分片外，写接口一律只接受 JSON
 			if ct := strings.ToLower(r.Header.Get("Content-Type")); ct != "" && !isJSONContentType(ct) && !(r.Method == http.MethodPut && strings.HasPrefix(ct, "application/octet-stream")) {
@@ -805,9 +807,20 @@ func (s *Server) resolveAppServer(w http.ResponseWriter, appID string) (*config.
 func (s *Server) protectedTags(app *config.AppConfig) map[string]string {
 	out := map[string]string{}
 	prefix := app.Image + ":"
-	for _, rel := range s.engine.Store.List(app.ID, 1) {
-		if tag, ok := strings.CutPrefix(rel.Image, prefix); ok && tag != "" {
+	// 所有成功发布过的版本都要保护：删除其中任何一个都会让对应的历史记录无法回滚。
+	// 平台不自动删镜像的原因正是这一点，手动维护页不能让用户误删掉回滚依赖。
+	for i, rel := range s.engine.Store.List(app.ID, 0) {
+		if rel.Status != store.StatusSuccess && rel.Status != store.StatusRolledBack {
+			continue
+		}
+		tag, ok := strings.CutPrefix(rel.Image, prefix)
+		if !ok || tag == "" || !config.TagRe.MatchString(tag) {
+			continue
+		}
+		if i == 0 {
 			out[tag] = "最近一次发布的版本"
+		} else {
+			out[tag] = "历史发布版本（回滚依赖）"
 		}
 	}
 	// 线上版本可能在列表之外（手工部署 / 回滚过），用一条轻量查询确认
@@ -912,13 +925,23 @@ func (s *Server) deleteImages(w http.ResponseWriter, r *http.Request) {
 	}
 	protected := s.protectedTags(app)
 	prefix := app.Image + ":"
-	var removed, skipped []string
+	// 先整体校验归属，再逐条去重：任何一个非法引用都不执行删除，避免半途而废
+	seen := map[string]bool{}
 	for _, ref := range req.Refs {
-		tag, ok := strings.CutPrefix(ref, prefix)
-		if !ok {
+		if _, ok := strings.CutPrefix(ref, prefix); !ok {
 			writeErr(w, http.StatusBadRequest, fmt.Sprintf("镜像引用 %q 不属于应用 %s 的镜像仓库", ref, app.ID))
 			return
 		}
+		seen[ref] = true
+	}
+	var removed, skipped []string
+	for _, ref := range req.Refs {
+		if seen[ref] {
+			seen[ref] = false
+		} else {
+			continue // 重复勾选只处理一次
+		}
+		tag, _ := strings.CutPrefix(ref, prefix)
 		if reason, ok := protected[tag]; ok {
 			skipped = append(skipped, fmt.Sprintf("%s（%s）", ref, reason))
 			continue

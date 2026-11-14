@@ -169,3 +169,51 @@ func TestAPIDockerImagesDeleteAbortsWhenUsageUnknown(t *testing.T) {
 		}
 	}
 }
+
+// 所有成功发布过的历史版本都受保护，避免用户手动清理掉回滚依赖的镜像
+func TestAPIDockerImagesProtectsHistory(t *testing.T) {
+	srv, _, fake, _ := newTestServer(t)
+	h := srv.Handler()
+	st := api.NewServerForTest(srv).Engine().Store
+	now := time.Now()
+	for i, tag := range []string{"v1.0.0", "v0.9.0", "v0.8.0"} {
+		st.Add(&store.Release{ID: "h" + tag, App: "demo", Tag: tag, Image: "app/demo:" + tag,
+			Status: store.StatusSuccess, CreatedAt: now.Add(-time.Duration(i) * time.Minute)})
+	}
+	// 失败的发布不保护：它的镜像并没有被线上使用过
+	st.Add(&store.Release{ID: "xfail", App: "demo", Tag: "v0.7.0", Image: "app/demo:v0.7.0",
+		Status: store.StatusFailed, CreatedAt: now.Add(-time.Hour)})
+
+	fake.outputs = map[string]string{
+		"docker images --no-trunc --format": strings.Join([]string{
+			"app/demo:v1.0.0|sha256:1|1MB|x",
+			"app/demo:v0.9.0|sha256:2|1MB|x",
+			"app/demo:v0.8.0|sha256:3|1MB|x",
+			"app/demo:v0.7.0|sha256:4|1MB|x",
+		}, "\n"),
+		"docker ps -a":   "",
+		"get deployment": "app/demo:v1.0.0",
+	}
+	rec := do(t, h, "POST", "/api/docker/images/delete",
+		`{"appId":"demo","refs":["app/demo:v1.0.0","app/demo:v0.9.0","app/demo:v0.8.0","app/demo:v0.7.0","app/demo:v0.7.0"]}`, nil)
+	if rec.Code != 200 {
+		t.Fatalf("删除 = %d %s", rec.Code, rec.Body.String())
+	}
+	var del struct {
+		Removed []string `json:"removed"`
+		Skipped []string `json:"skipped"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &del)
+	// 只有失败记录对应的 v0.7.0 可删，且重复提交只删一次
+	if len(del.Removed) != 1 || del.Removed[0] != "app/demo:v0.7.0" {
+		t.Fatalf("只应删除未被发布使用过的 v0.7.0（且去重）: %+v", del)
+	}
+	if len(del.Skipped) != 3 {
+		t.Fatalf("应跳过 3 个历史版本: %+v", del.Skipped)
+	}
+	for _, s := range del.Skipped {
+		if !strings.Contains(s, "回滚依赖") && !strings.Contains(s, "最近一次发布") && !strings.Contains(s, "线上正在运行") {
+			t.Fatalf("跳过原因应说明是发布过的版本: %s", s)
+		}
+	}
+}

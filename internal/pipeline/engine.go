@@ -208,7 +208,7 @@ func (e *Engine) precheckDocker(ctx context.Context, srv *sshpool.ServerConfig, 
 	}
 }
 
-// imageSummary 查询任意镜像引用的内容摘要（RepoDigest 优先，退回镜像 ID）
+// imageSummary 查询任意镜像引用的内容摘要，只返回完整的 64 位 sha256（与 inspectImage 口径一致）
 func (e *Engine) imageSummary(ctx context.Context, srv *sshpool.ServerConfig, ref string) string {
 	if !imageRefRe.MatchString(ref) {
 		return ""
@@ -219,7 +219,12 @@ func (e *Engine) imageSummary(ctx context.Context, srv *sshpool.ServerConfig, re
 	if err != nil {
 		return ""
 	}
-	return pickDigest(buildstage.SummarizeImages(out, imageRepoOf(ref), extractTag(ref)))
+	for _, s := range buildstage.SummarizeImages(out, imageRepoOf(ref), extractTag(ref)) {
+		if buildstage.ValidSummary(s) {
+			return s
+		}
+	}
+	return ""
 }
 
 // k8sImageIDSummary 从集群侧读取线上容器实际运行的镜像摘要。
@@ -512,9 +517,7 @@ func (e *Engine) startDeploy(parent context.Context, req StartRequest) (*store.R
 	defer func() {
 		if !ok {
 			cancel()
-			e.mu.Lock()
-			delete(e.running, app.ID)
-			e.mu.Unlock()
+			e.releaseRun(app.ID, run.releaseID)
 		}
 	}()
 
@@ -586,6 +589,7 @@ func (e *Engine) startDeploy(parent context.Context, req StartRequest) (*store.R
 	stages = append(stages,
 		store.Stage{Name: "validate", Title: "校验本地产物", Status: store.StatusPending},
 		store.Stage{Name: "upload", Title: "SFTP 上传至产物目录", Status: store.StatusPending},
+		store.Stage{Name: "verify", Title: "校验远端产物完整性", Status: store.StatusPending},
 		store.Stage{Name: "sync", Title: "准备构建上下文", Status: store.StatusPending},
 		store.Stage{Name: "build", Title: "执行镜像构建", Status: store.StatusPending},
 		store.Stage{Name: "consistency", Title: "确认镜像内容与线上不同", Status: store.StatusPending},
@@ -638,11 +642,7 @@ func (e *Engine) startDeploy(parent context.Context, req StartRequest) (*store.R
 
 	go func() {
 		defer cancel()
-		defer func() {
-			e.mu.Lock()
-			delete(e.running, app.ID)
-			e.mu.Unlock()
-		}()
+		defer e.releaseRun(app.ID, run.releaseID)
 
 		runner := &pipelineRunner{
 			engine:        e,
@@ -703,9 +703,7 @@ func (e *Engine) StartRollback(req RollbackRequest) (*store.Release, error) {
 	defer func() {
 		if !ok {
 			cancel()
-			e.mu.Lock()
-			delete(e.running, app.ID)
-			e.mu.Unlock()
+			e.releaseRun(app.ID, run.releaseID)
 		}
 	}()
 
@@ -777,11 +775,7 @@ func (e *Engine) StartRollback(req RollbackRequest) (*store.Release, error) {
 
 	go func() {
 		defer cancel()
-		defer func() {
-			e.mu.Lock()
-			delete(e.running, app.ID)
-			e.mu.Unlock()
-		}()
+		defer e.releaseRun(app.ID, run.releaseID)
 
 		runner := &pipelineRunner{
 			engine: e,
@@ -1134,6 +1128,16 @@ func (r *pipelineRunner) run() error {
 		return err
 	}
 
+	// 2.5 校验远端产物与本地一致：多个应用可能共用同一个产物目录，文件名也可能恰好相同，
+	// 上传后若远端文件不是本次上传的内容（被并发覆盖），Continue 构建会用到错误产物，必须在同步前拦住。
+	if r.rel.FileSHA256 != "" {
+		if err := r.stage("verify", func(w io.Writer) error {
+			return r.verifyRemoteArtifact(w, remoteArtifactPath)
+		}); err != nil {
+			return err
+		}
+	}
+
 	// 3. 准备构建上下文（将产物从 ArtifactDir 拷贝到 BuildDir）
 	if err := r.stage("sync", func(w io.Writer) error {
 		targetName := templates.ArtifactName(r.app.Type)
@@ -1455,20 +1459,23 @@ func (r *pipelineRunner) inspectImage(ref string) string {
 	if err != nil {
 		return ""
 	}
-	return pickDigest(buildstage.SummarizeImages(out, imageRepoOf(ref), extractTag(ref)))
-}
-
-// pickDigest 优先返回完整 sha256 摘要（64 位），否则返回第一个值（本地镜像 ID）
-func pickDigest(list []string) string {
-	for _, s := range list {
-		if strings.HasPrefix(s, "sha256:") && len(s) == len("sha256:")+64 {
+	// 只接受完整的 64 位摘要：短 ID / 镜像 ID 与 RepoDigest 不是同一空间的值，
+	// 混用会让"内容相同"的比对时而命中、时而漏掉
+	for _, s := range buildstage.SummarizeImages(out, imageRepoOf(ref), extractTag(ref)) {
+		if buildstage.ValidSummary(s) {
 			return s
 		}
 	}
-	if len(list) > 0 {
-		return list[0]
-	}
 	return ""
+}
+
+// clearImageSummary 清空记录与内存中的镜像摘要，避免读取失败时沿用过期的旧摘要
+func (r *pipelineRunner) clearImageSummary() {
+	if r.rel.ImageSummary == "" {
+		return
+	}
+	r.update(func(rel *store.Release) { rel.ImageSummary = "" })
+	r.rel.ImageSummary = ""
 }
 
 // findReusableImage 查找内容相同的已有镜像。
@@ -1546,6 +1553,29 @@ func (r *pipelineRunner) refsForImage(cur string) []string {
 	return []string{cur}
 }
 
+// verifyRemoteArtifact 校验远端产物文件的 SHA256 与本地一致。
+// 用 sha256sum 而非 cmp：远端不需要回传文件内容，且能给出可读的差异信息。
+func (r *pipelineRunner) verifyRemoteArtifact(w io.Writer, remotePath string) error {
+	cmd := fmt.Sprintf("sha256sum %s", shellQuote(remotePath))
+	out, err := r.engine.SSH.ExecuteOutput(r.ctx, r.srv, cmd)
+	if err != nil {
+		fmt.Fprintf(w, "[警告] 无法计算远端产物摘要，跳过一致性校验: %v\n", err)
+		return nil
+	}
+	fields := strings.Fields(out)
+	if len(fields) == 0 {
+		fmt.Fprintln(w, "[警告] 远端产物摘要为空，跳过一致性校验")
+		return nil
+	}
+	if !strings.EqualFold(fields[0], r.rel.FileSHA256) {
+		return fmt.Errorf("远端产物 %s 的 SHA256 (%s) 与本次上传的内容 (%s) 不一致，"+
+			"可能被其它应用或进程覆盖；请为每个应用配置独立的产物目录后重试",
+			remotePath, firstN(fields[0], 12), firstN(r.rel.FileSHA256, 12))
+	}
+	fmt.Fprintf(w, "✔ 远端产物校验通过 (SHA256: %s)\n", firstN(fields[0], 12))
+	return nil
+}
+
 // checkImageExists 确认镜像引用在服务器上仍然存在；missing 为 true 表示已不存在。
 // 用 docker image inspect 而非 docker images：前者对 tag、摘要（repo@sha256:...）都能识别。
 func (e *Engine) checkImageExists(ctx context.Context, srv *sshpool.ServerConfig, ref string) (missing bool, err error) {
@@ -1581,6 +1611,7 @@ func (r *pipelineRunner) labelImage(w io.Writer) error {
 	}
 	sum := r.inspectImage(r.rel.Image)
 	if sum == "" {
+		r.clearImageSummary()
 		return nil
 	}
 	r.update(func(rel *store.Release) { rel.ImageSummary = sum })
@@ -1608,6 +1639,10 @@ func (r *pipelineRunner) labelImage(w io.Writer) error {
 func (r *pipelineRunner) checkBuiltImage(w io.Writer) error {
 	sum := r.inspectImage(r.rel.Image)
 	if sum == "" {
+		// 读不到摘要时不能沿用记录里可能残留的旧值（例如 labelImage 失败后），
+		// 否则后续"与线上/历史相同"的判断和用户确认都会基于错误的摘要
+		r.clearImageSummary()
+		fmt.Fprintln(w, "[警告] 读取本次镜像的内容摘要失败，本次发布不做镜像内容一致性判断")
 		return nil
 	}
 	r.update(func(rel *store.Release) { rel.ImageSummary = sum })
@@ -1646,6 +1681,11 @@ func (r *pipelineRunner) sameAsCurrent(sum string) bool {
 // deployDocker 让宿主机上以指定镜像运行（同名容器先移除再启动）。
 // 镜像引用只允许合法镜像字符，命令模板里的变量同样通过 shellQuote 转义。
 func (r *pipelineRunner) deployDocker(w io.Writer, imageRef string) error {
+	return r.deployDockerCtx(r.ctx, w, imageRef)
+}
+
+// deployDockerCtx 与 deployDocker 相同，但使用指定的 ctx（自动回滚用独立超时的 ctx，不改动 r.ctx）
+func (r *pipelineRunner) deployDockerCtx(ctx context.Context, w io.Writer, imageRef string) error {
 	if !imageRefRe.MatchString(imageRef) {
 		return fmt.Errorf("镜像引用不合法: %q", imageRef)
 	}
@@ -1666,17 +1706,22 @@ func (r *pipelineRunner) deployDocker(w io.Writer, imageRef string) error {
 		cmd = rendered
 	}
 	fmt.Fprintf(w, "正在宿主机上启动容器 %s ...\n", r.app.DockerContainer)
-	return r.engine.SSH.RunCommand(r.ctx, r.srv, cmd, w)
+	return r.engine.SSH.RunCommand(ctx, r.srv, cmd, w)
 }
 
 // awaitDocker 轮询容器状态（以及可选的容器内 HTTP 探测），直到 running / 失败 / 超时
 func (r *pipelineRunner) awaitDocker(w io.Writer) error {
+	return r.awaitDockerCtx(r.ctx, w)
+}
+
+// awaitDockerCtx 与 awaitDocker 相同，但使用指定的 ctx（自动回滚用独立超时的 ctx）
+func (r *pipelineRunner) awaitDockerCtx(ctx context.Context, w io.Writer) error {
 	cmd, err := dockerrun.ReadyCmd(r.app, r.app.RolloutTimeout)
 	if err != nil {
 		return err
 	}
 	fmt.Fprintf(w, "等待容器 %s 就绪 ...\n", r.app.DockerContainer)
-	if err := r.engine.SSH.RunCommand(r.ctx, r.srv, cmd, w); err != nil {
+	if err := r.engine.SSH.RunCommand(ctx, r.srv, cmd, w); err != nil {
 		return fmt.Errorf("容器 %s 未在 %d 秒内就绪: %w", r.app.DockerContainer, r.app.RolloutTimeout, err)
 	}
 	fmt.Fprintf(w, "✔ 容器 %s 已就绪\n", r.app.DockerContainer)
@@ -1764,13 +1809,11 @@ func (r *pipelineRunner) autoRollbackDocker(cause error, reason string) {
 		case <-ctx.Done():
 		}
 	}()
-	savedCtx := r.ctx
-	r.ctx = ctx
-	err := r.deployDocker(r.hub, r.rel.PrevImage)
+	// 回滚使用独立 ctx，但不改写 r.ctx：finish() 等会在其它 goroutine 并发读取它
+	err := r.deployDockerCtx(ctx, r.hub, r.rel.PrevImage)
 	if err == nil {
-		err = r.awaitDocker(r.hub)
+		err = r.awaitDockerCtx(ctx, r.hub)
 	}
-	r.ctx = savedCtx
 	if err == nil {
 		r.update(func(rel *store.Release) {
 			rel.Status = store.StatusRolledBack
@@ -1826,8 +1869,10 @@ func (r *pipelineRunner) runRollback() error {
 
 func (r *pipelineRunner) finish(err error) {
 	// 先释放"该应用正在发布"的占位，再写入终态：否则调用方看到 done 后立刻发起回滚/重发，
-	// 会撞上尚未清理的 running 记录（表现为"应用正在发布中"，实际流水线已结束）
-	r.engine.releaseRunning(r.app.ID)
+	// 会撞上尚未清理的 running 记录（表现为"应用正在发布中"，实际流水线已结束）。
+	// 只释放自己持有的占位：被拒绝或已被接管的旧流水线不能清掉别人的锁。
+	owned := r.engine.ownsRun(r.app.ID, r.rel.ID)
+	r.engine.releaseRun(r.app.ID, r.rel.ID)
 	now := time.Now()
 	status := store.StatusSuccess
 	if err != nil {
@@ -1843,6 +1888,10 @@ func (r *pipelineRunner) finish(err error) {
 		}
 	}
 	r.update(func(rel *store.Release) {
+		// 记录已被另一条流水线接管（状态回到 running 且占位不归自己）时不再覆盖，避免把别人的进展写成自己的终态
+		if !owned && rel.Status == store.StatusRunning {
+			return
+		}
 		// 自动回滚成功时 tryAutoRollback 已把状态标为 rolledback：普通失败保留该终态，取消则如实记录
 		if rel.Status != store.StatusRolledBack || err == nil || errors.Is(err, context.Canceled) {
 			rel.Status = status
@@ -1879,29 +1928,47 @@ func (r *pipelineRunner) finish(err error) {
 	}
 }
 
-// releaseRunning 释放应用级发布占位（幂等，可由 finish 与收尾 goroutine 重复调用）
-func (e *Engine) releaseRunning(appID string) {
+// releaseRun 释放应用级发布占位：只有当前占位确实是这条发布时才删除（幂等，可由 finish 与收尾 goroutine 重复调用）。
+// 不能只按 appID 删除：被拒绝或已结束的旧流水线若无条件 delete，会把后来者正在持有的锁一并清掉，
+// 导致同一应用同时跑两条流水线。
+func (e *Engine) releaseRun(appID, releaseID string) {
 	e.mu.Lock()
-	delete(e.running, appID)
+	if r, ok := e.running[appID]; ok && (releaseID == "" || r.releaseID == releaseID) {
+		delete(e.running, appID)
+	}
 	e.mu.Unlock()
+}
+
+// ownsRun 当前占位是否属于该发布（finish 用它判断自己是否仍被 store 视为在跑）
+func (e *Engine) ownsRun(appID, releaseID string) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	r, ok := e.running[appID]
+	return ok && r.releaseID == releaseID
 }
 
 func (r *pipelineRunner) cleanup() {
 	r.hub.Logf("\n==> 阶段 [cleanup]: 自动清理历史版本产物")
 	keepCount := 5 // 默认保留最近 5 个产物版本
 	if r.app.ArtifactDir != "" && r.app.ArtifactDir != "/" {
-		// 只清理本应用历次上传的产物文件，避免误删目录内手工放置的 Dockerfile、配置等
+		// 只清理本应用历次上传的产物文件，避免误删目录内手工放置的 Dockerfile、配置等。
+		// 只认"当前产物目录下确实存在、且文件名是本平台上传命名"的文件：
+		// 应用改过 artifactDir 后，旧记录里的文件名不该再拿去别的目录删。
 		seen := map[string]bool{}
 		var artifactNames []string
 		for _, rel := range r.engine.Store.List(r.app.ID, 0) {
-			if rel.FileName != "" && upload.ValidFileName(rel.FileName) && !seen[rel.FileName] {
-				seen[rel.FileName] = true
-				artifactNames = append(artifactNames, shellQuote(r.app.ArtifactDir+"/"+rel.FileName))
+			if rel.FileName == "" || !upload.ValidFileName(rel.FileName) || seen[rel.FileName] {
+				continue
 			}
+			seen[rel.FileName] = true
+			artifactNames = append(artifactNames, r.app.ArtifactDir+"/"+rel.FileName)
 		}
+		// 远端先筛出真实存在的文件再删：不存在的路径不参与计数，避免把"保留 5 个"算成空名额
 		if len(artifactNames) > keepCount {
-			// tail 按输入顺序保留最后 keepCount 个（Store.List 已按时间倒序，即最近的），不使用 ls -t 排序
-			cleanCmd := fmt.Sprintf("printf '%%s\\n' %s | tail -n +%d | while IFS= read -r f; do [ -n \"$f\" ] && rm -f -- \"$f\"; done", strings.Join(artifactNames, " "), keepCount+1)
+			names := shellQuote(strings.Join(artifactNames, "\n"))
+			cleanCmd := fmt.Sprintf(
+				"cd %s 2>/dev/null || exit 0; printf '%%s\n' %s | while IFS= read -r f; do [ -n \"$f\" ] && [ -f \"$f\" ] && printf '%%s\n' \"$f\"; done | tail -n +%d | while IFS= read -r f; do rm -f -- \"$f\"; done",
+				shellQuote(r.app.ArtifactDir), names, keepCount+1)
 			_ = r.engine.SSH.RunCommand(context.Background(), r.srv, cleanCmd, io.Discard)
 			r.hub.Logf(fmt.Sprintf("✔ 已清理远程产物目录 %s，保留最近 %d 个版本包", r.app.ArtifactDir, keepCount))
 		}
@@ -1940,24 +2007,24 @@ func (e *Engine) ResumeRelease(id, imageSummary string) (*store.Release, error) 
 	if err := validateAppForPipeline(app); err != nil {
 		return nil, err
 	}
+	// 记录里的镜像必须属于该应用当前的镜像仓库：releases.json 可能被手工改过，
+	// 否则确认继续会把别的镜像（甚至别的应用的镜像）部署到这个应用上
+	if rel.Image != fmt.Sprintf("%s:%s", app.Image, rel.Tag) || !config.TagRe.MatchString(rel.Tag) {
+		return nil, fmt.Errorf("发布记录中的镜像 %q 与应用 %s 当前的镜像仓库不一致，无法继续，请重新发布", rel.Image, app.ID)
+	}
+	if !buildstage.ValidSummary(rel.ImageSummary) {
+		return nil, fmt.Errorf("发布记录中的镜像摘要 %q 不合法，无法继续，请重新发布", rel.ImageSummary)
+	}
 	srv := e.Cfg.FindServer(app.ServerID)
 	if srv == nil {
 		return nil, fmt.Errorf("未找到服务器配置: %s", app.ServerID)
 	}
-	// 重新预检：等待确认期间线上可能已被别的发布或手工操作改过。
-	// 自动回滚依赖的"上一版本"必须是此刻线上的版本，而不是首次发布时记录的 PrevImage。
-	pctx, pcancel := context.WithTimeout(context.Background(), 60*time.Second)
-	pre, preErr := e.Precheck(pctx, app, rel.Tag)
-	pcancel()
-	if preErr != nil {
-		pre = &PrecheckResult{Conflicts: []Conflict{}, Warnings: []string{}}
-	} else if pre.Current != "" {
-		e.Store.Update(rel.ID, func(r *store.Release) { r.PrevImage = pre.Current })
-		rel.PrevImage = pre.Current
-	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	run := &activeRun{releaseID: rel.ID, cancel: cancel}
+
+	// 先抢锁再做任何有副作用的事（预检会写库）：否则抢锁失败时已经改过 PrevImage，
+	// 且释放时可能删掉别人持有的锁。
 	e.mu.Lock()
 	if r, ok := e.running[app.ID]; ok {
 		e.mu.Unlock()
@@ -1971,17 +2038,35 @@ func (e *Engine) ResumeRelease(id, imageSummary string) (*store.Release, error) 
 	defer func() {
 		if !ok {
 			cancel()
-			e.releaseRunning(app.ID)
+			e.releaseRun(app.ID, run.releaseID)
 		}
 	}()
 
+	// 等待确认期间线上可能已被别的发布或手工操作改过：重新预检，
+	// 并把自动回滚依赖的"上一版本"刷新为此刻线上的版本（而不是首次发布时记录的 PrevImage）。
+	pctx, pcancel := context.WithTimeout(context.Background(), 60*time.Second)
+	pre, preErr := e.Precheck(pctx, app, rel.Tag)
+	pcancel()
+	if preErr != nil {
+		pre = &PrecheckResult{Conflicts: []Conflict{}, Warnings: []string{}}
+	} else if pre.Current != "" {
+		rel.PrevImage = pre.Current
+	}
 	pre.Conflicts = nil
+
+	// 抢到锁后记录仍可能已被别处改动（例如并发两次确认），以此处的状态为准
+	if cur, err := e.Store.Get(rel.ID); err == nil && cur.Status != store.StatusNeedsConfirm {
+		return nil, fmt.Errorf("该发布当前状态为 %s，无需继续", cur.Status)
+	}
 	running := store.StatusRunning
 	e.Store.Update(rel.ID, func(r *store.Release) {
 		r.Status = running
 		r.TargetSummary = imageSummary
 		r.Error = ""
 		r.FinishedAt = nil
+		if pre.Current != "" {
+			r.PrevImage = pre.Current
+		}
 		for i := range r.Stages {
 			if r.Stages[i].Name == "consistency" {
 				r.Stages[i].Status = store.StatusSkipped
@@ -1999,7 +2084,7 @@ func (e *Engine) ResumeRelease(id, imageSummary string) (*store.Release, error) 
 
 	go func() {
 		defer cancel()
-		defer e.releaseRunning(app.ID)
+		defer e.releaseRun(app.ID, run.releaseID)
 		cur, _ := e.Store.Get(rel.ID)
 		runner := &pipelineRunner{
 			engine: e, ctx: ctx, rel: cur, app: app, srv: srv, hub: hub, precheck: pre,
@@ -2036,6 +2121,20 @@ func (e *Engine) Cancel(id string) error {
 			r.cancel()
 			return nil
 		}
+	}
+	// 已暂停等待确认的记录不在 running 里：允许直接放弃，否则它会永远停在 needs_confirm
+	rel, err := e.Store.Get(id)
+	if err != nil {
+		return errors.New("该发布未在运行")
+	}
+	if rel.Status == store.StatusNeedsConfirm {
+		now := time.Now()
+		_, err := e.Store.Update(id, func(r *store.Release) {
+			r.Status = store.StatusCanceled
+			r.FinishedAt = &now
+			r.Error = "用户放弃了本次发布（镜像内容与线上相同，未部署）"
+		})
+		return err
 	}
 	return errors.New("该发布未在运行")
 }

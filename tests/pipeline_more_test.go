@@ -277,6 +277,58 @@ func TestPMoreResumeAfterDuplicateConfirm(t *testing.T) {
 	}
 }
 
+// 被拒绝的继续部署不能顺手删掉别人持有的锁（否则同一应用会并行两条流水线）
+func TestPMoreResumeRejectedKeepsOthersLock(t *testing.T) {
+	eng, _, st, fake, app := newScriptedEnv(t, config.DeployModeK8s)
+	sum := "sha256:" + strings.Repeat("9", 64)
+	fake.addRules(
+		scriptRule{"docker images -q", ""},
+		scriptRule{"get deployment", "app/demo:v0.9.0"},
+		scriptRule{"docker images --no-trunc", ""},
+	)
+	fake.prependRules(
+		scriptRule{"xargs -r docker image inspect", sum + " []"},
+		scriptRule{"docker image inspect", sum + " []"},
+	)
+	rel, err := eng.StartDeploy(pipeline.StartRequest{AppID: app.ID, Tag: "v1.0.0", UseLocalArtifact: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitDoneStrict(t, st, rel.ID)
+	prev, _ := st.Get(rel.ID)
+
+	pipeline.MarkRunningForTest(eng, app.ID, "other-release", func() {})
+	if _, err := eng.ResumeRelease(rel.ID, sum); err == nil || !strings.Contains(err.Error(), "正在发布中") {
+		t.Fatalf("并发时应拒绝继续: %v", err)
+	}
+	if !pipeline.IsRunning(eng, app.ID) {
+		t.Fatal("拒绝继续时不应删掉别人持有的锁")
+	}
+	// 被拒绝时也不能改动记录（预检结果不应落库）
+	if cur, _ := st.Get(rel.ID); cur.Status != store.StatusNeedsConfirm || cur.PrevImage != prev.PrevImage {
+		t.Fatalf("被拒绝时记录不应被改动: status=%s prev=%q", cur.Status, cur.PrevImage)
+	}
+	pipeline.ReleaseRunningForTest(eng, app.ID)
+}
+
+// 待确认的记录可以放弃，否则会永远停在 needs_confirm
+func TestPMoreCancelNeedsConfirmRelease(t *testing.T) {
+	eng, _, st, _, app := newScriptedEnv(t, config.DeployModeK8s)
+	st.Add(&store.Release{ID: "pend", App: app.ID, Tag: "v1.0.0", Image: "app/demo:v1.0.0",
+		Status: store.StatusNeedsConfirm, ImageSummary: "sha256:" + strings.Repeat("9", 64)})
+	if err := eng.Cancel("pend"); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := st.Get("pend")
+	if got.Status != store.StatusCanceled || got.FinishedAt == nil {
+		t.Fatalf("待确认记录应被标为已中止: %+v", got)
+	}
+	// 再次放弃、或对已结束的记录放弃都应报错
+	if err := eng.Cancel("pend"); err == nil {
+		t.Fatal("已中止的记录不应再次取消")
+	}
+}
+
 // 并发保护：同一应用已有流水线在跑时，确认继续部署必须被拒绝，不能出现两条流水线同时改线上
 func TestPMoreResumeRejectsWhenAnotherReleaseRunning(t *testing.T) {
 	eng, _, st, fake, app := newScriptedEnv(t, config.DeployModeK8s)

@@ -538,6 +538,13 @@ func SummarizeImages(output, repo, tag string) []string {
 	return out
 }
 
+// summaryRe 完整的镜像内容摘要：sha256 + 64 位十六进制
+var summaryRe = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+
+// ValidSummary 判断字符串是否为完整的镜像内容摘要（sha256:<64hex>）。
+// 摘要会进入远程命令并与镜像比对，必须严格校验，不能接受短 ID 或任意字符串。
+func ValidSummary(s string) bool { return summaryRe.MatchString(s) }
+
 // Short 返回便于日志展示的摘要前缀
 func Short(s string, n int) string {
 	if len(s) <= n {

@@ -69,4 +69,4 @@ func MarkRunningForTest(e *Engine, appID, releaseID string, cancel context.Cance
 }
 
 // ReleaseRunningForTest 释放应用的发布锁
-func ReleaseRunningForTest(e *Engine, appID string) { e.releaseRunning(appID) }
+func ReleaseRunningForTest(e *Engine, appID string) { e.releaseRun(appID, "") }
