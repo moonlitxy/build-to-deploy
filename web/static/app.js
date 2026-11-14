@@ -22,6 +22,8 @@ const state = {
   connEnabled: false,
   // 镜像维护页状态：当前选中的应用与其镜像列表
   imageMaint: { appId: '', images: [] },
+  // 镜像内容重复暂停时的结构化信息（来自 SSE duplicate 事件），供确认弹窗使用
+  pendingDuplicate: null,
   pendingReleaseParams: null,
   prefs: {
     selectedAppId: '',
@@ -950,6 +952,7 @@ function resetDeployUi() {
 }
 
 async function startDeployPipeline(appId, tag, remark, force, isLocalBuild, useDefaultArtifact, noReuse = false, existingUploadId = '', skipDupCheck = false) {
+  state.pendingDuplicate = null;
   const draft = state.appDrafts && state.appDrafts[appId];
   state.isDeploying = true;
   $('startDeployBtn').disabled = true;
@@ -1150,14 +1153,19 @@ function listenReleaseEvents(releaseId, isReconnect = false) {
     renderStages(rel.stages || []);
     const finished = ['success', 'failed', 'canceled', 'rolledback', 'needs_confirm'].includes(rel.status);
     if (rel.status === 'needs_confirm') {
-      // 流水线在部署前检测到镜像内容重复并已暂停：弹出确认框，确认后调 /resume 继续
+      // 流水线在部署前检测到镜像内容重复并已暂停：弹出确认框，确认后调 /resume 继续。
+      // 优先等 duplicate 事件带来的完整信息；没有时按错误文案尽力还原
       updateStatus('idle', '等待确认是否仍要部署');
-      showDuplicateDeployModal({
-        imageSummary: rel.imageSummary || '',
-        sameAsCurrent: true,
-        currentTag: (rel.error || '').match(/版本\s+(\S+?)\s+内容完全相同/)?.[1] || '',
-        currentImage: '',
-      }, rel.id);
+      const info = state.pendingDuplicate && state.pendingDuplicate.releaseId === rel.id
+        ? state.pendingDuplicate
+        : {
+            imageSummary: rel.imageSummary || '',
+            sameAsCurrent: !/与历史版本\s+\S+\s+内容完全相同/.test(rel.error || ''),
+            currentTag: (rel.error || '').match(/与线上正在运行的版本\s+(\S+?)\s+内容完全相同/)?.[1] || '',
+            duplicateTag: (rel.error || '').match(/与历史版本\s+(\S+?)\s+内容完全相同/)?.[1] || '',
+            currentImage: '',
+          };
+      showDuplicateDeployModal(info, rel.id);
     } else if (rel.status === 'success') {
       updateStatus('success', '发布完成');
     } else if (rel.status === 'failed' || rel.status === 'canceled') {
@@ -1176,6 +1184,12 @@ function listenReleaseEvents(releaseId, isReconnect = false) {
   es.addEventListener('log', (e) => {
     const line = JSON.parse(e.data);
     appendLog(line);
+  });
+
+  es.addEventListener('duplicate', (e) => {
+    // 暂停原因的结构化信息（与线上相同 / 只是与历史版本相同），供 needs_confirm 弹窗使用
+    const info = JSON.parse(e.data);
+    state.pendingDuplicate = info;
   });
 
   es.addEventListener('end', () => {
@@ -1201,7 +1215,11 @@ function listenReleaseEvents(releaseId, isReconnect = false) {
 function renderStages(stages) {
   if (!stages || stages.length === 0) return;
   const html = stages.map((s) => {
-    const iconName = s.status === 'success' ? 'check' : s.status === 'failed' ? 'x' : s.status === 'running' ? 'loader' : 'circle';
+    const iconName = s.status === 'success' ? 'check'
+      : s.status === 'failed' ? 'x'
+      : s.status === 'running' ? 'loader'
+      : s.status === 'skipped' ? 'check'
+      : 'circle';
     return `<div class="stage-chip ${s.status}">
       ${ic(iconName, 'icon stage-icon')}
       <span>${escapeHtml(s.title)}</span>
@@ -2337,6 +2355,8 @@ function filterHistoryList() {
     filtered = filtered.filter((r) => r.status === 'failed');
   } else if (statusFilter === 'force') {
     filtered = filtered.filter((r) => r.force);
+  } else if (statusFilter === 'dup') {
+    filtered = filtered.filter((r) => r.duplicateOf);
   }
 
   if (keyword) {
@@ -2362,8 +2382,17 @@ function renderHistoryTable(list) {
 
   $('historyTableBody').innerHTML = list.map((r) => {
     const isSuccess = r.status === 'success';
-    const statusText = isSuccess ? '发布成功' : r.status === 'running' ? '进行中' : '发布失败';
-    const statusCls = isSuccess ? 'status-success' : r.status === 'running' ? 'status-running' : 'status-failed';
+    const statusText = isSuccess ? '发布成功'
+      : r.status === 'running' ? '进行中'
+      : r.status === 'needs_confirm' ? '待确认'
+      : r.status === 'canceled' ? '已中止'
+      : r.status === 'rolledback' ? '已自动回滚'
+      : '发布失败';
+    const statusCls = isSuccess ? 'status-success'
+      : r.status === 'running' ? 'status-running'
+      : r.status === 'needs_confirm' ? 'status-notice'
+      : r.status === 'canceled' || r.status === 'rolledback' ? 'status-muted'
+      : 'status-failed';
 
     const appObj = state.apps.find((a) => a.id === r.app);
     const appType = appObj ? appObj.type : 'app';
@@ -2395,6 +2424,7 @@ function renderHistoryTable(list) {
             <button class="copy-tag-btn" title="复制版本号" onclick="copyText('${escapeHtml(r.tag)}')">${ic('copy', 'icon icon-inline')}</button>
           </div>
           ${r.force ? '<div class="force-tag-warn">强制覆盖版本</div>' : ''}
+          ${r.duplicateOf ? '<div class="duplicate-tag-note" title="镜像内容与已发布版本完全相同">镜像内容重复</div>' : ''}
         </td>
         <td>
           <span class="status-pill ${statusCls}">

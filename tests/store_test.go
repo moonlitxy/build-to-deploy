@@ -72,6 +72,18 @@ func TestStoreStoreAddGetUpdateList(t *testing.T) {
 	if got.Status != store.StatusFailed {
 		t.Fatalf("未完成记录应标记为 failed: %s", got.Status)
 	}
+
+	// needs_confirm 是暂停等待用户决定：重启后必须保留，才能继续经 /resume 部署
+	pend := newStoreRelease("r4", "a", "v4")
+	pend.Status = store.StatusNeedsConfirm
+	st2.Add(pend)
+	st3, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := st3.Get("r4"); got == nil || got.Status != store.StatusNeedsConfirm {
+		t.Fatalf("needs_confirm 记录重启后应保留: %+v", got)
+	}
 }
 
 func TestStoreStoreFindByImageAndFingerprint(t *testing.T) {

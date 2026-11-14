@@ -1157,6 +1157,28 @@ input[type="checkbox"] {
   color: var(--danger-text);
 }
 
+/* 待确认：与提醒弹窗同色系，避免被误读为失败 */
+.status-notice {
+  background: rgba(0, 113, 227, 0.09);
+  color: var(--primary);
+}
+
+.status-muted {
+  background: rgba(0, 0, 0, 0.05);
+  color: var(--text-secondary);
+}
+
+.duplicate-tag-note {
+  display: inline-block;
+  margin-top: 4px;
+  padding: 1px 7px;
+  border-radius: 6px;
+  background: rgba(0, 113, 227, 0.08);
+  color: var(--primary);
+  font-size: 11px;
+  font-weight: 500;
+}
+
 @keyframes pulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.55; }
@@ -1217,6 +1239,12 @@ input[type="checkbox"] {
   background: rgba(255, 59, 48, 0.1);
   border-color: rgba(255, 59, 48, 0.16);
   color: var(--danger-text);
+}
+
+.stage-chip.skipped {
+  background: rgba(0, 113, 227, 0.07);
+  border-color: rgba(0, 113, 227, 0.14);
+  color: var(--primary);
 }
 
 .upload-progress-box {

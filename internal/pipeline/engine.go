@@ -83,6 +83,9 @@ type PrecheckResult struct {
 	ImageFp      string `json:"imageFp,omitempty"` // 本次发布的构建输入指纹（与 Tag 无关）
 }
 
+// ErrImageMissing 回滚目标镜像在服务器上已不存在（可能被手工清理或被 docker 回收）
+var ErrImageMissing = errors.New("目标镜像不存在")
+
 type ConflictError struct {
 	Result *PrecheckResult
 }
@@ -142,8 +145,8 @@ func (e *Engine) Precheck(ctx context.Context, app *config.AppConfig, tag string
 		if !strings.HasPrefix(res.CurrentTag, "sha256") {
 			summary, err := e.currentImageSummary(ctx, srv, app)
 			if err != nil {
-				// 取不到线上摘要时不能静默跳过：否则"镜像内容未变化"的重复发布会被当成正常发布放行
-				res.Warnings = append(res.Warnings, "无法获取线上镜像内容摘要，本次发布将跳过镜像内容一致性检查: "+err.Error())
+				// 取不到线上摘要时不能静默：明确告知交给构建后的摘要比对兜底
+				res.Warnings = append(res.Warnings, "预检无法获取线上镜像内容摘要，将在构建完成后按镜像摘要再做一次一致性比对: "+err.Error())
 			} else {
 				res.CurrentImage = summary
 			}
@@ -672,7 +675,7 @@ type RollbackRequest struct {
 func (e *Engine) StartRollback(req RollbackRequest) (*store.Release, error) {
 	target, err := e.Store.Get(req.ReleaseID)
 	if err != nil {
-		return nil, fmt.Errorf("未找到对应的发布记录: %w", err)
+		return nil, fmt.Errorf("未找到对应的发布记录: %w", store.ErrNotFound)
 	}
 	app := e.Cfg.FindApp(target.App)
 	if app == nil {
@@ -723,7 +726,7 @@ func (e *Engine) StartRollback(req RollbackRequest) (*store.Release, error) {
 		return nil, fmt.Errorf("确认目标镜像 %s 是否存在失败: %w", target.Image, checkErr)
 	}
 	if missing {
-		return nil, fmt.Errorf("目标镜像 %s 已不在服务器 %s 上，无法回滚；请先在服务器上恢复该镜像或重新发布该版本", target.Image, srv.Host)
+		return nil, fmt.Errorf("%w: %s 已不在服务器 %s 上，无法回滚；请先在服务器上恢复该镜像或重新发布该版本", ErrImageMissing, target.Image, srv.Host)
 	}
 
 	stages := []store.Stage{
@@ -1377,8 +1380,8 @@ func (r *pipelineRunner) confirmDockerNotSame(w io.Writer) error {
 	if current == "" || current != sum {
 		return nil
 	}
-	msg := fmt.Sprintf("本次镜像与容器 %s 当前运行的版本 %s 内容完全相同（镜像摘要 %s），重建容器不会改变线上服务",
-		r.app.DockerContainer, currentTag, buildstage.Short(sum, 19))
+	msg := fmt.Sprintf("本次镜像与线上正在运行的版本 %s 内容完全相同（镜像摘要 %s），重建容器 %s 不会改变线上服务",
+		currentTag, buildstage.Short(sum, 19), r.app.DockerContainer)
 	fmt.Fprintf(w, "[警告] %s\n", msg)
 	return r.allowIfConfirmed(w, &DuplicateDeployError{ImageSummary: sum, CurrentImage: current, CurrentTag: currentTag, SameAsCurrent: true})
 }
@@ -1859,6 +1862,18 @@ func (r *pipelineRunner) finish(err error) {
 		}
 	} else if status == store.StatusNeedsConfirm {
 		r.hub.Logf(fmt.Sprintf("\n==> ⏸️ 已暂停，等待确认: %v", err))
+		var dup *DuplicateDeployError
+		if errors.As(err, &dup) {
+			// 通过事件推送完整的重复信息，前端据此区分"与线上相同"和"只是与历史版本相同"
+			r.hub.Publish(Event{Type: "duplicate", Data: map[string]any{
+				"releaseId":     r.rel.ID,
+				"imageSummary":  dup.ImageSummary,
+				"currentImage":  dup.CurrentImage,
+				"currentTag":    dup.CurrentTag,
+				"duplicateTag":  dup.DuplicateTag,
+				"sameAsCurrent": dup.SameAsCurrent,
+			}})
+		}
 	} else {
 		r.hub.Logf(fmt.Sprintf("\n==> ❌ 发布终止: %v", err))
 	}
@@ -1929,6 +1944,17 @@ func (e *Engine) ResumeRelease(id, imageSummary string) (*store.Release, error) 
 	if srv == nil {
 		return nil, fmt.Errorf("未找到服务器配置: %s", app.ServerID)
 	}
+	// 重新预检：等待确认期间线上可能已被别的发布或手工操作改过。
+	// 自动回滚依赖的"上一版本"必须是此刻线上的版本，而不是首次发布时记录的 PrevImage。
+	pctx, pcancel := context.WithTimeout(context.Background(), 60*time.Second)
+	pre, preErr := e.Precheck(pctx, app, rel.Tag)
+	pcancel()
+	if preErr != nil {
+		pre = &PrecheckResult{Conflicts: []Conflict{}, Warnings: []string{}}
+	} else if pre.Current != "" {
+		e.Store.Update(rel.ID, func(r *store.Release) { r.PrevImage = pre.Current })
+		rel.PrevImage = pre.Current
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	run := &activeRun{releaseID: rel.ID, cancel: cancel}
@@ -1949,7 +1975,7 @@ func (e *Engine) ResumeRelease(id, imageSummary string) (*store.Release, error) 
 		}
 	}()
 
-	pre := &PrecheckResult{Current: rel.PrevImage, CurrentTag: extractTag(rel.PrevImage)}
+	pre.Conflicts = nil
 	running := store.StatusRunning
 	e.Store.Update(rel.ID, func(r *store.Release) {
 		r.Status = running

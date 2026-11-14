@@ -90,17 +90,20 @@ func Open(path string) (*Store, error) {
 			return nil, err
 		}
 	}
-	// 服务重启时，把未完成的记录标记为失败
+	// 服务重启时，把未完成的记录标记为失败。
+	// needs_confirm 是"已构建完成、等用户决定是否部署"的暂停态，重启后仍可经 /resume 继续，不能标成失败。
 	now := time.Now()
 	for _, r := range s.list {
-		if !r.Done() {
-			r.Status = StatusFailed
-			r.Error = "服务重启，流水线被中断"
-			r.FinishedAt = &now
-			for i := range r.Stages {
-				if r.Stages[i].Status == StatusRunning {
-					r.Stages[i].Status = StatusFailed
-				}
+		// 只处理服务重启即中断的执行态；pending/running 之外的（含 needs_confirm）保持原状
+		if r.Status != StatusRunning && r.Status != StatusPending {
+			continue
+		}
+		r.Status = StatusFailed
+		r.Error = "服务重启，流水线被中断"
+		r.FinishedAt = &now
+		for i := range r.Stages {
+			if r.Stages[i].Status == StatusRunning {
+				r.Stages[i].Status = StatusFailed
 			}
 		}
 	}

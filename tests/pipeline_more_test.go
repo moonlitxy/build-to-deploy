@@ -390,7 +390,8 @@ func TestPMoreRollbackErrorsAndTargets(t *testing.T) {
 	fake.addRules(scriptRule{"docker image inspect -f", "1"})
 	if _, err := eng.StartRollback(pipeline.RollbackRequest{ReleaseID: first.ID}); err == nil {
 		t.Fatal("目标镜像不存在时应拒绝回滚")
-	} else if !strings.Contains(err.Error(), "已不在服务器") {
+	} else if !strings.Contains(err.Error(), "已不在服务器") || !errors.Is(err, pipeline.ErrImageMissing) {
+		// 必须能被 errors.Is 识别为"镜像不存在"，API 层据此返回 409 而不是 400
 		t.Fatalf("错误信息应说明镜像不存在: %v", err)
 	}
 	if rels := st.List(app.ID, 0); len(rels) != 1 {

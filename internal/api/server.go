@@ -1357,6 +1357,11 @@ func (s *Server) rollbackRelease(w http.ResponseWriter, r *http.Request) {
 		Remark:    req.Remark,
 	})
 	if err != nil {
+		// 目标镜像已被清理、记录不存在等属于状态冲突，与参数错误区分开，便于页面给出准确提示
+		if errors.Is(err, store.ErrNotFound) || errors.Is(err, pipeline.ErrImageMissing) {
+			writeErr(w, http.StatusConflict, err.Error())
+			return
+		}
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -1484,6 +1489,12 @@ func (s *Server) releaseEvents(w http.ResponseWriter, r *http.Request) {
 	if err := send("release", rel); err != nil {
 		return
 	}
+	// 暂停等待确认的记录：订阅时补发重复信息（hub 已关闭时不会再有 duplicate 事件），页面据此决定弹窗文案
+	if rel.Status == store.StatusNeedsConfirm {
+		if ev, ok := duplicateEventOf(rel.ID, rel.Error); ok {
+			_ = send("duplicate", ev)
+		}
+	}
 	for _, l := range history {
 		if err := send("log", l); err != nil {
 			return
@@ -1528,6 +1539,33 @@ func (s *Server) releaseEvents(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+}
+
+// duplicateEventOf 从未执行完的恢复路径里重建暂停信息：
+// 记录只保存了错误文本，这里按 "与线上...相同" / "与历史版本 xxx 相同" 两种措辞还原前端所需字段。
+func duplicateEventOf(id, errText string) (map[string]any, bool) {
+	if errText == "" {
+		return nil, false
+	}
+	ev := map[string]any{"releaseId": id}
+	if i := strings.Index(errText, "与历史版本 "); i >= 0 {
+		// 先判历史版本：两类文案都以"与历史版本"开头的情况不存在，但历史版本判断更具体
+		rest := errText[i+len("与历史版本 "):]
+		if end := strings.Index(rest, " 内容完全相同"); end > 0 {
+			ev["sameAsCurrent"] = false
+			ev["duplicateTag"] = rest[:end]
+			return ev, true
+		}
+	}
+	if strings.Contains(errText, "与线上正在运行的版本 ") {
+		rest := errText[strings.Index(errText, "与线上正在运行的版本 ")+len("与线上正在运行的版本 "):]
+		if end := strings.Index(rest, " 内容完全相同"); end > 0 {
+			ev["sameAsCurrent"] = true
+			ev["currentTag"] = rest[:end]
+			return ev, true
+		}
+	}
+	return nil, false
 }
 
 // maxReadLines 回放已完成发布日志时只读最后 N 行（与 Hub 历史上限一致）

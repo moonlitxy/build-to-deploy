@@ -548,8 +548,9 @@ func TestAPIReleaseLogCancelAndNotFound(t *testing.T) {
 		t.Fatalf("取消不存在发布应 400，实际 %d", rec.Code)
 	}
 	// 同一应用并发锁：另起一件不同 Tag 的发布（或其回滚）应被拒绝
-	if rec = do(t, h, "POST", "/api/releases/missing/rollback", `{}`, nil); rec.Code != 400 {
-		t.Fatalf("不存在发布的回滚应 400，实际 %d", rec.Code)
+	// 记录不存在属于状态冲突（409），与参数错误区分，页面可给出准确提示
+	if rec = do(t, h, "POST", "/api/releases/missing/rollback", `{}`, nil); rec.Code != 409 {
+		t.Fatalf("不存在发布的回滚应 409，实际 %d", rec.Code)
 	}
 	// 刚结束的发布记录可能仍被流水线 goroutine 收尾（并发的同名应用会被锁拒绝），两种结果都合理
 	rbRec := do(t, h, "POST", "/api/releases/"+rel.ID+"/rollback", `{"remark":"手动回滚"}`, nil)
@@ -557,7 +558,8 @@ func TestAPIReleaseLogCancelAndNotFound(t *testing.T) {
 		var rb store.Release
 		decode(t, rbRec, &rb)
 		waitAPIDone(t, srv, rb.ID)
-	} else if rbRec.Code != 400 {
+	} else if rbRec.Code != 400 && rbRec.Code != 409 {
+		// 409：目标镜像已被清理（假执行器没有"镜像存在"规则时即如此）
 		t.Fatalf("回滚结果异常: %d %s", rbRec.Code, rbRec.Body.String())
 	}
 }

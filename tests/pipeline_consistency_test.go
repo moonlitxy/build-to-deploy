@@ -103,3 +103,48 @@ func asDuplicate(err error) *pipeline.DuplicateDeployError {
 	}
 	return nil
 }
+
+// 确认后继续部署时，自动回滚依赖的"上一版本"必须是此刻线上的版本，而不是首次发布时的 PrevImage
+func TestPResumeRefreshesPrevImage(t *testing.T) {
+	eng, _, st, fake, app := newScriptedEnv(t, config.DeployModeK8s)
+	sum := "sha256:" + strings.Repeat("9", 64)
+	fake.addRules(
+		scriptRule{"docker images -q", ""},
+		scriptRule{"get deployment", "app/demo:v0.9.0"},
+		scriptRule{"docker images --no-trunc", ""},
+	)
+	fake.prependRules(
+		scriptRule{"xargs -r docker image inspect", sum + " []"},
+		scriptRule{"docker image inspect", sum + " []"},
+	)
+	rel, err := eng.StartDeploy(pipeline.StartRequest{AppID: app.ID, Tag: "v1.0.0", UseLocalArtifact: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := waitDoneStrict(t, st, rel.ID)
+	if done.Status != store.StatusNeedsConfirm {
+		t.Fatalf("应暂停等待确认: %s\n%s", done.Status, readLogFile(t, eng, rel.ID))
+	}
+
+	// 等待确认期间线上被切到 v0.9.5（首次发布时线上是 v0.9.0）
+	fake.rules = nil
+	fake.addRules(
+		scriptRule{"docker images -q", ""},
+		scriptRule{"get deployment", "app/demo:v0.9.5"},
+		scriptRule{"docker images --no-trunc", ""},
+	)
+	fake.prependRules(
+		scriptRule{"xargs -r docker image inspect", sum + " []"},
+		scriptRule{"docker image inspect", sum + " []"},
+	)
+	if _, err := eng.ResumeRelease(rel.ID, sum); err != nil {
+		t.Fatal(err)
+	}
+	final := waitDoneStrict(t, st, rel.ID)
+	if final.Status != store.StatusSuccess {
+		t.Fatalf("确认后应完成部署: %s\n%s", final.Error, readLogFile(t, eng, rel.ID))
+	}
+	if final.PrevImage != "app/demo:v0.9.5" {
+		t.Fatalf("上一版本应刷新为确认时的线上版本，实际 %q", final.PrevImage)
+	}
+}
