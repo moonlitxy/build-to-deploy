@@ -485,6 +485,36 @@ label {
   margin-top: 5px;
 }
 
+/* 线上当前版本 / Tag 关系提示：只做轻提示，不抢输入框注意力 */
+.current-version-line {
+  margin-top: 6px;
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: var(--text-secondary);
+}
+
+.current-version-line.is-muted {
+  color: var(--text-muted);
+}
+
+.tag-relation-line {
+  margin-top: 4px;
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+
+.tag-relation-line.is-newer {
+  color: var(--success-text);
+}
+
+.tag-relation-line.is-older {
+  color: var(--warning-text);
+}
+
+.tag-relation-line.is-same {
+  color: var(--primary);
+}
+
 input[type="text"],
 input[type="password"],
 input[type="number"],

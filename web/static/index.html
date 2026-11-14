@@ -156,6 +156,8 @@
           <div class="form-group flex-1">
             <label>镜像 Tag / 版本号 <span class="req">*</span></label>
             <input type="text" id="tagInput" name="release_image_tag_val" placeholder="如: v1.0.0 或 20261109.1" autocomplete="new-password" data-lpignore="true" data-form-type="other" readonly onfocus="this.removeAttribute('readonly');">
+            <div id="currentVersionLine" class="current-version-line">线上当前版本：连接服务器后可查看</div>
+            <div id="tagRelationLine" class="tag-relation-line"></div>
             <div id="tagTip" class="hint">字母、数字、. _ -，若服务器已存在同名 Tag 会触发弹窗确认</div>
           </div>
         </div>

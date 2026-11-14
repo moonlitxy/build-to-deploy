@@ -121,6 +121,7 @@ func (s *Server) Handler() http.Handler {
 
 	// 预检版本冲突（满足需求 2）
 	mux.HandleFunc("POST /api/precheck", s.precheck)
+	mux.HandleFunc("GET /api/apps/{id}/current-version", s.currentVersion)
 	mux.HandleFunc("POST /api/artifacts/inspect", s.inspectArtifact)
 	mux.HandleFunc("GET /api/deploy-target", s.containerStatus)
 
@@ -1036,6 +1037,27 @@ func (s *Server) inspectArtifact(w http.ResponseWriter, r *http.Request) {
 		out["previous"] = map[string]any{"tag": prev.Tag, "image": prev.Image, "createdAt": prev.CreatedAt}
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// currentVersion 返回应用线上当前运行的版本（只读），供发布页在填写 Tag 时展示。
+// 读不到时返回空字段而不是错误：页面提示"暂时无法读取"，不影响用户继续填写。
+func (s *Server) currentVersion(w http.ResponseWriter, r *http.Request) {
+	if !s.requireConn(w) {
+		return
+	}
+	app := s.cfg.FindApp(r.PathValue("id"))
+	if app == nil {
+		writeErr(w, http.StatusNotFound, "应用不存在")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	defer cancel()
+	v, err := s.engine.CurrentVersion(ctx, app)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, v)
 }
 
 // ---------- 预检版本冲突 (需求 2) ----------

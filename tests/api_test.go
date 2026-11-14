@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -672,3 +673,54 @@ func TestAPIReleaseEventsWithLiveHub(t *testing.T) {
 	}
 	waitAPIDone(t, srv, rel.ID)
 }
+
+// 发布页展示线上当前版本：K8s / Docker 两种形态都能返回 Tag，读不到时不报错而是返回空字段
+func TestAPICurrentVersion(t *testing.T) {
+	srv, _, fake, _ := newTestServer(t)
+	h := srv.Handler()
+	var got struct {
+		Image string `json:"image"`
+		Tag   string `json:"tag"`
+	}
+
+	fake.outputs["get deployment"] = "app/demo:v1.2.3"
+	rec := do(t, h, "GET", "/api/apps/demo/current-version", "", nil)
+	if rec.Code != 200 {
+		t.Fatalf("当前版本 = %d %s", rec.Code, rec.Body.String())
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &got)
+	if got.Tag != "v1.2.3" || got.Image != "app/demo:v1.2.3" {
+		t.Fatalf("K8s 当前版本解析错误: %+v", got)
+	}
+
+	fake.outputs = map[string]string{"docker inspect": "running app/demo:v2.0.0"}
+	rec = do(t, h, "GET", "/api/apps/demo-docker/current-version", "", nil)
+	_ = json.Unmarshal(rec.Body.Bytes(), &got)
+	if got.Tag != "v2.0.0" {
+		t.Fatalf("Docker 当前版本解析错误: %+v", got)
+	}
+
+	// 读不到（远端报错）时返回空字段而不是 5xx，页面提示"暂时无法读取"
+	fake.outputs = map[string]string{}
+	fake.err = errFromString("ssh 断开")
+	rec = do(t, h, "GET", "/api/apps/demo/current-version", "", nil)
+	if rec.Code != 200 {
+		t.Fatalf("读取失败应降级为 200，实际 %d %s", rec.Code, rec.Body.String())
+	}
+	var empty map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &empty)
+	if empty["tag"] != "" {
+		t.Fatalf("读取失败时 tag 应为空: %+v", empty)
+	}
+
+	if rec := do(t, h, "GET", "/api/apps/nope/current-version", "", nil); rec.Code != 404 {
+		t.Fatalf("未知应用应 404，实际 %d", rec.Code)
+	}
+	// 未连接服务器时不访问远程
+	srv.SetConnectionEnabled(false)
+	if rec := do(t, h, "GET", "/api/apps/demo/current-version", "", nil); rec.Code != 412 {
+		t.Fatalf("未连接时应 412，实际 %d", rec.Code)
+	}
+}
+
+func errFromString(s string) error { return errors.New(s) }

@@ -24,6 +24,10 @@ const state = {
   imageMaint: { appId: '', images: [] },
   // 镜像内容重复暂停时的结构化信息（来自 SSE duplicate 事件），供确认弹窗使用
   pendingDuplicate: null,
+  // 各应用线上当前版本（按 appId 缓存），来自 /api/apps/{id}/current-version
+  currentVersions: {},
+  // 建议 Tag 只预填一次，用户手动改过之后不再覆盖
+  tagTouched: false,
   pendingReleaseParams: null,
   prefs: {
     selectedAppId: '',
@@ -278,6 +282,9 @@ function updatePathPreview({ probeRemote = true } = {}) {
   }
 
   $('appPathPreview').classList.remove('hidden');
+  // 展示线上当前版本：只有已连接服务器时才查询，避免启动/切页时访问远程
+  renderCurrentVersion(appId);
+  if (probeRemote && state.connEnabled) refreshCurrentVersion(appId);
   const srv = state.servers.find((s) => s.id === app.serverId);
   $('pvServer').textContent = srv ? `${srv.name} (${srv.user}@${srv.host})` : (app.serverId || '-');
   $('pvArtifactDir').textContent = app.artifactDir || '未配置';
@@ -405,7 +412,12 @@ function updateDropZoneVisual() {
   }
 }
 
-$('deployAppSelect').addEventListener('change', updatePathPreview);
+$('deployAppSelect').addEventListener('change', () => {
+  // 切换应用是新的填写场景：允许按新应用的线上版本再次预填建议 Tag
+  state.tagTouched = false;
+  $('tagInput').value = '';
+  updatePathPreview();
+});
 
 // ---------------- 本地文件拖拽与选择 ----------------
 function setupDropZone() {
@@ -454,6 +466,119 @@ function handleSelectedFile(file) {
       $('tagInput').value = 'v' + match[1];
     }
   }
+}
+
+// ---------------- 线上当前版本与 Tag 建议 ----------------
+async function refreshCurrentVersion(appId) {
+  try {
+    const res = await api('GET', `/api/apps/${encodeURIComponent(appId)}/current-version`);
+    if (res.ok && res.data) {
+      state.currentVersions[appId] = { tag: res.data.tag || '', image: res.data.image || '', deployedAt: res.data.deployedAt || '', error: '' };
+    } else {
+      state.currentVersions[appId] = { tag: '', image: '', error: res.data && res.data.error ? res.data.error : '读取失败' };
+    }
+  } catch (e) {
+    state.currentVersions[appId] = { tag: '', image: '', error: '读取失败' };
+  }
+  if ($('deployAppSelect').value === appId) {
+    renderCurrentVersion(appId);
+    maybePrefillTag(appId);
+  }
+}
+
+function suggestionFor(tag) {
+  // 只对纯数字点分版本给建议（v1.2.3 → v1.2.4），其它命名交给用户
+  const m = /^(v?)(\d+)\.(\d+)\.(\d+)$/.exec(tag || '');
+  if (!m) return '';
+  return `${m[1]}${m[2]}.${m[3]}.${Number(m[4]) + 1}`;
+}
+
+function renderCurrentVersion(appId) {
+  const el = $('currentVersionLine');
+  if (!el) return;
+  if (!state.connEnabled) {
+    el.className = 'current-version-line is-muted';
+    el.textContent = '线上当前版本：连接服务器后可查看';
+    return;
+  }
+  const v = state.currentVersions[appId];
+  if (!v) {
+    el.className = 'current-version-line is-muted';
+    el.textContent = '线上当前版本：读取中...';
+    return;
+  }
+  if (v.error) {
+    el.className = 'current-version-line is-muted';
+    el.textContent = `线上当前版本：暂时无法读取（${v.error}）`;
+    renderTagRelation();
+    return;
+  }
+  if (!v.tag) {
+    el.className = 'current-version-line is-muted';
+    el.textContent = '线上当前版本：该服务尚未部署过';
+    renderTagRelation();
+    return;
+  }
+  const when = v.deployedAt ? ` · 上线于 ${fmtTime(v.deployedAt)}` : '';
+  el.className = 'current-version-line';
+  el.textContent = `线上当前版本：${v.tag}${when}`;
+  const sug = suggestionFor(v.tag);
+  if (sug && !state.tagTouched && !$('tagInput').value.trim()) {
+    el.textContent += ` · 建议填写 ${sug}`;
+  }
+  renderTagRelation();
+}
+
+function maybePrefillTag(appId) {
+  const v = state.currentVersions[appId];
+  if (!v || v.error || state.tagTouched || $('tagInput').value.trim()) return;
+  const sug = suggestionFor(v.tag);
+  if (sug) {
+    $('tagInput').value = sug;
+    renderCurrentVersion(appId);
+  }
+}
+
+// renderTagRelation 提示当前填写的 Tag 与线上版本的关系（只提示，不阻断）
+function renderTagRelation() {
+  const appId = $('deployAppSelect').value;
+  const v = state.currentVersions[appId];
+  const tag = $('tagInput').value.trim();
+  const tip = $('tagRelationLine');
+  if (!tip) return;
+  tip.className = 'tag-relation-line';
+  tip.textContent = '';
+  if (!v || v.error || !v.tag || !tag) return;
+  if (tag === v.tag) {
+    tip.className = 'tag-relation-line is-same';
+    tip.textContent = `与线上当前版本相同：线上镜像不会变化，发布时会弹窗确认`;
+    return;
+  }
+  const cmp = compareVersion(tag, v.tag);
+  if (cmp === 0) return;
+  if (cmp > 0) {
+    tip.className = 'tag-relation-line is-newer';
+    tip.textContent = `新版本（线上为 ${v.tag}）`;
+  } else {
+    tip.className = 'tag-relation-line is-older';
+    tip.textContent = `低于线上当前版本 ${v.tag}：相当于回退，请确认是否符合预期`;
+  }
+}
+
+function compareVersion(a, b) {
+  const pa = String(a).replace(/^v/i, '').split(/[.\-+_]/);
+  const pb = String(b).replace(/^v/i, '').split(/[.\-+_]/);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const x = pa[i] === undefined ? '' : pa[i];
+    const y = pb[i] === undefined ? '' : pb[i];
+    const nx = Number(x), ny = Number(y);
+    if (!Number.isNaN(nx) && !Number.isNaN(ny) && x !== '' && y !== '') {
+      if (nx !== ny) return nx > ny ? 1 : -1;
+    } else if (x !== y) {
+      return x > y ? 1 : -1;
+    }
+  }
+  return 0;
 }
 
 // ---------------- 发布主流程 ----------------
@@ -687,6 +812,8 @@ function setupButtons() {
   }
   $('disconnectAllBtn').addEventListener('click', disconnectAllConnections);
   $('tagInput').addEventListener('input', () => {
+    state.tagTouched = true;
+    renderTagRelation();
     const appId = $('deployAppSelect').value;
     const app = state.apps.find((a) => a.id === appId);
     if (app && app.image) {
@@ -1186,6 +1313,9 @@ function listenReleaseEvents(releaseId, isReconnect = false) {
       showDuplicateDeployModal(info, rel.id);
     } else if (rel.status === 'success') {
       updateStatus('success', '发布完成');
+      if (rel.tag) {
+        state.currentVersions[rel.app] = { tag: rel.tag, image: rel.image || '', deployedAt: rel.finishedAt || '', error: '' };
+      }
     } else if (rel.status === 'failed' || rel.status === 'canceled') {
       updateStatus('failed', rel.status === 'canceled' ? '已中止' : '发布失败');
     } else if (rel.status === 'rolledback') {
@@ -1217,6 +1347,9 @@ function listenReleaseEvents(releaseId, isReconnect = false) {
     $('cancelReleaseBtn').classList.add('hidden');
     $('uploadProgressContainer').classList.add('hidden');
     updatePathPreview();
+    // 部署结束后线上版本可能已变化：已连接时顺便刷新供下次填写参考
+    const curApp = $('deployAppSelect').value;
+    if (state.connEnabled && curApp) refreshCurrentVersion(curApp);
   });
 
   es.onopen = () => { state.esRetry = 0; };
@@ -1879,6 +2012,10 @@ async function connectCurrentServer() {
   if (res.ok) {
     state.connEnabled = true;
     await updateConnStatus();
+    // 连接成功前读不到线上版本，这里立即补一次，否则要切换应用才会刷新
+    state.currentVersions = {};
+    await refreshCurrentVersion(appId);
+    maybePrefillTag(appId);
   } else {
     alert(`✖ 连接失败: ${res.data.error || '未知错误'}`);
   }
@@ -1950,6 +2087,10 @@ window.testOneServer = async function (srvId) {
   if (res.ok) {
     state.connEnabled = true;
     await updateConnStatus();
+    // 连接建立后补拉当前应用的线上版本
+    state.currentVersions = {};
+    await refreshCurrentVersion($('deployAppSelect').value);
+    maybePrefillTag($('deployAppSelect').value);
     alert(`✔ ${res.data.message || '连接测试成功！'}`);
   } else {
     alert(`✖ 连接失败: ${res.data.error || '未知错误'}`);
@@ -2044,6 +2185,9 @@ async function testServerConnection() {
     // 测试连接成功同样会打开服务端连接开关，同步本地状态
     state.connEnabled = true;
     await updateConnStatus();
+    // 连接建立后补拉当前应用的线上版本
+    state.currentVersions = {};
+    await refreshCurrentVersion($('deployAppSelect').value);
     alert(`✔ ${res.data.message || '连接成功！'}`);
   } else {
     alert(`✖ 连接失败: ${res.data.error}`);

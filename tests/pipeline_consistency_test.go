@@ -3,6 +3,7 @@ package tests
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -197,7 +198,7 @@ func TestPVerifyRemoteArtifact(t *testing.T) {
 	}
 }
 
-// cleanup 只删除当前产物目录下真实存在、且属于本应用上传的文件
+// cleanup 不再删除任何远程历史产物：只清掉本地上传缓存
 func TestPCleanup(t *testing.T) {
 	eng, _, st, fake, app := newScriptedEnv(t, config.DeployModeK8s)
 	hub := pipeline.NewHub(filepath.Join(t.TempDir(), "c2.log"))
@@ -206,30 +207,95 @@ func TestPCleanup(t *testing.T) {
 		st.Add(&store.Release{ID: "r" + name, App: app.ID, Tag: "v1.0." + strconv.Itoa(i), FileName: name,
 			Status: store.StatusSuccess, CreatedAt: time.Now().Add(time.Duration(i) * time.Minute)})
 	}
-	// 非法文件名不参与清理
-	st.Add(&store.Release{ID: "bad", App: app.ID, Tag: "v9", FileName: "../evil", Status: store.StatusSuccess})
 	rel := &store.Release{ID: "cur", App: app.ID, Tag: "v2", FileName: "a6.jar"}
 	r := pipeline.NewRunnerLike(eng, context.Background(), rel, app, eng.Cfg.SSHServers[0], hub, "", nil)
 	pipeline.CleanupForTest(r)
 
-	var cleanCmd string
 	for _, c := range fake.snapshot() {
-		if strings.Contains(c, "rm -f --") {
-			cleanCmd = c
+		if strings.Contains(c, "rm -f --") || strings.Contains(c, "docker image rm") || strings.Contains(c, "prune") {
+			t.Fatalf("不应自动删除任何远程产物或镜像: %s", c)
 		}
 	}
-	if cleanCmd == "" {
-		t.Fatal("超过 5 个版本时应触发清理")
+}
+
+// CurrentVersion 的降级路径：配置不完整 / 读到摘要而非镜像引用时返回空，而不是报错或给错版本
+func TestPCurrentVersionDegrades(t *testing.T) {
+	eng, _, _, fake, app := newScriptedEnv(t, config.DeployModeDocker)
+
+	// Docker 配置不完整：不查询远程，直接返回空
+	broken := *app
+	broken.DockerContainer = ""
+	v, err := eng.CurrentVersion(context.Background(), &broken)
+	if err != nil || v.Tag != "" || v.Image != "" {
+		t.Fatalf("配置不完整时应返回空: %+v %v", v, err)
 	}
-	// 文件名全部先列出、再在远端按"真实存在"过滤后 tail，因此最新文件出现在列表里是正常的；
-	// 关键是要保留最近 5 个（tail -n +6）、非法文件名不得出现
-	if strings.Contains(cleanCmd, "../evil") {
-		t.Fatalf("非法文件名不应进入清理列表: %s", cleanCmd)
+
+	// 容器里跑的是摘要（没有可读的 Tag）：不返回镜像名，避免页面展示 sha256
+	fake.rules = nil
+	fake.addRules(scriptRule{"docker inspect", "running sha256:" + strings.Repeat("a", 64)})
+	v, err = eng.CurrentVersion(context.Background(), app)
+	if err != nil || v.Tag != "" {
+		t.Fatalf("摘要形式不应当作版本: %+v %v", v, err)
 	}
-	if !strings.Contains(cleanCmd, "tail -n +6") {
-		t.Fatalf("应保留最近 5 个版本: %s", cleanCmd)
+
+	// 线上版本对应的发布记录：命中后应带出部署时间；不存在的 Tag 不应误配
+	fake.rules = nil
+	fake.addRules(scriptRule{"docker inspect", "running " + app.Image + ":v1.0.0"})
+	eng.Store.Add(&store.Release{ID: "cur", App: app.ID, Tag: "v1.0.0", Status: store.StatusSuccess,
+		CreatedAt: time.Now().Add(-time.Hour)})
+	eng.Store.Add(&store.Release{ID: "other", App: app.ID, Tag: "v9.9.9", Status: store.StatusSuccess, CreatedAt: time.Now()})
+	if v, _ := eng.CurrentVersion(context.Background(), app); v.DeployedAt == nil {
+		t.Fatalf("应带出线上版本对应的部署时间: %+v", v)
 	}
-	if !strings.Contains(cleanCmd, "[ -f") {
-		t.Fatalf("清理前应确认远端文件真实存在: %s", cleanCmd)
+	fake.rules = nil
+	fake.addRules(scriptRule{"docker inspect", "running " + app.Image + ":v0.1.0"})
+	if v, _ := eng.CurrentVersion(context.Background(), app); v.DeployedAt != nil {
+		t.Fatalf("没有对应发布记录时不应给部署时间: %+v", v)
+	}
+
+	// 服务器配置不存在：返回错误
+	noSrv := *app
+	noSrv.ServerID = "missing"
+	if _, err := eng.CurrentVersion(context.Background(), &noSrv); err == nil {
+		t.Fatal("服务器不存在应报错")
+	}
+
+	// K8s 形态读不到 Deployment（远端报错）：降级为空
+	keng, _, _, kfake, kapp := newScriptedEnv(t, config.DeployModeK8s)
+	kfake.execErr = errors.New("ssh 断开")
+	v, err = keng.CurrentVersion(context.Background(), kapp)
+	if err != nil || v.Tag != "" {
+		t.Fatalf("远端失败应降级: %+v %v", v, err)
+	}
+}
+
+// cleanup 只删除来自本地上传目录的 .part 缓存，其它本地产物不动
+func TestPCleanupRemovesUploadCache(t *testing.T) {
+	eng, _, _, _, app := newScriptedEnv(t, config.DeployModeK8s)
+	hub := pipeline.NewHub(filepath.Join(t.TempDir(), "c3.log"))
+	defer hub.Close()
+	uploads := filepath.Join(eng.DataDir, "uploads")
+	if err := os.MkdirAll(uploads, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	part := filepath.Join(uploads, "abc.part")
+	if err := os.WriteFile(part, []byte("PK"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r := pipeline.NewRunnerLike(eng, context.Background(), &store.Release{ID: "x", App: app.ID}, app, eng.Cfg.SSHServers[0], hub, part, nil)
+	pipeline.CleanupForTest(r)
+	if _, err := os.Stat(part); !os.IsNotExist(err) {
+		t.Fatalf("上传缓存应被删除: %v", err)
+	}
+
+	// 不在上传目录里的本地产物不应被删
+	other := filepath.Join(t.TempDir(), "keep.jar")
+	if err := os.WriteFile(other, []byte("PK"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r = pipeline.NewRunnerLike(eng, context.Background(), &store.Release{ID: "y", App: app.ID}, app, eng.Cfg.SSHServers[0], hub, other, nil)
+	pipeline.CleanupForTest(r)
+	if _, err := os.Stat(other); err != nil {
+		t.Fatalf("非上传缓存不应被删除: %v", err)
 	}
 }

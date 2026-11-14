@@ -94,6 +94,61 @@ func (c *ConflictError) Error() string {
 	return "版本已存在，需弹窗确认覆盖"
 }
 
+// CurrentVersion 查询应用线上当前正在运行的镜像引用与 Tag（只读，供发布页展示"当前版本"）。
+// 读不到时返回空串而不是错误：页面据此提示"暂时无法读取"，不阻塞用户填写。
+type CurrentVersion struct {
+	Image string `json:"image"`
+	Tag   string `json:"tag"`
+	// DeployedAt 该版本最近一次成功部署的时间（来自发布记录，可能为空）
+	DeployedAt *time.Time `json:"deployedAt,omitempty"`
+}
+
+func (e *Engine) CurrentVersion(ctx context.Context, app *config.AppConfig) (*CurrentVersion, error) {
+	srv := e.Cfg.FindServer(app.ServerID)
+	if srv == nil {
+		return nil, fmt.Errorf("找不到对应的 SSH 服务器配置 [%s]", app.ServerID)
+	}
+	out := &CurrentVersion{}
+	if app.DeployMode == config.DeployModeDocker {
+		insp, err := dockerrun.InspectCmdFor(app)
+		if err != nil {
+			return out, nil
+		}
+		raw, err := e.SSH.ExecuteOutput(ctx, srv, insp)
+		if err != nil {
+			return out, nil
+		}
+		_, image := dockerrun.ParseInspect(raw)
+		if image != "" && !strings.HasPrefix(image, "sha256:") {
+			out.Image = image
+			out.Tag = extractTag(image)
+		}
+	} else {
+		cmd := fmt.Sprintf("kubectl -n %s get deployment %s -o jsonpath=%s",
+			shellQuote(app.Namespace), shellQuote(app.Deployment),
+			shellQuote(fmt.Sprintf(`{.spec.template.spec.containers[?(@.name=="%s")].image}`, app.Container)))
+		raw, err := e.SSH.ExecuteOutput(ctx, srv, cmd)
+		if err != nil {
+			return out, nil
+		}
+		if image := strings.TrimSpace(raw); image != "" {
+			out.Image = image
+			out.Tag = extractTag(image)
+		}
+	}
+	// 线上版本对应的最近一次成功发布记录：只用于展示部署时间，找不到不影响结果
+	if out.Tag != "" {
+		for _, rel := range e.Store.List(app.ID, 0) {
+			if rel.Tag == out.Tag && (rel.Status == store.StatusSuccess || rel.Status == store.StatusRolledBack) {
+				t := rel.CreatedAt
+				out.DeployedAt = &t
+				break
+			}
+		}
+	}
+	return out, nil
+}
+
 // Precheck 检查目标服务器上该 Tag 是否存在
 func (e *Engine) Precheck(ctx context.Context, app *config.AppConfig, tag string) (*PrecheckResult, error) {
 	if !config.TagRe.MatchString(tag) {
@@ -1904,10 +1959,11 @@ func (r *pipelineRunner) finish(err error) {
 	if status == store.StatusSuccess {
 		if r.rel.Kind == "rollback" {
 			r.hub.Logf(fmt.Sprintf("\n==> 🎉 回滚成功! 已回退至版本: %s (%s)", r.rel.Tag, r.rel.Image))
+			r.hub.Logf(fmt.Sprintf("==> ✅ 回滚流程已结束（记录 %s）", r.rel.ID))
 		} else {
-			r.hub.Logf(fmt.Sprintf("\n==> 🎉 发布成功! 镜像已上线: %s", r.rel.Image))
-			// 自动执行历史版本与磁盘清理
 			r.cleanup()
+			r.hub.Logf(fmt.Sprintf("\n==> 🎉 发布成功! 镜像已上线: %s", r.rel.Image))
+			r.hub.Logf(fmt.Sprintf("==> ✅ 发布流程已结束（记录 %s），本次未删除任何远程产物或镜像", r.rel.ID))
 		}
 	} else if status == store.StatusNeedsConfirm {
 		r.hub.Logf(fmt.Sprintf("\n==> ⏸️ 已暂停，等待确认: %v", err))
@@ -1948,40 +2004,12 @@ func (e *Engine) ownsRun(appID, releaseID string) bool {
 }
 
 func (r *pipelineRunner) cleanup() {
-	r.hub.Logf("\n==> 阶段 [cleanup]: 自动清理历史版本产物")
-	keepCount := 5 // 默认保留最近 5 个产物版本
-	if r.app.ArtifactDir != "" && r.app.ArtifactDir != "/" {
-		// 只清理本应用历次上传的产物文件，避免误删目录内手工放置的 Dockerfile、配置等。
-		// 只认"当前产物目录下确实存在、且文件名是本平台上传命名"的文件：
-		// 应用改过 artifactDir 后，旧记录里的文件名不该再拿去别的目录删。
-		seen := map[string]bool{}
-		var artifactNames []string
-		for _, rel := range r.engine.Store.List(r.app.ID, 0) {
-			if rel.FileName == "" || !upload.ValidFileName(rel.FileName) || seen[rel.FileName] {
-				continue
-			}
-			seen[rel.FileName] = true
-			artifactNames = append(artifactNames, r.app.ArtifactDir+"/"+rel.FileName)
-		}
-		// 远端先筛出真实存在的文件再删：不存在的路径不参与计数，避免把"保留 5 个"算成空名额
-		if len(artifactNames) > keepCount {
-			names := shellQuote(strings.Join(artifactNames, "\n"))
-			cleanCmd := fmt.Sprintf(
-				"cd %s 2>/dev/null || exit 0; printf '%%s\n' %s | while IFS= read -r f; do [ -n \"$f\" ] && [ -f \"$f\" ] && printf '%%s\n' \"$f\"; done | tail -n +%d | while IFS= read -r f; do rm -f -- \"$f\"; done",
-				shellQuote(r.app.ArtifactDir), names, keepCount+1)
-			_ = r.engine.SSH.RunCommand(context.Background(), r.srv, cleanCmd, io.Discard)
-			r.hub.Logf(fmt.Sprintf("✔ 已清理远程产物目录 %s，保留最近 %d 个版本包", r.app.ArtifactDir, keepCount))
-		}
-	}
-
-	// 清理本次上传产生的本地 .part 副本（上传目录只是缓存）
+	// 只清理本次上传在本地留下的 .part 副本（上传目录只是缓存）；
+	// 远程产物包与 Docker 镜像一律不自动删除，旧版本由运维在页面上手动处理。
 	uploadsDir := filepath.Join(r.engine.DataDir, "uploads") + string(os.PathSeparator)
 	if strings.HasPrefix(r.artifact, uploadsDir) {
 		_ = os.Remove(r.artifact)
 	}
-
-	// 注意：不自动删除远程 Docker 镜像（包括悬空层与旧版本 tag），历史版本由运维自行管理，
-	// 避免误删回滚依赖的镜像。
 }
 
 // ResumeRelease 用户在"镜像内容完全相同"的弹窗里确认仍然部署后，从部署阶段继续执行同一条发布记录。
