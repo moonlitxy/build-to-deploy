@@ -45,6 +45,9 @@ func TestConfigLoadNormalizeDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	app := cfg.FindApp("a1")
+	if cfg.ServerSettingsSnapshot().YamlBackupDir == "" {
+		t.Fatal("远程 YAML 备份目录应有默认值")
+	}
 	if app.DeployMode != config.DeployModeK8s {
 		t.Fatalf("默认部署形态应为 k8s: %q", app.DeployMode)
 	}

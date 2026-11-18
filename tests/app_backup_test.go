@@ -55,6 +55,9 @@ func TestConfigAppBackupPerService(t *testing.T) {
 	if b.AppName != "order-service" || b.Image != "harbor.example.com/app/order-service" {
 		t.Fatalf("备份应记录服务名与镜像: %+v", b)
 	}
+	if b.ServerID == "" || b.YamlPath != "order-service.yaml" {
+		t.Fatalf("备份应记录所属服务器与 YAML 文件: %+v", b)
+	}
 	if b.Size <= 0 || b.CreatedAt.IsZero() {
 		t.Fatalf("备份大小/时间不正确: %+v", b)
 	}
@@ -157,6 +160,9 @@ func TestAPIAppBackupEndpoints(t *testing.T) {
 	decode(t, do(t, h, "GET", "/api/config/app-backups", "", nil), &backups)
 	if len(backups) == 0 || backups[0].AppID != "demo" {
 		t.Fatalf("按服务备份列表 = %+v", backups)
+	}
+	if backups[0].ServerID != "s1" || backups[0].YamlPath != "demo.yaml" {
+		t.Fatalf("备份列表应展示服务归属: %+v", backups[0])
 	}
 	if !strings.HasPrefix(backups[0].Name, "demo_") {
 		t.Fatalf("备份文件名应以服务名开头: %s", backups[0].Name)

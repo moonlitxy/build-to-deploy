@@ -322,6 +322,18 @@
         </div>
         <div id="appBackupsList"></div>
       </div>
+
+      <!-- 远程 YAML 快照：每次发布/回滚改服务器文件前自动保存 -->
+      <div class="card config-section-card">
+        <div class="card-header">
+          <div>
+            <h3><svg class="icon"><use href="#i-database"/></svg>远程 YAML 备份（发布前快照）</h3>
+            <p class="config-sub-hint">每次发布或回滚修改服务器 YAML 前自动备份，记录服务器、文件路径、镜像、Tag、来源 IP 与时间。备份失败会直接中止发布；“只恢复文件”不会 apply，线上保持不变。</p>
+          </div>
+          <button id="refreshYamlBackupsBtn" class="btn btn-secondary">刷新</button>
+        </div>
+        <div id="yamlBackupsList"></div>
+      </div>
       <!-- 镜像维护：平台不自动删除镜像，只在这里由用户显式勾选 -->
       <div class="card config-section-card">
         <div class="card-header">
@@ -424,6 +436,8 @@
     </div>
   </section>
 </main>
+
+<div id="appToast" class="validation-toast" role="status" aria-live="polite" aria-atomic="true"></div>
 
 <!-- 模态弹窗：Tag 版本冲突确认覆盖 (需求 2 核心) -->
 <div id="conflictModal" class="modal-backdrop hidden">

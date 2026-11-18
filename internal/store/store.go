@@ -42,6 +42,8 @@ type Release struct {
 	FileSHA256 string `json:"fileSha256,omitempty"`
 	Force      bool   `json:"force"` // 是否为覆盖已有版本
 	Operator   string `json:"operator"`
+	// OperatorIP 发起本次发布的来源 IP（页面只允许本机访问，通常为 127.0.0.1/::1）
+	OperatorIP string `json:"operatorIp,omitempty"`
 	Remark     string `json:"remark"`
 	PrevImage  string `json:"prevImage"`
 	// 构建输入指纹：产物内容 + 构建上下文（Dockerfile 等），相同即代表镜像内容相同，与 Tag 无关

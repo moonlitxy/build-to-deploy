@@ -469,6 +469,7 @@ func TestAPIConnModeGate(t *testing.T) {
 	}
 	remoteCalls := []struct{ method, path, body string }{
 		{"GET", "/api/deploy-target?appId=demo", ""},
+		{"POST", "/api/artifacts/inspect", `{"appId":"demo","tag":"v1","useLocalArtifact":true}`},
 		{"POST", "/api/precheck", `{"appId":"demo","tag":"v1"}`},
 		{"GET", "/api/k8s/namespaces?serverId=s1", ""},
 		{"GET", "/api/k8s/pods?serverId=s1", ""},

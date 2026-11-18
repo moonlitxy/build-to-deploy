@@ -364,7 +364,6 @@ type ArtifactFingerprint struct {
 func (e *Engine) InspectArtifact(app *config.AppConfig, src ArtifactSource) (*ArtifactFingerprint, error) {
 	spec := e.buildSpec(app, src.Tag)
 	if spec == nil {
-		fmt.Fprintln(os.Stderr, "DEBUG nil buildCmd=", app.BuildCmd, " resolved=", app.ResolveLocalArtifactPath())
 		return &ArtifactFingerprint{}, nil
 	}
 	sha := ""
@@ -503,6 +502,8 @@ type StartRequest struct {
 	// BuildDir / BuildCmd 前端未保存的构建配置草稿，非空时覆盖已保存配置
 	BuildDir string
 	BuildCmd string
+	// ClientIP 发起本次发布的来源 IP，写入发布记录与 YAML 快照元信息
+	ClientIP string
 }
 
 func fileStatAndSHA256(path string) (string, int64, string, error) {
@@ -676,6 +677,7 @@ func (e *Engine) startDeploy(parent context.Context, req StartRequest) (*store.R
 		FileSHA256: fileSHA256,
 		Force:      req.Force && len(pre.Conflicts) > 0,
 		Operator:   srv.User + "@" + srv.Host,
+		OperatorIP: req.ClientIP,
 		Remark:     req.Remark,
 		PrevImage:  pre.Current,
 		Mode:       app.DeployMode,
@@ -724,6 +726,7 @@ func (e *Engine) startDeploy(parent context.Context, req StartRequest) (*store.R
 type RollbackRequest struct {
 	ReleaseID string `json:"releaseId"`
 	Remark    string `json:"remark"`
+	ClientIP  string `json:"-"`
 }
 
 // StartRollback 触发历史版本一键回滚
@@ -811,6 +814,7 @@ func (e *Engine) StartRollback(req RollbackRequest) (*store.Release, error) {
 		RollbackOf: target.ID,
 		Mode:       app.DeployMode,
 		Operator:   srv.User + "@" + srv.Host,
+		OperatorIP: req.ClientIP,
 		Remark:     remark,
 		Status:     store.StatusRunning,
 		CreatedAt:  time.Now(),
@@ -925,6 +929,23 @@ func k8sYamlFilePath(app *config.AppConfig) string {
 	return yamlPath
 }
 
+func sanitizeYamlBackupPart(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '.', r == '_', r == '-':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('-')
+		}
+	}
+	out := strings.Trim(b.String(), ".-")
+	if out == "" {
+		return "no-tag"
+	}
+	return out
+}
+
 // splitImagePrefix 把 "image:   值  # 注释" 拆成前缀（含冒号后原有空白）、值与行尾注释
 func splitImagePrefix(line string) (prefix, value, suffix string, ok bool) {
 	trimmed := strings.TrimSpace(line)
@@ -1010,6 +1031,11 @@ func (r *pipelineRunner) updateRemoteK8sYamlImage(w io.Writer, targetImage strin
 	updatedYaml, ok := replaceYamlImage(rawYaml, r.app.Image, targetImage)
 	if !ok {
 		return fmt.Errorf("在远程 YAML 文件 (%s) 中未找到可替换的 image: 字段", yamlPath)
+	}
+
+	// 先落备份再改远程文件：备份失败直接中止，绝不出现"线上已改、本地没底"的情况
+	if _, err := r.saveYamlSnapshot(w, rawYaml, yamlPath, targetImage, ""); err != nil {
+		return err
 	}
 
 	if err := r.engine.SSH.WriteRemoteFile(r.srv, yamlPath, updatedYaml); err != nil {
@@ -1957,7 +1983,10 @@ func (r *pipelineRunner) finish(err error) {
 		}
 	})
 	if status == store.StatusSuccess {
-		if r.rel.Kind == "rollback" {
+		if r.rel.Kind == "restore" {
+			r.hub.Logf(fmt.Sprintf("\n==> 🎉 YAML 恢复完成（记录 %s）", r.rel.ID))
+			r.hub.Logf("==> ✅ 恢复流程已结束")
+		} else if r.rel.Kind == "rollback" {
 			r.hub.Logf(fmt.Sprintf("\n==> 🎉 回滚成功! 已回退至版本: %s (%s)", r.rel.Tag, r.rel.Image))
 			r.hub.Logf(fmt.Sprintf("==> ✅ 回滚流程已结束（记录 %s）", r.rel.ID))
 		} else {

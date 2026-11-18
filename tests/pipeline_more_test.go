@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -102,8 +103,29 @@ func TestPMoreInspectArtifactVariants(t *testing.T) {
 	// 构建命令无法解析
 	app2 := *app
 	app2.BuildCmd = "echo build"
-	if fp, err := eng.InspectArtifact(&app2, pipeline.ArtifactSource{Tag: "v1", LocalArtifact: app.ResolveLocalArtifactPath()}); err != nil || fp.Fingerprint != "" {
+	oldStderr := os.Stderr
+	readFile, writeFile, pipeErr := os.Pipe()
+	if pipeErr != nil {
+		t.Fatal(pipeErr)
+	}
+	os.Stderr = writeFile
+	fp, inspectErr := eng.InspectArtifact(&app2, pipeline.ArtifactSource{Tag: "v1", LocalArtifact: app.ResolveLocalArtifactPath()})
+	if closeErr := writeFile.Close(); closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	debugOut, readErr := io.ReadAll(readFile)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if closeErr := readFile.Close(); closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	os.Stderr = oldStderr
+	if inspectErr != nil || fp.Fingerprint != "" {
 		t.Fatalf("无法解析构建命令 = %+v %v", fp, err)
+	}
+	if strings.Contains(string(debugOut), "DEBUG") || strings.Contains(string(debugOut), app.ResolveLocalArtifactPath()) {
+		t.Fatalf("指纹跳过不应输出调试信息: %q", debugOut)
 	}
 	// 跳过原因
 	if r := eng.FingerprintSkipReason(app, pipeline.ArtifactSource{}); r == "" {
@@ -274,6 +296,40 @@ func TestPMoreResumeAfterDuplicateConfirm(t *testing.T) {
 	// 再次继续：状态已不是待确认
 	if _, err := eng.ResumeRelease(rel.ID, sum); err == nil {
 		t.Fatal("已完成的记录不应再次继续")
+	}
+}
+
+func TestPMoreRemoteYamlBackupPerService(t *testing.T) {
+	eng, _, _, fake, app := newScriptedEnv(t, config.DeployModeK8s)
+	backupRoot := filepath.Join(t.TempDir(), "custom-yaml-backups")
+	eng.Cfg.Server.YamlBackupDir = backupRoot
+	hub := pipeline.NewHub(filepath.Join(t.TempDir(), "yaml.log"))
+	defer hub.Close()
+	rel := &store.Release{ID: "release-backup", App: app.ID, Tag: "v1.0.0", Image: "app/demo:v1.0.0"}
+	r := pipeline.NewRunnerLike(eng, context.Background(), rel, app, eng.Cfg.SSHServers[0], hub, "", nil)
+
+	if err := pipeline.UpdateRemoteYamlForTest(r, hub, "app/demo:v1.0.0"); err != nil {
+		t.Fatal(err)
+	}
+	backupPath := pipeline.YamlBackupPathForTest(r)
+	if backupPath == "" {
+		t.Fatal("应生成远程 YAML 备份")
+	}
+	if got, want := filepath.Dir(backupPath), pipeline.YamlBackupDirForTest(r); got != want {
+		t.Fatalf("备份目录 = %s, want %s", got, want)
+	}
+	if !strings.Contains(backupPath, filepath.Join(backupRoot, app.ID)) {
+		t.Fatalf("备份未按服务隔离: %s", backupPath)
+	}
+	b, err := os.ReadFile(backupPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), "app/demo:v0.9.0") {
+		t.Fatalf("备份内容应为修改前 YAML: %s", b)
+	}
+	if got := fake.files[app.K8sYamlDir+"/demo.yaml"]; !strings.Contains(got, "app/demo:v1.0.0") {
+		t.Fatalf("远程 YAML 应已更新: %s", got)
 	}
 }
 

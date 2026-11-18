@@ -27,9 +27,12 @@ type Config struct {
 }
 
 type ServerSettings struct {
-	Listen      string `yaml:"listen" json:"listen"`           // 默认 ":8080"
-	DataDir     string `yaml:"dataDir" json:"dataDir"`         // 本地缓存、日志存放目录
-	MaxUploadMB int64  `yaml:"maxUploadMB" json:"maxUploadMB"` // 单个上传最大 MB
+	Listen               string `yaml:"listen" json:"listen"`                             // 默认 ":8080"
+	DataDir              string `yaml:"dataDir" json:"dataDir"`                           // 本地缓存、日志存放目录
+	YamlBackupDir        string `yaml:"yamlBackupDir" json:"yamlBackupDir"`               // 远程 YAML 修改前备份根目录；内部再按应用 ID 分目录
+	YamlBackupKeep       int    `yaml:"yamlBackupKeep" json:"yamlBackupKeep"`             // 每个应用保留的 YAML 备份份数；0 用默认 30，负数表示不按份数清理
+	YamlBackupMaxAgeDays int    `yaml:"yamlBackupMaxAgeDays" json:"yamlBackupMaxAgeDays"` // YAML 备份最长保留天数；0 用默认 30，负数表示不按时间清理
+	MaxUploadMB          int64  `yaml:"maxUploadMB" json:"maxUploadMB"`                   // 单个上传最大 MB
 }
 
 type AppConfig struct {
@@ -174,6 +177,17 @@ func ValidateApp(a *AppConfig) error {
 	if a.DeployMode == DeployModeDocker {
 		return ValidateDocker(a)
 	}
+	// 只填目录、按目录 apply 的模式不会改写镜像版本，发布后线上仍是旧镜像却显示成功。
+	// 这里直接拒绝这种配置：要么填具体 YAML 文件名，要么改成 set image 等自管镜像的命令。
+	if strings.TrimSpace(a.K8sYamlDir) != "" && strings.TrimSpace(a.K8sYamlFile) == "" {
+		cmd := strings.TrimSpace(a.DeployCmd)
+		if cmd == "" {
+			cmd = "kubectl apply -f {{.K8sYamlDir}}"
+		}
+		if strings.Contains(cmd, "apply") && strings.Contains(cmd, "{{.K8sYamlDir}}") {
+			return fmt.Errorf("仅配置 K8s 目录时无法自动更新镜像版本（apply 目录会部署旧镜像）：请填写 K8s YAML 文件名，或把部署命令改为不依赖目录 apply 的方式")
+		}
+	}
 	return nil
 }
 
@@ -247,6 +261,15 @@ func (c *Config) normalize() {
 	}
 	if c.Server.DataDir == "" {
 		c.Server.DataDir = "./data"
+	}
+	if c.Server.YamlBackupDir == "" {
+		c.Server.YamlBackupDir = filepath.Join(c.Server.DataDir, "yaml-backups")
+	}
+	if c.Server.YamlBackupKeep == 0 {
+		c.Server.YamlBackupKeep = 30
+	}
+	if c.Server.YamlBackupMaxAgeDays == 0 {
+		c.Server.YamlBackupMaxAgeDays = 30
 	}
 	if c.Server.MaxUploadMB <= 0 {
 		c.Server.MaxUploadMB = 2048
@@ -639,6 +662,8 @@ type AppBackup struct {
 	AppName   string    `json:"appName"`
 	Image     string    `json:"image"`
 	Tag       string    `json:"tag"` // 备份时该服务最近一次发布的版本号，未发布过为 no-tag
+	ServerID  string    `json:"serverId,omitempty"`
+	YamlPath  string    `json:"yamlPath,omitempty"`
 	Size      int64     `json:"size"`
 	CreatedAt time.Time `json:"createdAt"`
 }
@@ -649,6 +674,8 @@ type appBackupFile struct {
 	AppName   string     `yaml:"appName"`
 	Image     string     `yaml:"image"`
 	Tag       string     `yaml:"tag"`
+	ServerID  string     `yaml:"serverId,omitempty"`
+	YamlPath  string     `yaml:"yamlPath,omitempty"`
 	CreatedAt time.Time  `yaml:"createdAt"`
 	App       *AppConfig `yaml:"app"`
 }
@@ -698,6 +725,8 @@ func (c *Config) backupAppLocked(app *AppConfig) {
 		AppName:   app.Name,
 		Image:     app.Image,
 		Tag:       tag,
+		ServerID:  app.ServerID,
+		YamlPath:  app.K8sYamlFile,
 		CreatedAt: now,
 		App:       app,
 	}
@@ -762,6 +791,8 @@ func (c *Config) AppBackups() ([]AppBackup, error) {
 			AppName:   payload.AppName,
 			Image:     payload.Image,
 			Tag:       payload.Tag,
+			ServerID:  payload.ServerID,
+			YamlPath:  payload.YamlPath,
 			Size:      size,
 			CreatedAt: payload.CreatedAt,
 		})

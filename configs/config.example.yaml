@@ -1,6 +1,9 @@
 server:
   listen: "127.0.0.1:8080"          # 本地页面访问地址: http://localhost:8080
   dataDir: "./data"        # 本地暂存文件与发布记录存放目录（相对启动时的工作目录，建议在项目根目录启动）
+  yamlBackupDir: "./data/yaml-backups" # 远程 YAML 修改前备份根目录；保存时会自动按应用 ID 创建子目录
+  yamlBackupKeep: 30          # 每个应用保留最近多少份远程 YAML 备份；负数表示不按份数清理
+  yamlBackupMaxAgeDays: 30    # 远程 YAML 备份最长保留天数；负数表示不按时间清理
   maxUploadMB: 2048        # 支持上传最大产物大小(MB)
 
 # SSH 服务器长连接池配置（保活心跳常驻，避免频繁 SSH 握手触发限制）

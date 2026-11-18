@@ -118,6 +118,10 @@ func (s *Server) Handler() http.Handler {
 	// 按服务的配置备份：文件名带服务名与版本号，恢复只影响该服务
 	mux.HandleFunc("GET /api/config/app-backups", s.listAppBackups)
 	mux.HandleFunc("POST /api/config/app-backups/restore", s.restoreAppBackup)
+	// 远程 YAML 快照：发布前自动保存，可按服务器/应用查看、下载与恢复
+	mux.HandleFunc("GET /api/config/yaml-backups", s.listYamlBackups)
+	mux.HandleFunc("GET /api/config/yaml-backups/download", s.downloadYamlBackup)
+	mux.HandleFunc("POST /api/config/yaml-backups/restore", s.restoreYamlBackup)
 
 	// 预检版本冲突（满足需求 2）
 	mux.HandleFunc("POST /api/precheck", s.precheck)
@@ -1353,6 +1357,7 @@ func (s *Server) startRelease(w http.ResponseWriter, r *http.Request) {
 		Remark:           req.Remark,
 		BuildDir:         req.BuildDir,
 		BuildCmd:         req.BuildCmd,
+		ClientIP:         clientIP(r),
 	})
 	if err != nil {
 		var ce *pipeline.ConflictError
@@ -1400,6 +1405,7 @@ func (s *Server) rollbackRelease(w http.ResponseWriter, r *http.Request) {
 	rel, err := s.engine.StartRollback(pipeline.RollbackRequest{
 		ReleaseID: id,
 		Remark:    req.Remark,
+		ClientIP:  clientIP(r),
 	})
 	if err != nil {
 		// 目标镜像已被清理、记录不存在等属于状态冲突，与参数错误区分开，便于页面给出准确提示

@@ -3,6 +3,8 @@ package pipeline
 import (
 	"context"
 	"io"
+	"os"
+	"path/filepath"
 
 	"build-to-deploy/internal/config"
 	"build-to-deploy/internal/sshpool"
@@ -39,6 +41,18 @@ func ImageRepoOfForTest(ref string) string { return imageRepoOf(ref) }
 
 // K8sYamlFilePathForTest 包装 k8sYamlFilePath
 func K8sYamlFilePathForTest(app *config.AppConfig) string { return k8sYamlFilePath(app) }
+
+// YamlBackupDirForTest 包装按服务隔离的远程 YAML 备份目录
+func YamlBackupDirForTest(r *RunnerLike) string { return r.yamlBackupDir() }
+
+// YamlBackupPathForTest 返回最近一份远程 YAML 备份，供测试断言
+func YamlBackupPathForTest(r *RunnerLike) string {
+	entries, err := os.ReadDir(r.yamlBackupDir())
+	if err != nil || len(entries) == 0 {
+		return ""
+	}
+	return filepath.Join(r.yamlBackupDir(), entries[len(entries)-1].Name())
+}
 
 // ValidateK8sTargetForTest 包装 validateK8sTarget
 func ValidateK8sTargetForTest(app *config.AppConfig) error { return validateK8sTarget(app) }

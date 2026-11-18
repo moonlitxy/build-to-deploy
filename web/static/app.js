@@ -88,7 +88,7 @@ async function pickLocalPath(mode, promptText) {
         return null;
       }
       if (!res.ok) {
-        alert(`打开本地文件选择器失败: ${data.error || '未知错误'}`);
+        showToast(`打开本地文件选择器失败: ${data.error || '未知错误'}`);
         return null;
       }
       if (data.canceled || !data.path) {
@@ -97,7 +97,7 @@ async function pickLocalPath(mode, promptText) {
       return data.path;
     } catch (e) {
       if (e.name === 'AbortError') {
-        alert('打开文件选择框超时，请重试');
+        showToast('打开文件选择框超时，请重试');
       }
       return null;
     } finally {
@@ -143,6 +143,31 @@ function fmtTime(dateStr) {
 
 function escapeHtml(str) {
   return String(str ?? '').replace(/[&<>"']/g, (m) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[m]));
+}
+
+function showToast(message, tone = 'error') {
+  const toast = document.getElementById('appToast');
+  if (!toast) return;
+  toast.textContent = message;
+  toast.className = `validation-toast visible ${tone === 'success' ? 'is-success' : ''}`;
+  if (toast.hideTimer) clearTimeout(toast.hideTimer);
+  toast.hideTimer = setTimeout(() => {
+    toast.classList.remove('visible');
+  }, 4200);
+  toast.addEventListener('pointerdown', () => {
+    if (toast.hideTimer) clearTimeout(toast.hideTimer);
+    toast.classList.add('is-holding');
+  });
+  toast.addEventListener('pointerup', () => {
+    toast.classList.remove('is-holding');
+    if (toast.hideTimer) clearTimeout(toast.hideTimer);
+    toast.hideTimer = setTimeout(() => {
+      toast.classList.remove('visible');
+    }, 2400);
+  });
+  toast.addEventListener('pointerleave', () => {
+    toast.classList.remove('is-holding');
+  });
 }
 
 // ---------------- 初始化 ----------------
@@ -217,6 +242,7 @@ async function refreshConfigs() {
   renderAppCards();
   updatePathPreview({ probeRemote: false });
   await loadAppBackups();
+  await loadYamlBackups();
 }
 
 function renderAppSelects() {
@@ -655,7 +681,7 @@ function setupButtons() {
     $('quickPickLocalArtifactBtn').addEventListener('click', async () => {
       const appId = $('deployAppSelect').value;
       const app = state.apps.find((a) => a.id === appId);
-      if (!app) return alert('请先选择目标应用');
+      if (!app) return showToast('请先选择目标应用');
       const btn = $('quickPickLocalArtifactBtn');
       const origText = btn.textContent;
       btn.textContent = '选择中...';
@@ -773,6 +799,7 @@ function setupButtons() {
   $('testServerConnBtn').addEventListener('click', testServerConnection);
   bindServerPasswordToggle();
   if ($('refreshBackupsBtn')) $('refreshBackupsBtn').addEventListener('click', loadAppBackups);
+  if ($('refreshYamlBackupsBtn')) $('refreshYamlBackupsBtn').addEventListener('click', loadYamlBackups);
   $('editServerAuthType').addEventListener('change', (e) => {
     $('pwdGroup').classList.toggle('hidden', e.target.value === 'key');
     $('keyGroup').classList.toggle('hidden', e.target.value !== 'key');
@@ -852,7 +879,7 @@ async function onStartDeployClick() {
   const tag = $('tagInput').value.trim();
   const remark = $('remarkInput').value.trim();
 
-  if (!appId) return alert('请先选择要发布的应用');
+  if (!appId) return showToast('请先选择要发布的应用');
   const app = state.apps.find((a) => a.id === appId);
 
   const isLocalBuild = state.deployMode === 'local_build';
@@ -869,15 +896,20 @@ async function onStartDeployClick() {
 
   if (isLocalBuild) {
     if (!app || !app.localBuildCmd || !app.localArtifactPath) {
-      return alert('当前应用尚未配置“本地编译命令”或“本地编译产出文件路径”，请先点击“修改编译配置”填写！');
+      return showToast('当前应用尚未配置“本地编译命令”或“本地编译产出文件路径”，请先点击“修改编译配置”填写！');
     }
   } else {
     if (!state.selectedFile && !useDefaultArtifact) {
-      return alert('请先选择本地构建产物文件，或切换至“本地一键编译并上传”模式');
+      return showToast('请先选择本地构建产物文件，或切换至“本地一键编译并上传”模式');
     }
   }
 
-  if (!tag || !TAG_RE.test(tag)) return alert('请输入合法的镜像 Tag (只能包含字母、数字、点、减号、下划线)');
+  if (!tag || !TAG_RE.test(tag)) return showToast('请输入合法的镜像 Tag（只能包含字母、数字、点、减号、下划线）');
+
+  await updateConnStatus();
+  if (!state.connEnabled) {
+    return showToast('尚未连接服务器：请先点击顶部「连接服务器」');
+  }
 
   appendLog(`\n[本地] 准备发布应用: ${appId}, Tag: ${tag} (${isLocalBuild ? '本地一键编译并上传' : '直接上传已有产物'})`);
   appendLog('[本地] 正在向服务器执行版本预检 (Precheck)...');
@@ -925,7 +957,7 @@ async function onStartDeployClick() {
   const preRes = await api('POST', '/api/precheck', { appId, tag });
   if (!preRes.ok) {
     appendLog(`[预检失败] ${preRes.data.error || '检查失败'}`);
-    return alert(`预检失败: ${preRes.data.error || '未知错误'}`);
+    return showToast(`预检失败: ${preRes.data.error || '未知错误'}`);
   }
 
   (preRes.data.warnings || []).forEach((w) => appendLog(`[提示] ${w}`));
@@ -1065,7 +1097,7 @@ async function onConfirmDuplicateDeploy() {
   modal.classList.add('hidden');
   modal.dataset.mode = '';
   if (!releaseId) {
-    alert('发布记录已丢失，请重新发布');
+    showToast('发布记录已丢失，请重新发布');
     return;
   }
   appendLog(`[确认] 用户确认镜像内容未变化，仍继续部署: ${releaseId}`);
@@ -1079,7 +1111,7 @@ async function onConfirmDuplicateDeploy() {
       showDuplicateDeployModal(res.data.duplicate, releaseId);
       return;
     }
-    alert(`继续部署失败: ${res.data.error || res.status}`);
+    showToast(`继续部署失败: ${res.data.error || res.status}`);
     updateStatus('failed', '继续部署失败');
     resetDeployUi();
     return;
@@ -1526,7 +1558,7 @@ async function deleteSelectedImages() {
   if (!ok) return;
   const res = await api('POST', '/api/docker/images/delete', { appId, refs });
   if (!res.ok) {
-    alert(`✖ 删除失败: ${res.data.error || res.status}`);
+    showToast(`删除失败: ${res.data.error || res.status}`);
     return;
   }
   const removed = res.data.removed || [];
@@ -1534,7 +1566,7 @@ async function deleteSelectedImages() {
   const lines = [];
   if (removed.length) lines.push(`已删除 ${removed.length} 个镜像`);
   if (skipped.length) lines.push(`跳过 ${skipped.length} 个：\n${skipped.join('\n')}`);
-  alert(lines.join('\n\n') || '没有删除任何镜像');
+  showToast(lines.join('；') || '没有删除任何镜像', 'success');
   await loadImages();
 }
 
@@ -1576,6 +1608,8 @@ async function loadAppBackups() {
       <div class="backup-group-head">
         <strong>${escapeHtml(head.appName || head.appId)}</strong>
         <code>${escapeHtml(head.image || '-')}</code>
+        ${head.yamlPath ? `<code>${escapeHtml(head.yamlPath)}</code>` : ''}
+        ${head.serverId ? `<code>${escapeHtml(head.serverId)}</code>` : ''}
         <span class="mini-badge">${items.length} 份备份</span>
       </div>
       ${rows}
@@ -1587,11 +1621,90 @@ window.restoreAppBackup = async function (name) {
   if (!confirm(`确定恢复备份 ${name} 吗？只会替换该服务的配置，当前版本会自动再备份一次，可再次恢复回来。`)) return;
   const res = await api('POST', '/api/config/app-backups/restore', { name });
   if (!res.ok) {
-    alert(`恢复失败: ${res.data.error || '未知错误'}`);
+    showToast(`恢复失败: ${res.data.error || '未知错误'}`);
     return;
   }
   await refreshConfigs();
-  alert('该服务配置已恢复');
+  showToast('该服务配置已恢复', 'success');
+};
+
+// ---------------- 远程 YAML 快照（发布前备份） ----------------
+async function loadYamlBackups() {
+  const box = $('yamlBackupsList');
+  if (!box) return;
+  const res = await api('GET', '/api/config/yaml-backups');
+  if (!res.ok) {
+    box.innerHTML = '<div class="td-empty">远程 YAML 备份列表加载失败</div>';
+    return;
+  }
+  const list = res.data || [];
+  if (!list.length) {
+    box.innerHTML = '<div class="td-empty">暂无远程 YAML 备份（发布或回滚修改服务器 YAML 前会自动产生）</div>';
+    return;
+  }
+  // 按“服务器 + 应用”分组，避免多台服务器/多个应用的备份混在一起
+  const groups = new Map();
+  list.forEach((b) => {
+    const key = `${b.serverId || '-'}|${b.appId || '-'}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(b);
+  });
+  box.innerHTML = Array.from(groups.values()).map((items) => {
+    const head = items[0];
+    const rows = items.map((b) => {
+      const q = `appId=${encodeURIComponent(b.appId || '')}&name=${encodeURIComponent(b.name || '')}`;
+      return `
+      <div class="backup-row yaml-row">
+        <span class="backup-name" title="${escapeHtml(b.name || '')}">${escapeHtml(b.name || '-')}</span>
+        <span class="backup-tag" title="${escapeHtml(b.targetImage || '')}">${escapeHtml(b.targetImage || '-')}${b.tag ? ' · ' + escapeHtml(b.tag) : ''}</span>
+        <span class="backup-size" title="来源 IP">${escapeHtml(b.operatorIp || '-')}</span>
+        <span class="backup-time">${fmtTime(b.createdAt)}</span>
+        <span class="backup-size">${fmtSize(b.size)}</span>
+        <div class="backup-actions">
+          <a class="btn btn-secondary btn-sm" href="/api/config/yaml-backups/download?${q}" download>下载</a>
+          <button class="btn btn-secondary btn-sm" onclick="restoreYamlBackup('${escapeHtml(b.appId || '')}','${escapeHtml(b.name || '')}',false)">只恢复文件</button>
+          <button class="btn btn-warn btn-sm" onclick="restoreYamlBackup('${escapeHtml(b.appId || '')}','${escapeHtml(b.name || '')}',true)">恢复并发布</button>
+        </div>
+      </div>`;
+    }).join('');
+    return `<div class="backup-group">
+      <div class="backup-group-head">
+        <strong>${escapeHtml(head.appName || head.appId || '-')}</strong>
+        <code>${escapeHtml(head.serverHost || head.serverId || '未知服务器')}</code>
+        <code>${escapeHtml(head.yamlPath || '-')}</code>
+        <span class="mini-badge">${items.length} 份备份</span>
+      </div>
+      ${rows}
+    </div>`;
+  }).join('');
+}
+
+window.restoreYamlBackup = async function (appId, name, apply) {
+  const tip = apply
+    ? '恢复并发布（写回 YAML 后会执行部署命令并等待 Pod 就绪）'
+    : '只恢复文件（不会执行 apply，线上保持不变）';
+  if (!confirm(`确定${tip}？\n\n备份: ${name}\n恢复前会把当前文件再备份一份。`)) return;
+  const res = await api('POST', '/api/config/yaml-backups/restore', { appId, name, apply: !!apply });
+  if (!res.ok) {
+    showToast(`恢复失败: ${res.data.error || '未知错误'}`);
+    return;
+  }
+  if (!apply) {
+    showToast('已开始恢复文件，完成后刷新列表可看到恢复前的快照', 'success');
+    setTimeout(loadYamlBackups, 900);
+    return;
+  }
+  const rel = res.data || {};
+  document.querySelector('.tab-btn[data-tab="deploy"]').click();
+  $('deployAppSelect').value = appId;
+  updatePathPreview();
+  $('logConsole').textContent = '';
+  $('pipelineStages').innerHTML = '';
+  updateStatus('running', '恢复 YAML 并发布中');
+  state.isDeploying = true;
+  $('startDeployBtn').disabled = true;
+  listenReleaseEvents(rel.id);
+  setTimeout(loadYamlBackups, 1500);
 };
 
 // ---------------- K8s Pod 监控 (需求 3) ----------------
@@ -1850,7 +1963,7 @@ async function fetchPodLogContent(srvId, ns, podName, containerName, isAuto) {
 function downloadPodLog() {
   const raw = window._rawPodLog || '';
   if (!raw) {
-    alert('当前没有可下载的日志内容');
+    showToast('当前没有可下载的日志内容');
     return;
   }
   const parts = String(currentViewingPod || 'pod').split('-');
@@ -1910,11 +2023,11 @@ window.restartPodDeployment = async function (podName) {
   });
 
   if (!res.ok) {
-    alert(`重启失败: ${res.data.error || '未知错误'}`);
+    showToast(`重启失败: ${res.data.error || '未知错误'}`);
     return;
   }
 
-  alert(`✔ 重启指令已下发！请稍候刷新查看 Pod 重建进度。`);
+  showToast('重启指令已下发！请稍候刷新查看 Pod 重建进度。', 'success');
   setTimeout(loadPods, 1500);
 };
 
@@ -1996,11 +2109,11 @@ async function connectCurrentServer() {
   const app = state.apps.find((a) => a.id === appId);
   const srv = app ? state.servers.find((s) => s.id === app.serverId) : null;
   if (!app) {
-    return alert('请先选择目标应用');
+    return showToast('请先选择目标应用');
   }
   if (!srv) {
     // 不能兜底连第一台：应用绑定的服务器已被删除或 ID 不匹配时，会静默连错机器
-    return alert(`应用 ${app.name} 绑定的服务器不存在，请先在“服务器与目录配置”中检查并重新绑定`);
+    return showToast(`应用 ${app.name} 绑定的服务器不存在，请先在“服务器与目录配置”中检查并重新绑定`);
   }
   const btn = $('connectSrvBtn');
   const origText = btn.textContent;
@@ -2017,7 +2130,7 @@ async function connectCurrentServer() {
     await refreshCurrentVersion(appId);
     maybePrefillTag(appId);
   } else {
-    alert(`✖ 连接失败: ${res.data.error || '未知错误'}`);
+    showToast(`连接失败: ${res.data.error || '未知错误'}`);
   }
 }
 
@@ -2026,7 +2139,7 @@ window.disconnectOneServer = async function (srvId) {
   if (res.ok) {
     await updateConnStatus();
   } else {
-    alert(`断开失败: ${res.data.error || '未知错误'}`);
+    showToast(`断开失败: ${res.data.error || '未知错误'}`);
   }
 };
 
@@ -2091,9 +2204,9 @@ window.testOneServer = async function (srvId) {
     state.currentVersions = {};
     await refreshCurrentVersion($('deployAppSelect').value);
     maybePrefillTag($('deployAppSelect').value);
-    alert(`✔ ${res.data.message || '连接测试成功！'}`);
+    showToast(res.data.message || '连接测试成功！', 'success');
   } else {
-    alert(`✖ 连接失败: ${res.data.error || '未知错误'}`);
+    showToast(`连接失败: ${res.data.error || '未知错误'}`);
   }
 };
 
@@ -2173,7 +2286,7 @@ async function testServerConnection() {
     password: $('editServerPassword').value,
     keyPath: $('editServerKeyPath').value.trim(),
   };
-  if (!srv.host || !srv.user) return alert('请先填写主机和用户名');
+  if (!srv.host || !srv.user) return showToast('请先填写主机和用户名');
 
   $('testServerConnBtn').textContent = '测试中...';
   $('testServerConnBtn').disabled = true;
@@ -2188,9 +2301,9 @@ async function testServerConnection() {
     // 连接建立后补拉当前应用的线上版本
     state.currentVersions = {};
     await refreshCurrentVersion($('deployAppSelect').value);
-    alert(`✔ ${res.data.message || '连接成功！'}`);
+    showToast(res.data.message || '连接成功！', 'success');
   } else {
-    alert(`✖ 连接失败: ${res.data.error}`);
+    showToast(`连接失败: ${res.data.error}`);
   }
 }
 
@@ -2205,10 +2318,10 @@ async function saveServer() {
     password: $('editServerPassword').value,
     keyPath: $('editServerKeyPath').value.trim(),
   };
-  if (!srv.host || !srv.user) return alert('主机 IP 与用户名必填');
+  if (!srv.host || !srv.user) return showToast('主机 IP 与用户名必填');
 
   const res = await api('POST', '/api/servers', srv);
-  if (!res.ok) return alert('保存失败: ' + res.data.error);
+  if (!res.ok) return showToast('保存失败: ' + res.data.error);
 
   $('serverModal').classList.add('hidden');
   // 保存后直接选中这台服务器，配置页立刻展示它的详情
@@ -2432,7 +2545,7 @@ window.deleteApp = async function (id) {
 
 async function saveApp() {
   const name = $('editAppName').value.trim();
-  if (!name) return alert('应用名称必填');
+  if (!name) return showToast('应用名称必填');
 
   const app = {
     id: $('editAppId').value || name,
@@ -2466,7 +2579,7 @@ async function saveApp() {
 
   const res = await api('POST', '/api/apps', app);
   if (!res.ok) {
-    alert('保存应用失败: ' + res.data.error);
+    showToast('保存应用失败: ' + res.data.error);
     return;
   }
 
@@ -2630,7 +2743,7 @@ function renderHistoryTable(list) {
 
 window.copyText = function (text) {
   navigator.clipboard.writeText(text).then(() => {
-    alert(`已复制版本号: ${text}`);
+    showToast(`已复制版本号: ${text}`, 'success');
   }).catch(() => {
     prompt('请手动复制:', text);
   });
@@ -2670,7 +2783,7 @@ window.openReleaseLogModal = async function (id, app, tag, createdAt) {
   let rawLog = '';
   $('copyReleaseLogBtn').onclick = () => {
     navigator.clipboard.writeText(rawLog).then(() => {
-      alert('日志已复制到剪贴板！');
+      showToast('日志已复制到剪贴板！', 'success');
     });
   };
 
@@ -2728,7 +2841,7 @@ $('rollbackConfirmBtn').addEventListener('click', async () => {
   });
 
   if (!res.ok) {
-    alert(`发起回滚失败: ${res.data.error || '未知错误'}`);
+    showToast(`发起回滚失败: ${res.data.error || '未知错误'}`);
     return;
   }
 

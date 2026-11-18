@@ -1822,6 +1822,17 @@ input[type="checkbox"] {
   border-top: 1px solid rgba(0, 0, 0, 0.05);
 }
 
+.backup-row.yaml-row {
+  grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr) auto auto auto auto;
+}
+
+.backup-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+
 .backup-name {
   overflow: hidden;
   color: var(--text-secondary);
@@ -1857,6 +1868,43 @@ input[type="checkbox"] {
   background: rgba(0, 0, 0, 0.32);
   -webkit-backdrop-filter: blur(18px) saturate(120%);
   backdrop-filter: blur(18px) saturate(120%);
+}
+
+/* 表单校验/连接前置校验提示：非阻断轻提示，替代浏览器原生 alert 弹窗 */
+.validation-toast {
+  position: fixed;
+  top: 76px;
+  left: 50%;
+  z-index: 1200;
+  display: flex;
+  align-items: center;
+  max-width: min(520px, calc(100vw - 32px));
+  padding: 13px 18px;
+  border: 1px solid rgba(0, 0, 0, 0.42);
+  border-radius: 16px;
+  background: #ffffff;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.06), 0 10px 34px rgba(0, 0, 0, 0.16);
+  color: #000000;
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.45;
+  opacity: 0;
+  cursor: text;
+  user-select: text;
+  transform: translate(-50%, -8px) scale(0.97);
+  -webkit-backdrop-filter: saturate(180%) blur(20px);
+  backdrop-filter: saturate(180%) blur(20px);
+  transition: opacity 0.18s ease, transform 0.18s ease;
+}
+
+.validation-toast.visible {
+  opacity: 1;
+  transform: translate(-50%, 0) scale(1);
+}
+
+.validation-toast.is-holding {
+  border-color: rgba(0, 0, 0, 0.62);
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.08), 0 12px 38px rgba(0, 0, 0, 0.2);
 }
 
 .modal-card {
